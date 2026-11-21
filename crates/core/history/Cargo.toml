@@ -1,0 +1,17 @@
+[package]
+name = "history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+envs.workspace = true
+model.workspace = true
+rusqlite.workspace = true
+ruzstd.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true

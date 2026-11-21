@@ -1,0 +1,38 @@
+[package]
+name = "harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "One window for every AI coding harness: Claude Code, Codex, OpenCode and more, local or over SSH."
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[[bin]]
+name = "bowyer"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+envs.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "webp"] }
+futures = "0.3"
+raw-window-handle = "0.6"
+history.workspace = true
+library.workspace = true
+live.workspace = true
+log = "0.4"
+mcp.workspace = true
+model.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+serde_json = { workspace = true, features = ["preserve_order"] }
+sys-locale = "0.3"
+theme.workspace = true
+ui-kit.workspace = true
+terminal.workspace = true
+update.workspace = true
+vcs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

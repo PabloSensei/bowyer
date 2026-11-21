@@ -1,0 +1,168 @@
+name: Release
+
+# Packages for a tag `v*`: the Windows installer (NSIS), the Linux .deb and AppImage, the
+# macOS .app and .dmg, with SHA-256 sums, as a draft release. Signing happens when the
+# secrets below are set; without them the packages are built unsigned.
+#
+#   WINDOWS_PFX_BASE64, WINDOWS_PFX_PASSWORD   Authenticode certificate (.pfx in base64)
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY
+#                                              Developer ID Application certificate (.p12 in base64)
+#   APPLE_API_KEY, APPLE_API_ISSUER, APPLE_API_KEY_BASE64
+#                                              App Store Connect key for notarization
+#
+# UNVERIFIED: written, never run (no tag has been pushed).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Secrets cannot be read in `if`; their presence is read from these.
+    env:
+      WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            formats: nsis
+          - name: Linux
+            os: ubuntu-22.04
+            formats: deb,appimage
+          - name: macOS
+            os: macos-latest
+            formats: app,dmg
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag, the workspace and the packages name one version.
+      - name: Version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          package_version=$(sed -n 's/^version = "\(.*\)"/\1/p' packaging/packager.toml | head -n 1)
+          echo "tag $tag, Cargo.toml $cargo_version, packager.toml $package_version"
+          [ "$tag" = "$cargo_version" ] && [ "$tag" = "$package_version" ]
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Build
+        # The feed and public key of updates are built in; without them the program never
+        # looks for updates or never installs them (see packaging/README.md).
+        env:
+          BOWYER_UPDATE_FEED: ${{ vars.BOWYER_UPDATE_FEED }}
+          BOWYER_UPDATE_KEY: ${{ vars.BOWYER_UPDATE_KEY }}
+        run: cargo build --release -p harness
+
+      # The release profile keeps line tables (216 MB on Linux); the packages do not need them.
+      - name: Strip
+        if: runner.os != 'Windows'
+        run: strip target/release/bowyer
+
+      - name: Licenses
+        run: python3 packaging/prepare.py || python packaging/prepare.py
+        shell: bash
+
+      - name: cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Windows certificate
+        if: runner.os == 'Windows' && env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'bowyer.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          "BOWYER_SIGN_PFX=$pfx" >> $env:GITHUB_ENV
+
+      - name: macOS signing identity
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          printf '\nsigning-identity = "%s"\n' "$APPLE_SIGNING_IDENTITY" >> packaging/packager.toml
+          if [ -n "$APPLE_API_KEY_BASE64" ]; then
+            echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package
+        env:
+          BOWYER_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # With the key, cargo-packager writes a minisign signature next to each package.
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.UPDATE_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATE_PRIVATE_KEY_PASSWORD }}
+        run: cargo packager -c packaging/packager.toml --release -f ${{ matrix.formats }}
+
+      - name: macOS update package
+        if: runner.os == 'macOS'
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.UPDATE_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATE_PRIVATE_KEY_PASSWORD }}
+        run: |
+          tar -czf target/packages/Bowyer.app.tar.gz -C target/packages Bowyer.app
+          if [ -n "$CARGO_PACKAGER_SIGN_PRIVATE_KEY" ]; then
+            cargo packager signer sign target/packages/Bowyer.app.tar.gz
+          fi
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd target/packages
+          find . -maxdepth 1 -type f ! -name '*.sha256' | while read -r f; do
+            f=${f#./}
+            if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi > "$f.sha256"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bowyer-${{ matrix.name }}
+          path: |
+            target/packages/*
+            !target/packages/.cargo-packager
+            !target/packages/*.app
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Update feed
+        # latest.json goes up with the release; the feed address points at the latest one.
+        run: |
+          python3 packaging/update_manifest.py packages "$GITHUB_REF_NAME" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" > latest.json
+          mv latest.json packages/
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" packages/* --repo "$GITHUB_REPOSITORY" --draft --title "Bowyer ${GITHUB_REF_NAME#v}"

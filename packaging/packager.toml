@@ -1,0 +1,62 @@
+# Packages of Bowyer, built by cargo-packager 0.11.8 (https://github.com/crabnebula-dev/cargo-packager)
+# from the repository root, after `cargo build --release -p harness` (then `strip
+# target/release/bowyer` on Linux and macOS) and `python packaging/prepare.py`:
+#
+#   cargo packager -c packaging/packager.toml --release -f nsis        (Windows)
+#   cargo packager -c packaging/packager.toml --release -f deb,appimage (Linux)
+#   cargo packager -c packaging/packager.toml --release -f app,dmg     (macOS)
+#
+# Paths here are relative to this folder. See packaging/README.md.
+
+name = "bowyer"
+product-name = "Bowyer"
+version = "0.1.0"
+# The same string is the AppUserModelID of the Windows shortcuts and of the process
+# (crates/app/harness/src/main.rs), so the taskbar groups the window under the shortcut.
+identifier = "dev.bowyer.app"
+description = "One window for every AI coding harness: Claude Code, Codex, OpenCode and DeepSeek, local or over SSH."
+long-description = "Bowyer shows the sessions of Claude Code, Codex, OpenCode and DeepSeek on this computer and on hosts reached over SSH in one tree, renders their history, runs new turns and keeps its own memory."
+publisher = "Bowyer"
+authors = ["Bowyer contributors"]
+copyright = "Bowyer contributors, GPL-3.0-or-later"
+category = "DeveloperTool"
+license-file = "../LICENSE"
+out-dir = "../target/packages"
+binaries-dir = "../target/release"
+binaries = [{ path = "bowyer", main = true }]
+icons = [
+  "linux/icons/32x32/bowyer.png",
+  "linux/icons/64x64/bowyer.png",
+  "linux/icons/128x128/bowyer.png",
+  "linux/icons/256x256/bowyer.png",
+  "linux/icons/512x512/bowyer.png",
+  "../assets/icon/bowyer.ico",
+  "macos/Bowyer.icns",
+]
+# The license of Bowyer and the notices of everything built into it, made by prepare.py.
+resources = [{ src = "../target/packaging/licenses", target = "licenses" }]
+
+[windows]
+# Signs the executable, the installer and its uninstaller when a certificate is given in
+# the environment (see sign.ps1); without one it signs nothing and says so.
+sign-command = "powershell -NoProfile -ExecutionPolicy Bypass -File windows/sign.ps1 %1"
+
+[nsis]
+# A per-user install into %LOCALAPPDATA%\Bowyer, no administrator rights. The uninstaller
+# removes the program only: the library, themes and caches in %APPDATA%\Bowyer stay.
+installer-mode = "currentUser"
+languages = ["English"]
+display-language-selector = false
+
+[deb]
+# Linked: libxcb, libxkbcommon, libxkbcommon-x11; loaded at start: libwayland-client,
+# libwayland-egl, libEGL (objdump -p and the library names in the binary).
+depends = ["libxcb1", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libwayland-egl1", "libegl1"]
+section = "devel"
+desktop-template = "linux/bowyer.desktop"
+
+[macos]
+minimum-system-version = "11.0"
+# signing-identity comes from the release workflow (APPLE_SIGNING_IDENTITY); notarization
+# reads APPLE_API_KEY, APPLE_API_ISSUER and APPLE_API_KEY_PATH, or APPLE_ID,
+# APPLE_PASSWORD and APPLE_TEAM_ID.

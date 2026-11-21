@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*/*", "tools/test-support"]
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+model = { path = "crates/core/model" }
+envs = { path = "crates/core/envs" }
+history = { path = "crates/core/history" }
+library = { path = "crates/core/library" }
+live = { path = "crates/core/live" }
+vcs = { path = "crates/core/vcs" }
+mcp = { path = "crates/core/mcp" }
+terminal = { path = "crates/core/terminal" }
+update = { path = "crates/core/update" }
+ui-kit = { path = "crates/ui/ui-kit" }
+theme = { path = "crates/ui/theme" }
+test-support = { path = "tools/test-support" }
+crossbeam-channel = "0.5"
+rusqlite = { version = "0.41", features = ["bundled"] }
+ruzstd = "0.9"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gpui-kit = "=0.9.0"
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.11" }
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.11" }
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.11" }
+
+[patch.crates-io]
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1

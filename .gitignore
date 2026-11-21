@@ -1,0 +1,14 @@
+/target/
+**/target/
+/.cargo/config.toml
+/.claude/worktrees/
+/.claude/settings.local.json
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+/dist/
+
+# Image generation logs (local paths, costs)
+assets/icon/gen/*.jsonl

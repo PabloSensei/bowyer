@@ -1,0 +1,16 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+envs.workspace = true
+history.workspace = true
+library.workspace = true
+model.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true
