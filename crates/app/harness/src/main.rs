@@ -87,15 +87,68 @@ fn set_app_id() {
     }
 }
 
+/// Opens the main window on `view`, at the start and when the icon brings a closed window
+/// back. Returns its native handle where the icon needs one.
+fn open_main_window(view: Entity<Shell>, cx: &mut App) -> Option<usize> {
+    let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
+    let found = std::rc::Rc::new(std::cell::Cell::new(None));
+    let handle = found.clone();
+    let opened = cx.open_window(shell::window_options(bounds), move |window, cx| {
+        // The root takes the keys from the start, so Ctrl+K works before any click.
+        let focus = view.read(cx).focus.clone();
+        focus.focus(window, cx);
+        window.activate_window();
+        let hwnd = tray::native_handle(window);
+        handle.set(hwnd);
+        window.on_window_should_close(cx, move |_, _| match hwnd {
+            Some(hwnd) if tray::hides_on_close() => {
+                tray::hide_window(hwnd);
+                false
+            }
+            _ => true,
+        });
+        view
+    });
+    match opened {
+        Ok(_) => tray::set_window_away(false),
+        Err(error) => eprintln!("cannot open the window: {error}"),
+    }
+    found.get()
+}
+
 /// Puts up the icon of the window and quits when its menu says so; takes it down on quit.
-fn start_tray(hwnd: usize, cx: &mut App) {
+fn start_tray(hwnd: Option<usize>, view: Entity<Shell>, cx: &mut App) {
     use futures::StreamExt;
     let text = tray::TrayText { tooltip: shell::APP_NAME.to_owned(), open: i18n::t("tray.open").to_owned(), quit: i18n::t("tray.quit").to_owned() };
     let Some((icon, mut events)) = tray::Tray::start(hwnd, text) else { return };
+    // Where the window closes into the icon rather than hiding, Bowyer outlives its last
+    // window then, and quits with it otherwise.
+    if cfg!(target_os = "linux") {
+        cx.set_quit_mode(QuitMode::Explicit);
+        cx.on_window_closed(|cx, _| {
+            if !cx.windows().is_empty() {
+                return;
+            }
+            if tray::hides_on_close() {
+                tray::set_window_away(true);
+            } else {
+                cx.quit();
+            }
+        })
+        .detach();
+    }
     cx.spawn(async move |cx| {
         while let Some(event) = events.next().await {
             match event {
                 tray::TrayEvent::Quit => cx.update(|cx| cx.quit()),
+                tray::TrayEvent::Show => cx.update(|cx| match cx.windows().first() {
+                    Some(window) => {
+                        let _ = window.update(cx, |_, window, _| window.activate_window());
+                    }
+                    None => {
+                        open_main_window(view.clone(), cx);
+                    }
+                }),
             }
         }
     })
@@ -162,34 +215,15 @@ fn main() {
         if let Some(id) = &theme_id {
             cx.set_global(catalog.theme(id));
         }
-        let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
-        let options = shell::window_options(bounds);
         let cache = data.join("cache");
         let settings = data.clone();
         tray::set_close_to_tray(close_to_tray);
-        let main_window = std::rc::Rc::new(std::cell::Cell::new(None));
-        let found = main_window.clone();
-        cx.open_window(options, move |window, cx| {
-            let view = cx.new(|cx| Shell::new(library, settings, cache, cx));
-            // The root takes the keys from the start, so Ctrl+K works before any click.
-            let focus = view.read(cx).focus.clone();
-            focus.focus(window, cx);
-            window.activate_window();
-            let hwnd = tray::native_handle(window);
-            found.set(hwnd);
-            window.on_window_should_close(cx, move |_, _| match hwnd {
-                Some(hwnd) if tray::hides_on_close() => {
-                    tray::hide_window(hwnd);
-                    false
-                }
-                _ => true,
-            });
-            view
-        })
-        .expect("open the window");
-        if let Some(hwnd) = main_window.get() {
-            start_tray(hwnd, cx);
+        let view = cx.new(|cx| Shell::new(library, settings, cache, cx));
+        let hwnd = open_main_window(view.clone(), cx);
+        if cx.windows().is_empty() {
+            std::process::exit(1);
         }
+        start_tray(hwnd, view, cx);
         cx.activate(true);
     });
 }

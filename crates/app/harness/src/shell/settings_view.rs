@@ -276,7 +276,7 @@ impl Shell {
                 ))
                 .child(row(
                     t("settings.tray_close"),
-                    Some(if cfg!(windows) { t("settings.tray_close_hint") } else { t("settings.tray_none") }),
+                    Some(if tray::icon_up() { t("settings.tray_close_hint") } else { t("settings.tray_none") }),
                     toggle("tray-close", tray_close, theme, cx, |this, on, cx| {
                         tray::set_close_to_tray(on);
                         this.set_flag("tray.close", on, cx);

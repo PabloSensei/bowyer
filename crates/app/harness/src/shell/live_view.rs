@@ -711,14 +711,12 @@ impl Shell {
             LiveEvent::Permission(ask) => {
                 live.asks.push(ask);
                 // The turn waits for the user: call them back if they went elsewhere.
-                self.attention = Some((None, super::Call::Asks));
+                self.call_attention(None, super::Call::Asks);
             }
             LiveEvent::Finished { ok, error } => {
                 live.finished = true;
                 // Questions left open are cancelled with their senders.
                 live.asks.clear();
-                // A turn of the window ended: call the user back if they went elsewhere.
-                self.attention = Some((None, if ok { super::Call::Done } else { super::Call::Failed }));
                 live.error = if ok { None } else { error.or_else(|| Some(live.stderr.clone())) };
                 let seconds = live.started.elapsed().as_secs_f32();
                 self.status = Some(match &live.error {
@@ -733,6 +731,8 @@ impl Shell {
                     let key = SessionKey { id: session, ..open.summary.key.clone() };
                     self.pending_open = Some(key);
                 }
+                // A turn of the window ended: call the user back if they went elsewhere.
+                self.call_attention(None, if ok { super::Call::Done } else { super::Call::Failed });
                 if self.right_tab == super::files_view::RightTab::Changes {
                     self.refresh_changes(cx);
                 }

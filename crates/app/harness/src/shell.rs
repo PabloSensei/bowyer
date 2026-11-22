@@ -823,10 +823,36 @@ impl Shell {
                 && self.statuses_seeded
                 && before.flatten() != status
             {
-                self.attention = Some((Some(key), call));
+                self.call_attention(Some(key), call);
             }
         }
         self.statuses_seeded = true;
+    }
+
+    /// Calls the user back: the next drawing flashes the window and notifies when it is not
+    /// in front; with the window away in the tray nothing is drawn, so the notification goes
+    /// at once.
+    fn call_attention(&mut self, key: Option<SessionKey>, call: Call) {
+        if crate::tray::window_away() {
+            self.notify_attention(key, call);
+        } else {
+            self.attention = Some((key, call));
+        }
+    }
+
+    /// The system notification of a call: the session's title and what happened.
+    fn notify_attention(&self, key: Option<SessionKey>, call: Call) {
+        if !self.notifications_enabled() {
+            return;
+        }
+        let key = key.or_else(|| self.open.as_ref().map(|open| open.summary.key.clone()));
+        let title = key
+            .and_then(|key| {
+                let summary = self.summaries.iter().find(|s| s.key == key).or(self.open.as_ref().map(|open| &open.summary).filter(|s| s.key == key))?;
+                Some(self.placements.get(&key).and_then(|p| p.title.clone()).unwrap_or_else(|| summary.display_title()))
+            })
+            .unwrap_or_else(|| APP_NAME.to_owned());
+        crate::notify::show(&model::shorten(&title, 120), call.text());
     }
 
     /// Reads the open session again and adds what is new, keeping the place in the list.
@@ -3268,16 +3294,7 @@ impl Render for Shell {
             && !window.is_window_active()
         {
             window.request_attention();
-            let key = key.or_else(|| self.open.as_ref().map(|open| open.summary.key.clone()));
-            let title = key
-                .and_then(|key| {
-                    let summary = self.summaries.iter().find(|s| s.key == key).or(self.open.as_ref().map(|open| &open.summary).filter(|s| s.key == key))?;
-                    Some(self.placements.get(&key).and_then(|p| p.title.clone()).unwrap_or_else(|| summary.display_title()))
-                })
-                .unwrap_or_else(|| APP_NAME.to_owned());
-            if self.notifications_enabled() {
-                crate::notify::show(&model::shorten(&title, 120), call.text());
-            }
+            self.notify_attention(key, call);
         }
         let viewer = self.render_viewer(window, cx);
         let context_menu = self.render_context_menu(cx);

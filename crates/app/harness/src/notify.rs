@@ -15,6 +15,7 @@ const POWERSHELL_ID: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowe
 
 /// Shows a notification; errors are dropped, the window flashes anyway.
 pub fn show(title: &str, body: &str) {
+    log::info!("notification: {title}: {body}");
     if let Some(mut command) = command(title, body) {
         let _ = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     }

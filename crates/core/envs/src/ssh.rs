@@ -9,6 +9,7 @@
 //! whole-file reads, uploads, terminals and harness turns get connections of their own.
 //! The remote side needs a POSIX shell and GNU `find`; sessions also need `base64`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -140,6 +141,84 @@ pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
 /// offered to trust).
 pub fn is_unknown_host_key(error: &str) -> bool {
     error.contains("Host key verification failed") && !error.contains("HAS CHANGED")
+}
+
+/// The ways of signing in the host still offered when it let the user in by none:
+/// `Permission denied (publickey,password).` → `["publickey", "password"]`.
+pub fn refused_sign_in(error: &str) -> Option<Vec<String>> {
+    let (_, rest) = error.rsplit_once("Permission denied (")?;
+    let (methods, _) = rest.split_once(')')?;
+    Some(methods.split(',').map(|method| method.trim().to_owned()).filter(|method| !method.is_empty()).collect())
+}
+
+/// Whether `error` says the host takes no password at all, whatever was typed.
+pub fn host_takes_no_password(error: &str) -> bool {
+    refused_sign_in(error).is_some_and(|methods| !methods.iter().any(|method| method == "password" || method == "keyboard-interactive"))
+}
+
+/// The files of host keys that `error` names as holding a key the host no longer shows:
+/// `Offending ED25519 key in <file>:<line>` after `REMOTE HOST IDENTIFICATION HAS CHANGED`.
+pub fn changed_host_key_files(error: &str) -> Vec<String> {
+    if !error.contains("HAS CHANGED") {
+        return Vec::new();
+    }
+    error
+        .lines()
+        .filter_map(|line| {
+            // `Offending ED25519 key in …` or `Offending key for IP in …`.
+            let (_, file) = line.trim().strip_prefix("Offending ")?.split_once(" in ")?;
+            let file = file.trim();
+            let file = match file.rsplit_once(':') {
+                Some((path, number)) if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) => path,
+                _ => file,
+            };
+            Some(file.to_owned())
+        })
+        .collect()
+}
+
+/// Whether the key that changed is only in Bowyer's own file of host keys, the one file the
+/// window may replace it in; one in the user's own files stays theirs to remove.
+pub fn changed_key_is_own(error: &str) -> bool {
+    KNOWN_HOSTS.get().is_some_and(|own| changed_key_is_in(error, own))
+}
+
+fn changed_key_is_in(error: &str, own: &Path) -> bool {
+    // ssh prints the path with either slash, and Windows OpenSSH doubles its backslashes
+    // (`C:\\Users\\…`); Windows paths are compared without case.
+    let normal = |path: &str| {
+        let mut slashed = String::new();
+        for c in path.trim_matches('"').chars() {
+            let c = if c == '\\' { '/' } else { c };
+            if !(c == '/' && slashed.ends_with('/')) {
+                slashed.push(c);
+            }
+        }
+        if cfg!(windows) { slashed.to_lowercase() } else { slashed }
+    };
+    let own = normal(&own.to_string_lossy());
+    let files = changed_host_key_files(error);
+    !files.is_empty() && files.iter().all(|file| normal(file) == own)
+}
+
+/// `known_hosts` text with `new` lines in place of the lines kept for the same host names.
+/// Comments and marker lines (`@cert-authority`, `@revoked`) stay.
+fn merged_known_hosts(text: &str, new: &str) -> String {
+    let names: HashSet<&str> = new.lines().filter_map(|line| line.split_whitespace().next()).flat_map(|names| names.split(',')).collect();
+    let mut merged = String::new();
+    for line in text.lines() {
+        let first = line.split_whitespace().next().unwrap_or_default();
+        let replaced = !line.starts_with(['#', '@']) && first.split(',').any(|name| names.contains(name));
+        if !replaced {
+            merged.push_str(line);
+            merged.push('\n');
+        }
+    }
+    for line in new.lines().filter(|line| !line.trim().is_empty()) {
+        merged.push_str(line);
+        merged.push('\n');
+    }
+    merged
 }
 
 /// The system's own files of host keys, which an option naming Bowyer's file must keep.
@@ -296,23 +375,15 @@ impl SshEnvironment {
         Ok(HostKeys { lines, fingerprints })
     }
 
-    /// Adds keys the user trusted to Bowyer's own file of host keys.
+    /// Puts keys the user trusted in Bowyer's own file of host keys, in place of the keys
+    /// kept there for the same host before (a host whose key changed).
     pub fn trust_host_keys(keys: &HostKeys) -> io::Result<()> {
         let file = KNOWN_HOSTS.get().ok_or_else(|| io::Error::other("no file of host keys"))?;
         if let Some(dir) = file.parent() {
             fs::create_dir_all(dir)?;
         }
-        let mut text = fs::read_to_string(file).unwrap_or_default();
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        for line in keys.lines.lines() {
-            if !text.lines().any(|known| known == line) {
-                text.push_str(line);
-                text.push('\n');
-            }
-        }
-        fs::write(file, text)
+        let text = fs::read_to_string(file).unwrap_or_default();
+        fs::write(file, merged_known_hosts(&text, &keys.lines))
     }
 
     /// Closes the idle sessions of this host.
@@ -806,7 +877,6 @@ mod tests {
         assert_eq!(askpass_answer(nobody, "(me@vm) Password: "), None, "no password kept, no answer");
     }
 
-    #[cfg(windows)]
     #[test]
     fn askpass_answers_a_password_question_with_the_kept_password() {
         if !crate::secret::usable_in_tests() {
@@ -834,6 +904,54 @@ mod tests {
         assert!(is_unknown_host_key("No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\r\nHost key verification failed."));
         assert!(!is_unknown_host_key("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed."));
         assert!(!is_unknown_host_key("Permission denied (password)."));
+    }
+
+    #[test]
+    fn a_host_without_passwords_is_told_from_a_wrong_password() {
+        let keys_only = "user@vm.example: Permission denied (publickey).\r\n";
+        assert_eq!(refused_sign_in(keys_only), Some(vec!["publickey".to_owned()]));
+        assert!(host_takes_no_password(keys_only));
+        assert!(!host_takes_no_password("user@vm.example: Permission denied (publickey,password)."), "a wrong password");
+        assert!(!host_takes_no_password("Permission denied (publickey,keyboard-interactive)."));
+        assert!(!host_takes_no_password("ssh: connect to host vm.example port 22: Connection timed out"));
+        assert_eq!(refused_sign_in("Connection closed"), None);
+    }
+
+    #[test]
+    fn a_changed_key_is_replaced_only_in_bowyers_own_file() {
+        let own = Path::new(r"C:\data dir\Bowyer\known_hosts");
+        let changed = |file: &str| {
+            format!(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+                 The fingerprint for the ED25519 key sent by the remote host is\r\n\
+                 SHA256:AAAA.\r\n\
+                 Add correct host key in C:\\Users\\someone/.ssh/known_hosts to get rid of this message.\r\n\
+                 Offending ED25519 key in {file}:3\r\n\
+                 Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\r\n\
+                 Host key verification failed."
+            )
+        };
+        assert_eq!(changed_host_key_files(&changed(r"C:\data dir\Bowyer\known_hosts")), [r"C:\data dir\Bowyer\known_hosts"]);
+        assert!(changed_key_is_in(&changed(r"C:\data dir\Bowyer\known_hosts"), own));
+        assert!(changed_key_is_in(&changed("C:/data dir/Bowyer/known_hosts"), own), "either slash");
+        // As Windows OpenSSH prints it.
+        assert!(changed_key_is_in(&changed(r"C:\\data dir\\Bowyer\\known_hosts"), own), "doubled backslashes");
+        assert!(!changed_key_is_in(&changed(r"C:\Users\someone/.ssh/known_hosts"), own), "the user's own file stays theirs");
+        let both = changed(r"C:\data dir\Bowyer\known_hosts") + "\r\nOffending key for IP in C:\\Users\\someone/.ssh/known_hosts:7";
+        assert!(!changed_key_is_in(&both, own), "a key in the user's file too");
+        assert!(!changed_key_is_in("No ED25519 host key is known for vm\r\nHost key verification failed.", own));
+        assert!(changed_host_key_files("Offending ED25519 key in /a:1").is_empty(), "only after a change");
+    }
+
+    #[test]
+    fn trusted_keys_take_the_place_of_the_old_keys_of_their_host() {
+        let kept = "# Bowyer\n[127.0.0.1]:2222 ssh-ed25519 OLD\nvm ssh-rsa VM\n[127.0.0.1]:2222 ssh-rsa OLDRSA\n@revoked [127.0.0.1]:2222 ssh-rsa BAD\n";
+        let new = "[127.0.0.1]:2222 ssh-ed25519 NEW\n";
+        assert_eq!(merged_known_hosts(kept, new), "# Bowyer\nvm ssh-rsa VM\n@revoked [127.0.0.1]:2222 ssh-rsa BAD\n[127.0.0.1]:2222 ssh-ed25519 NEW\n");
+        assert_eq!(merged_known_hosts("", new), new);
+        assert_eq!(merged_known_hosts("other,10.0.0.1 ssh-ed25519 X", "10.0.0.1 ssh-ed25519 Y\n"), "10.0.0.1 ssh-ed25519 Y\n", "a line with several names");
+        assert_eq!(merged_known_hosts(new, new), new, "trusting twice keeps one line");
     }
 
     #[test]

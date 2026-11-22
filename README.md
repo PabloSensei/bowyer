@@ -101,12 +101,12 @@
 
 And more:
 
-- **SSH hosts from the window.** Add `user@host` with a key of its own or, on Windows, a password kept in Windows Credential Manager. The connection is checked before it is saved, an unknown host key is shown by its fingerprint before you trust it, and sessions on the host appear next to local ones.
+- **SSH hosts from the window.** Add `user@host` with a key of its own or a password kept by the system: Windows Credential Manager, the macOS Keychain, or the Secret Service keyring on Linux (GNOME Keyring, KWallet, KeePassXC; the Linux keyring tried against a test keyring only). The connection is checked before it is saved, an unknown host key is shown by its fingerprint before you trust it, and sessions on the host appear next to local ones.
 - **Memory for your agents.** `bowyer mcp` is an MCP server: an agent searches and reads past sessions of the project and keeps notes there instead of carrying them in its context. One switch turns it off, another turns it off for a single project, and the window shows the command that connects it to Claude Code, Codex or OpenCode.
 - **MCP servers and plugins** of each harness at a glance; Claude Code plugins switch on and off (Bowyer keeps a backup of the settings it changes).
 - **Settings in one place:** language, appearance, sessions, harnesses, SSH hosts, terminal, search, memory and updates.
 - **Themes.** Seven built in (Dark, Light, High Contrast, Retro, Nord, Mocha, Paper), your own as JSON with a live editor, and import of VS Code themes and IntelliJ `.icls` schemes. The interface speaks English, Simplified Chinese, Spanish, Brazilian Portuguese, German, French, Japanese and Russian.
-- **Stays out of the way.** On Windows, closing the window can keep Bowyer in the notification area, watching your sessions.
+- **Stays out of the way.** Closing the window can keep Bowyer in the notification area, watching your sessions: on Windows, and on Linux desktops whose panel shows tray icons (StatusNotifierItem: KDE, GNOME with the AppIndicator extension, waybar and others).
 - **Updates itself** from a signed feed: it checks on start and twice a day, and installs only when you click.
 
 ## Install
@@ -155,7 +155,7 @@ Known limitations of this preview:
 - Linux and macOS are built and tested by CI, but used far less than the Windows build.
 - Codex and DeepSeek Harness support is written but has not been tried against a real installation yet. Claude Code and OpenCode are used every day.
 - The packages are not code-signed or notarized.
-- The notification area icon is Windows only.
+- The notification area icon is on Windows and Linux; macOS has none yet. On Linux it has been tried against a test panel only.
 
 ## Build from source
 

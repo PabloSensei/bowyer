@@ -1,7 +1,11 @@
-//! The icon of Bowyer in the notification area of Windows. A click shows the window (also
-//! when it was hidden there on close), the menu shows it or quits. The icon lives on a thread
-//! of its own with a hidden window for its messages, and comes back when Explorer restarts.
-//! Other systems have no icon yet.
+//! The icon of Bowyer in the notification area. A click shows the window (also when it was
+//! hidden there on close), the menu shows it or quits.
+//!
+//! Windows: the icon lives on a thread of its own with a hidden window for its messages, and
+//! comes back when Explorer restarts. Linux: a StatusNotifierItem with a dbusmenu menu on the
+//! session bus, registered with the desktop's StatusNotifierWatcher (KDE, GNOME with the
+//! AppIndicator extension, waybar, …); without a watcher there is no icon. There the window
+//! is not hidden but closed, and the icon opens it again. macOS has no icon yet.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,14 +24,35 @@ pub fn close_to_tray() -> bool {
     CLOSE_TO_TRAY.load(Ordering::Relaxed)
 }
 
+/// Whether the window is away in the icon: hidden (Windows) or closed (Linux). Nothing is
+/// drawn then, so what would be said while drawing is said at once.
+static WINDOW_AWAY: AtomicBool = AtomicBool::new(false);
+
+pub fn window_away() -> bool {
+    WINDOW_AWAY.load(Ordering::Relaxed)
+}
+
+pub fn set_window_away(away: bool) {
+    WINDOW_AWAY.store(away, Ordering::Relaxed);
+}
+
+/// Whether the icon is in the notification area.
+pub fn icon_up() -> bool {
+    ICON_UP.load(Ordering::Relaxed)
+}
+
 /// Whether closing the window should hide it: asked for, and the icon is there to bring it back.
 pub fn hides_on_close() -> bool {
-    close_to_tray() && ICON_UP.load(Ordering::Relaxed)
+    close_to_tray() && icon_up()
 }
 
 /// What the user asked of the icon that the window has to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
+    /// Bring the window back, opening it again where closing took it away. (The icon of
+    /// Windows shows the window itself.)
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Show,
     Quit,
 }
 
@@ -35,6 +60,8 @@ pub enum TrayEvent {
 pub struct Tray {
     #[cfg(windows)]
     hwnd: usize,
+    #[cfg(target_os = "linux")]
+    connection: zbus::blocking::Connection,
 }
 
 /// The words of the icon, in the language of the window.
@@ -45,8 +72,9 @@ pub struct TrayText {
 }
 
 impl Tray {
-    /// Puts the icon up for the window `main` (its `HWND`). `None` when the system has none.
-    pub fn start(main: usize, text: TrayText) -> Option<(Tray, UnboundedReceiver<TrayEvent>)> {
+    /// Puts the icon up for the window `main` (its `HWND` on Windows). `None` when the
+    /// system has no notification area.
+    pub fn start(main: Option<usize>, text: TrayText) -> Option<(Tray, UnboundedReceiver<TrayEvent>)> {
         let (sender, receiver) = unbounded();
         let tray = imp::start(main, text, sender)?;
         ICON_UP.store(true, Ordering::Relaxed);
@@ -78,18 +106,272 @@ pub fn close_window(window: &mut ui_kit::Window) {
 
 /// Hides the window `main` (its `HWND`): it stays reachable from the icon.
 pub fn hide_window(main: usize) {
+    set_window_away(true);
     imp::hide_window(main);
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use super::*;
 
-    pub fn start(_main: usize, _text: TrayText, _sender: UnboundedSender<TrayEvent>) -> Option<Tray> {
+    pub fn start(_main: Option<usize>, _text: TrayText, _sender: UnboundedSender<TrayEvent>) -> Option<Tray> {
         None
     }
 
     pub fn remove(_tray: &Tray) {}
+
+    pub fn hide_window(_main: usize) {}
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::collections::HashMap;
+
+    use zbus::blocking::Connection;
+    use zbus::blocking::connection::Builder;
+    use zbus::interface;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Structure, StructureBuilder, Value};
+
+    use super::*;
+
+    const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+    const ITEM_PATH: &str = "/StatusNotifierItem";
+    const MENU_PATH: &str = "/MenuBar";
+    const OPEN: i32 = 1;
+    const SEPARATOR: i32 = 2;
+    const QUIT: i32 = 3;
+
+    /// The picture of the icon: ARGB32 in network byte order, at sizes hosts ask for.
+    type Pixmaps = Vec<(i32, i32, Vec<u8>)>;
+    /// A dbusmenu item with its children: `(ia{sv}av)`.
+    type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+    fn pixmaps() -> Pixmaps {
+        let Ok(image) = image::load_from_memory(include_bytes!("../../../../assets/icon/bowyer-256.png")) else { return Vec::new() };
+        [22u32, 32, 48, 64]
+            .into_iter()
+            .map(|side| {
+                let rgba = image::imageops::resize(&image.to_rgba8(), side, side, image::imageops::FilterType::Lanczos3);
+                let argb = rgba.pixels().flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]]).collect();
+                (side as i32, side as i32, argb)
+            })
+            .collect()
+    }
+
+    struct Item {
+        title: String,
+        pixmaps: Pixmaps,
+        sender: UnboundedSender<TrayEvent>,
+    }
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl Item {
+        #[zbus(property)]
+        fn category(&self) -> &str {
+            "ApplicationStatus"
+        }
+
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "bowyer"
+        }
+
+        #[zbus(property)]
+        fn title(&self) -> &str {
+            &self.title
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> &str {
+            "Active"
+        }
+
+        #[zbus(property)]
+        fn window_id(&self) -> i32 {
+            0
+        }
+
+        /// No name from the icon theme: an AppImage installs none, and some hosts show
+        /// nothing rather than the picture when the name is not found.
+        #[zbus(property)]
+        fn icon_name(&self) -> &str {
+            ""
+        }
+
+        #[zbus(property)]
+        fn icon_pixmap(&self) -> Pixmaps {
+            self.pixmaps.clone()
+        }
+
+        #[zbus(property)]
+        fn tool_tip(&self) -> (String, Pixmaps, String, String) {
+            (String::new(), Vec::new(), self.title.clone(), String::new())
+        }
+
+        #[zbus(property)]
+        fn item_is_menu(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn menu(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(MENU_PATH).expect("a valid object path")
+        }
+
+        fn activate(&self, _x: i32, _y: i32) {
+            let _ = self.sender.unbounded_send(TrayEvent::Show);
+        }
+
+        fn secondary_activate(&self, _x: i32, _y: i32) {
+            let _ = self.sender.unbounded_send(TrayEvent::Show);
+        }
+
+        fn context_menu(&self, _x: i32, _y: i32) {}
+
+        fn scroll(&self, _delta: i32, _orientation: &str) {}
+    }
+
+    /// The menu of the icon, as the dbusmenu protocol lays it out: a root (0) with the open
+    /// item, a separator and the quit item.
+    struct Menu {
+        open: String,
+        quit: String,
+        sender: UnboundedSender<TrayEvent>,
+    }
+
+    impl Menu {
+        fn properties(&self, id: i32) -> HashMap<String, OwnedValue> {
+            let mut properties = HashMap::new();
+            let mut put = |key: &str, value: Value<'_>| {
+                if let Ok(value) = OwnedValue::try_from(value) {
+                    properties.insert(key.to_owned(), value);
+                }
+            };
+            match id {
+                0 => put("children-display", Value::from("submenu")),
+                OPEN => put("label", Value::from(self.open.as_str())),
+                SEPARATOR => put("type", Value::from("separator")),
+                QUIT => put("label", Value::from(self.quit.as_str())),
+                _ => {}
+            }
+            properties
+        }
+
+        /// An item as a `(ia{sv}av)` structure, for the children of the root.
+        fn node(&self, id: i32) -> Option<OwnedValue> {
+            let structure: Structure<'_> = StructureBuilder::new()
+                .add_field(id)
+                .add_field(self.properties(id))
+                .add_field(Vec::<OwnedValue>::new())
+                .build()
+                .ok()?;
+            OwnedValue::try_from(Value::from(structure)).ok()
+        }
+    }
+
+    #[interface(name = "com.canonical.dbusmenu")]
+    impl Menu {
+        #[zbus(property)]
+        fn version(&self) -> u32 {
+            3
+        }
+
+        #[zbus(property)]
+        fn text_direction(&self) -> &str {
+            "ltr"
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> &str {
+            "normal"
+        }
+
+        #[zbus(property)]
+        fn icon_theme_path(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn get_layout(&self, parent_id: i32, _recursion_depth: i32, _property_names: Vec<String>) -> (u32, Layout) {
+            let children = if parent_id == 0 { [OPEN, SEPARATOR, QUIT].into_iter().filter_map(|id| self.node(id)).collect() } else { Vec::new() };
+            (1, (parent_id, self.properties(parent_id), children))
+        }
+
+        fn get_group_properties(&self, ids: Vec<i32>, _property_names: Vec<String>) -> Vec<(i32, HashMap<String, OwnedValue>)> {
+            let ids = if ids.is_empty() { vec![0, OPEN, SEPARATOR, QUIT] } else { ids };
+            ids.into_iter().map(|id| (id, self.properties(id))).collect()
+        }
+
+        fn get_property(&self, id: i32, name: &str) -> OwnedValue {
+            self.properties(id).remove(name).unwrap_or_else(|| OwnedValue::from(0i32))
+        }
+
+        fn event(&self, id: i32, event_id: &str, _data: OwnedValue, _timestamp: u32) {
+            if event_id != "clicked" {
+                return;
+            }
+            let event = match id {
+                OPEN => TrayEvent::Show,
+                QUIT => TrayEvent::Quit,
+                _ => return,
+            };
+            let _ = self.sender.unbounded_send(event);
+        }
+
+        fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
+            for (id, event_id, data, timestamp) in events {
+                self.event(id, &event_id, data, timestamp);
+            }
+            Vec::new()
+        }
+
+        fn about_to_show(&self, _id: i32) -> bool {
+            false
+        }
+
+        fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    fn register(connection: &Connection, name: &str) -> zbus::Result<()> {
+        connection.call_method(Some(WATCHER), "/StatusNotifierWatcher", Some(WATCHER), "RegisterStatusNotifierItem", &(name,)).map(|_| ())
+    }
+
+    pub fn start(_main: Option<usize>, text: TrayText, sender: UnboundedSender<TrayEvent>) -> Option<Tray> {
+        let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
+        let item = Item { title: text.tooltip, pixmaps: pixmaps(), sender: sender.clone() };
+        let menu = Menu { open: text.open, quit: text.quit, sender };
+        let built = Builder::session().and_then(|builder| builder.name(name.as_str())?.serve_at(ITEM_PATH, item)?.serve_at(MENU_PATH, menu)?.build());
+        let connection = match built {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::info!("no session bus for the tray icon: {error}");
+                return None;
+            }
+        };
+        // No watcher: the desktop shows no such icons.
+        if let Err(error) = register(&connection, &name) {
+            log::info!("no StatusNotifierWatcher for the tray icon: {error}");
+            return None;
+        }
+        // A watcher that starts again (a restarted panel) forgets the icon: register anew.
+        let watch = connection.clone();
+        let _ = std::thread::Builder::new().name("tray".into()).spawn(move || {
+            let Ok(bus) = zbus::blocking::fdo::DBusProxy::new(&watch) else { return };
+            let Ok(changes) = bus.receive_name_owner_changed() else { return };
+            for change in changes {
+                let Ok(args) = change.args() else { continue };
+                if args.name().as_str() == WATCHER && args.new_owner().is_some() {
+                    let _ = register(&watch, &name);
+                }
+            }
+        });
+        Some(Tray { connection })
+    }
+
+    pub fn remove(tray: &Tray) {
+        let _ = tray.connection.release_name(format!("org.kde.StatusNotifierItem-{}-1", std::process::id()));
+    }
 
     pub fn hide_window(_main: usize) {}
 }
@@ -136,7 +418,8 @@ mod imp {
         text.encode_utf16().chain([0]).collect()
     }
 
-    pub fn start(main: usize, text: TrayText, sender: UnboundedSender<TrayEvent>) -> Option<Tray> {
+    pub fn start(main: Option<usize>, text: TrayText, sender: UnboundedSender<TrayEvent>) -> Option<Tray> {
+        let main = main?;
         let (ready, hwnd) = mpsc::channel::<Option<usize>>();
         std::thread::Builder::new()
             .name("tray".into())
@@ -219,6 +502,7 @@ mod imp {
 
     /// Brings the window back: shown, restored and in front.
     unsafe fn show_main(main: HWND) {
+        set_window_away(false);
         unsafe {
             if IsWindowVisible(main) == 0 {
                 ShowWindow(main, SW_SHOW);

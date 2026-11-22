@@ -3,6 +3,8 @@
 //! application stores only the path, never the user's `~/.ssh/config`. A password goes to
 //! the system's store (see `envs::secret`). A host whose key ssh does not know shows its
 //! fingerprints, and its keys go to Bowyer's own file of host keys once the user trusts them.
+//! A key that changed in that file is offered for replacement the same way, with a warning;
+//! one in the user's own files is theirs to remove.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +28,8 @@ pub(super) struct SshForm {
     pub message: Option<(bool, String)>,
     /// The keys of a host ssh does not know, waiting for the user to trust them.
     pub unknown_keys: Option<HostKeys>,
+    /// Whether those keys take the place of a changed key in Bowyer's own file.
+    pub key_changed: bool,
 }
 
 /// How a new host signs in.
@@ -81,6 +85,7 @@ impl Shell {
                 busy: false,
                 message: None,
                 unknown_keys: None,
+                key_changed: false,
             });
             self.ssh_focus.focus(window, cx);
         }
@@ -192,8 +197,9 @@ impl Shell {
                             None => envs::secret::remove(&probe.host),
                         };
                     }
-                    // An unknown host key: its fingerprints, for the user to compare.
-                    let keys = envs::is_unknown_host_key(&error).then(|| probe.scan_host_keys());
+                    // An unknown host key, or a changed one in Bowyer's own file: its
+                    // fingerprints, for the user to compare.
+                    let keys = (envs::is_unknown_host_key(&error) || envs::changed_key_is_own(&error)).then(|| probe.scan_host_keys());
                     Err((error, keys))
                 }
             }
@@ -221,15 +227,34 @@ impl Shell {
                     Err((error, keys)) => {
                         if let Some(form) = &mut this.ssh_form {
                             form.busy = false;
+                            let changed = envs::changed_key_is_own(&error);
                             match keys {
                                 Some(Ok(keys)) => {
-                                    form.message = Some((true, t("ssh.unknown_key").to_owned()));
+                                    form.message = Some(if changed {
+                                        (false, t("ssh.changed_key").to_owned())
+                                    } else {
+                                        (true, t("ssh.unknown_key").to_owned())
+                                    });
                                     form.unknown_keys = Some(keys);
+                                    form.key_changed = changed;
                                 }
                                 Some(Err(scan)) => {
                                     form.message = Some((false, model::shorten(&format!("{error}\n{}: {scan}", t("ssh.keyscan_failed")), 300)));
                                 }
-                                None => form.message = Some((false, model::shorten(&error, 240))),
+                                None => {
+                                    // A changed key in the user's own file: ssh's long warning
+                                    // would be cut before the file it names.
+                                    let text = match envs::changed_host_key_files(&error).first() {
+                                        Some(file) => t("ssh.changed_key_elsewhere").replace("{file}", file),
+                                        // The host's sshd lets no password in: no password
+                                        // typed here would help.
+                                        None if ssh.password && envs::host_takes_no_password(&error) => {
+                                            t("ssh.password_off").replace("{host}", &host)
+                                        }
+                                        None => model::shorten(&error, 240),
+                                    };
+                                    form.message = Some((false, text));
+                                }
                             }
                         }
                     }
@@ -312,6 +337,7 @@ impl Shell {
         });
         let fingerprints: Vec<String> = form.unknown_keys.as_ref().map(|keys| keys.fingerprints.clone()).unwrap_or_default();
         let trusting = form.unknown_keys.is_some();
+        let replacing = trusting && form.key_changed;
         let busy = form.busy;
         let known: Vec<(String, Option<String>)> = self
             .ssh_hosts
@@ -366,13 +392,20 @@ impl Shell {
                 .child(field)
                 .children(password_field)
                 .when(uses_password, |this| {
-                    this.child(div().text_size(px(11.)).text_color(theme.text_muted).child(t("ssh.password_stored")))
+                    let stored = match envs::secret::store_kind() {
+                        Some(envs::secret::Store::Keychain) => t("ssh.password_stored_keychain"),
+                        Some(envs::secret::Store::SecretService) => t("ssh.password_stored_keyring"),
+                        _ => t("ssh.password_stored"),
+                    };
+                    this.child(div().text_size(px(11.)).text_color(theme.text_muted).child(stored))
                 })
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
+                        .gap(px(6.))
                         .child(chip("ssh-key", key_label, &theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             if let Some(form) = &mut this.ssh_form {
                                 form.way = (form.way + 1) % form.ways.len().max(1);
@@ -386,6 +419,7 @@ impl Shell {
                         .child(
                             div()
                                 .id("ssh-connect")
+                                .flex_none()
                                 .h(px(26.))
                                 .px(px(12.))
                                 .flex()
@@ -396,6 +430,8 @@ impl Shell {
                                 .text_size(px(12.))
                                 .child(if busy {
                                     t("ssh.probing")
+                                } else if replacing {
+                                    t("ssh.replace_key")
                                 } else if trusting {
                                     t("ssh.trust")
                                 } else {
