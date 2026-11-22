@@ -212,9 +212,9 @@ impl Pty {
         self.job.process_ids().unwrap_or_default()
     }
 
-    /// Finds the console programs below the shell and pulls them into the job. A shell such
-    /// as PowerShell 7 starts native commands outside the job, so `TerminateJobObject` alone
-    /// would leave them running. Window programs are left alone, and so is everything they
+    /// Finds the console programs below the shell and pulls them into the job: whatever the
+    /// shell starts leaves the job, so `TerminateJobObject` alone would leave them running.
+    /// Window programs are left alone, and so is everything they
     /// start: an editor or a browser the user launched from the terminal does not belong to
     /// the session and must not die with it. Returns how many processes were added.
     pub(crate) fn adopt(&self) -> usize {

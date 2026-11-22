@@ -1,6 +1,10 @@
 //! A host over SSH through the `ssh` program of the system, so `~/.ssh/config`, keys and
 //! the agent work as they do in a terminal. Connections use `BatchMode`: a host that needs
 //! a password typed in shows up as an error, never as a prompt hidden behind the window.
+//! A host the user gave a password to signs in without `BatchMode`: `ssh` asks Bowyer for
+//! the password (`SSH_ASKPASS`), which reads it from the system's store, and an unknown
+//! host key fails instead of being asked about. Host keys the user trusted in the window go
+//! to Bowyer's own file, never to `~/.ssh`.
 //! Short calls go through a persistent shell session of the host ([`crate::session`]);
 //! whole-file reads, uploads, terminals and harness turns get connections of their own.
 //! The remote side needs a POSIX shell and GNU `find`; sessions also need `base64`.
@@ -9,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use model::EnvId;
 
@@ -95,22 +99,94 @@ fn interactive_script(program: &str, args: &[&str]) -> String {
     format!("exec \"${{SHELL:-sh}}\" -lc {}", shell_quote(&inner))
 }
 
-#[derive(Clone, Debug)]
+/// The program `ssh` asks for a password: Bowyer itself (see [`askpass_answer`]).
+static ASKPASS: OnceLock<PathBuf> = OnceLock::new();
+/// Bowyer's own file of host keys, which the user trusted in the window.
+static KNOWN_HOSTS: OnceLock<PathBuf> = OnceLock::new();
+
+/// The variable that tells Bowyer it was started by `ssh` as an askpass program, and for
+/// which host.
+pub const ASKPASS_HOST: &str = "BOWYER_ASKPASS_HOST";
+
+/// Sets the askpass program; the running executable when never set.
+pub fn set_askpass(program: PathBuf) {
+    let _ = ASKPASS.set(program);
+}
+
+/// Sets Bowyer's own file of host keys, read next to the user's own.
+pub fn set_known_hosts(file: PathBuf) {
+    let _ = KNOWN_HOSTS.set(file);
+}
+
+fn askpass() -> Option<PathBuf> {
+    ASKPASS.get().cloned().or_else(|| std::env::current_exe().ok())
+}
+
+/// The answer of the askpass program to `prompt` for `host`: the kept password when `ssh`
+/// asks for a password, nothing for any other question. A host key question in particular
+/// must never get the password: `ssh` would ask again and again.
+pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
+    let prompt = prompt.to_lowercase();
+    // The host key question is "(yes/no/[fingerprint])?" and then "Please type 'yes', 'no' or
+    // the fingerprint"; a password prompt names the user and host, which may hold any word.
+    let host_key_question = prompt.contains("(yes/no") || prompt.contains("'yes'");
+    if !prompt.contains("password") || host_key_question {
+        return None;
+    }
+    crate::secret::load(host)
+}
+
+/// Whether `error` says the host's key is not known (rather than changed, which is never
+/// offered to trust).
+pub fn is_unknown_host_key(error: &str) -> bool {
+    error.contains("Host key verification failed") && !error.contains("HAS CHANGED")
+}
+
+/// The system's own files of host keys, which an option naming Bowyer's file must keep.
+#[cfg(windows)]
+const GLOBAL_KNOWN_HOSTS: &str = r"__PROGRAMDATA__\ssh/ssh_known_hosts __PROGRAMDATA__\ssh/ssh_known_hosts2";
+#[cfg(not(windows))]
+const GLOBAL_KNOWN_HOSTS: &str = "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2";
+
+/// The keys a host shows, read without signing in, for the user to trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostKeys {
+    /// Lines for a `known_hosts` file.
+    pub lines: String,
+    /// The fingerprints, one line per key: `SHA256:… (ED25519)`.
+    pub fingerprints: Vec<String>,
+}
+
+#[derive(Clone)]
 pub struct SshEnvironment {
     /// The alias of `~/.ssh/config` or `user@host`.
     pub host: String,
     pub ssh: PathBuf,
     /// A private key of this host, kept by the application rather than in `~/.ssh/config`.
     pub identity: Option<PathBuf>,
+    /// Whether the host signs in with the password kept in the system's store.
+    pub password: bool,
+}
+
+impl std::fmt::Debug for SshEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshEnvironment").field("host", &self.host).field("identity", &self.identity).field("password", &self.password).finish()
+    }
 }
 
 impl SshEnvironment {
     pub fn new(host: &str) -> Self {
-        Self { host: host.to_owned(), ssh: PathBuf::from("ssh"), identity: None }
+        Self { host: host.to_owned(), ssh: PathBuf::from("ssh"), identity: None, password: false }
     }
 
     pub fn with_identity(mut self, identity: Option<PathBuf>) -> Self {
         self.identity = identity;
+        self
+    }
+
+    /// A host that signs in with the password kept for it (see [`crate::secret`]).
+    pub fn with_password(mut self, password: bool) -> Self {
+        self.password = password;
         self
     }
 
@@ -120,30 +196,123 @@ impl SshEnvironment {
         if let Some(identity) = &self.identity {
             options.extend(["-i".into(), identity.to_string_lossy().into_owned(), "-o".into(), "IdentitiesOnly=yes".into()]);
         }
+        if let Some(file) = KNOWN_HOSTS.get().filter(|file| file.is_file()) {
+            options.extend(["-o".into(), format!("GlobalKnownHostsFile={GLOBAL_KNOWN_HOSTS} \"{}\"", file.display())]);
+        }
+        if self.password {
+            // One try of the password, and no question about an unknown host key: askpass
+            // would get it, and only the window may answer it.
+            options.extend(
+                ["-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=yes"]
+                    .map(str::to_owned),
+            );
+        }
         options
+    }
+
+    /// `BatchMode` turns password sign-in off, so a password host goes without it; its
+    /// password comes from the askpass program, never from a prompt behind the window.
+    fn batch_mode(&self) -> &'static str {
+        if self.password { "BatchMode=no" } else { "BatchMode=yes" }
+    }
+
+    /// The variables that make `ssh` ask Bowyer for the password of this host.
+    pub fn askpass_env(&self) -> Vec<(String, String)> {
+        let Some(program) = askpass().filter(|_| self.password) else { return Vec::new() };
+        vec![
+            ("SSH_ASKPASS".into(), program.to_string_lossy().into_owned()),
+            ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
+            (ASKPASS_HOST.into(), self.host.clone()),
+        ]
     }
 
     fn base_command(&self) -> Command {
         let mut command = Command::new(&self.ssh);
-        command.args(["-o", "BatchMode=yes", "-T"]);
+        command.args(["-o", self.batch_mode(), "-T"]);
         command.args(self.options());
         command.arg(&self.host);
+        command.envs(self.askpass_env());
         command
     }
 
     /// The sessions of this host and key, shared by every copy of the environment.
     fn sessions(&self) -> Arc<Sessions> {
-        sessions_for(&format!("{}|{}|{:?}", self.ssh.display(), self.host, self.identity))
+        sessions_for(&format!("{}|{}|{:?}|{}", self.ssh.display(), self.host, self.identity, self.password))
     }
 
     /// The connection a session runs over: a dead one is noticed within a minute.
     fn session_command(&self) -> Command {
         let mut command = Command::new(&self.ssh);
-        command.args(["-o", "BatchMode=yes", "-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
+        command.args(["-o", self.batch_mode(), "-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
         command.args(self.options());
         command.args([self.host.as_str(), "--"]);
+        command.envs(self.askpass_env());
         hide_console(&mut command);
         command
+    }
+
+    /// Reads the keys of the host without signing in (`ssh-keyscan` at the address and
+    /// port `ssh -G` resolves), for the user to compare and trust.
+    pub fn scan_host_keys(&self) -> io::Result<HostKeys> {
+        let mut resolve = Command::new(&self.ssh);
+        resolve.arg("-G").args(self.options()).arg(&self.host);
+        hide_console(&mut resolve);
+        let config = String::from_utf8_lossy(&resolve.output()?.stdout).into_owned();
+        let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()));
+        let hostname = value("hostname ").ok_or_else(|| io::Error::other("ssh -G named no host"))?;
+        let port = value("port ").unwrap_or_else(|| "22".into());
+        let mut scan = Command::new(self.ssh.with_file_name("ssh-keyscan"));
+        scan.args(["-T", "8", "-p", &port, &hostname]);
+        hide_console(&mut scan);
+        let scanned = scan.output()?;
+        let mut lines = String::from_utf8_lossy(&scanned.stdout).lines().filter(|line| !line.starts_with('#') && !line.trim().is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        if lines.is_empty() {
+            let message = String::from_utf8_lossy(&scanned.stderr).trim().to_owned();
+            return Err(io::Error::other(if message.is_empty() { format!("{hostname}:{port}: no keys") } else { message }));
+        }
+        // A `HostKeyAlias` is the name ssh looks the key up by.
+        if let Some(alias) = value("hostkeyalias ").filter(|alias| alias != "none") {
+            for line in &mut lines {
+                if let Some((_, rest)) = line.split_once(' ') {
+                    *line = format!("{alias} {rest}");
+                }
+            }
+        }
+        let lines = lines.join("\n") + "\n";
+        let mut keygen = Command::new(self.ssh.with_file_name("ssh-keygen"));
+        keygen.args(["-l", "-f", "-"]);
+        hide_console(&mut keygen);
+        let listed = crate::output_with_input(keygen, lines.as_bytes())?;
+        // `256 SHA256:… [host]:port (ED25519)` → `SHA256:… (ED25519)`.
+        let fingerprints = listed
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let fingerprint = words.nth(1)?;
+                let kind = line.rsplit_once(' ').map(|(_, kind)| kind).unwrap_or_default();
+                Some(format!("{fingerprint} {kind}"))
+            })
+            .collect();
+        Ok(HostKeys { lines, fingerprints })
+    }
+
+    /// Adds keys the user trusted to Bowyer's own file of host keys.
+    pub fn trust_host_keys(keys: &HostKeys) -> io::Result<()> {
+        let file = KNOWN_HOSTS.get().ok_or_else(|| io::Error::other("no file of host keys"))?;
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut text = fs::read_to_string(file).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        for line in keys.lines.lines() {
+            if !text.lines().any(|known| known == line) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        fs::write(file, text)
     }
 
     /// Closes the idle sessions of this host.
@@ -496,6 +665,8 @@ impl Environment for SshEnvironment {
         command.arg("-t");
         command.args(self.options());
         command.args([&self.host, "--", &script]);
+        // A terminal that drops these variables gets the password prompt of ssh itself.
+        command.envs(self.askpass_env());
         command
     }
 
@@ -581,6 +752,88 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-i", "k"]));
         assert!(args.contains(&"-T".to_owned()));
         assert_eq!(args.last().unwrap(), r#"exec "${SHELL:-sh}" -lc 'exec claude -p'"#);
+    }
+
+    fn words(command: &Command) -> Vec<String> {
+        command.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn envs(command: &Command) -> Vec<(String, String)> {
+        command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+            .collect()
+    }
+
+    #[test]
+    fn a_password_host_asks_bowyer_and_never_about_host_keys() {
+        let host = SshEnvironment::new("me@vm").with_password(true);
+        for command in [host.headless("claude", &[], None), host.session_command(), host.interactive("", &[], None)] {
+            let args = words(&command);
+            assert!(!args.contains(&"BatchMode=yes".to_owned()), "{args:?}");
+            for option in ["StrictHostKeyChecking=yes", "NumberOfPasswordPrompts=1", "PreferredAuthentications=keyboard-interactive,password"] {
+                assert!(args.windows(2).any(|w| w == ["-o", option]), "{option} in {args:?}");
+            }
+            let envs = envs(&command);
+            assert!(envs.contains(&("SSH_ASKPASS_REQUIRE".into(), "force".into())), "{envs:?}");
+            assert!(envs.contains(&(ASKPASS_HOST.into(), "me@vm".into())), "{envs:?}");
+            assert!(envs.iter().any(|(key, value)| key == "SSH_ASKPASS" && !value.is_empty()), "{envs:?}");
+        }
+        assert!(!format!("{host:?}").contains("askpass"), "the debug form names no secret");
+    }
+
+    #[test]
+    fn a_key_host_stays_in_batch_mode_without_askpass() {
+        let host = SshEnvironment::new("vm");
+        let command = host.headless("claude", &[], None);
+        assert!(words(&command).windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(!words(&command).contains(&"StrictHostKeyChecking=yes".to_owned()), "the user's own policy holds");
+        assert!(envs(&command).is_empty());
+        assert!(envs(&host.interactive("", &[], None)).is_empty());
+    }
+
+    #[test]
+    fn askpass_answers_only_a_password_question() {
+        let nobody = "nobody-bowyer-test@example.invalid";
+        for prompt in [
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
+            "Please type 'yes', 'no' or the fingerprint: ",
+            "Enter passphrase for key '/home/me/.ssh/id_ed25519': ",
+            "Verification code: ",
+        ] {
+            assert_eq!(askpass_answer(nobody, prompt), None, "{prompt}");
+        }
+        assert_eq!(askpass_answer(nobody, "(me@vm) Password: "), None, "no password kept, no answer");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn askpass_answers_a_password_question_with_the_kept_password() {
+        if !crate::secret::usable_in_tests() {
+            return;
+        }
+        let host = format!("hayes-{}@bayes.example.invalid", std::process::id());
+        crate::secret::store(&host, "s3cret").unwrap();
+        let answers = [
+            askpass_answer(&host, "(me@vm) Password: "),
+            askpass_answer(&host, "me@vm's password: "),
+            // A user or host may hold "yes" or "fingerprint" in its name.
+            askpass_answer(&host, "(hayes@fingerprint-yes.example) Password: "),
+        ];
+        let refused = [
+            askpass_answer(&host, "Please type 'yes', 'no' or the fingerprint: "),
+            askpass_answer(&host, "Are you sure you want to continue connecting (yes/no/[fingerprint])? password"),
+        ];
+        crate::secret::remove(&host).unwrap();
+        assert_eq!(answers, [Some("s3cret".into()), Some("s3cret".into()), Some("s3cret".into())]);
+        assert_eq!(refused, [None, None]);
+    }
+
+    #[test]
+    fn an_unknown_host_key_is_told_from_a_changed_one() {
+        assert!(is_unknown_host_key("No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\r\nHost key verification failed."));
+        assert!(!is_unknown_host_key("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed."));
+        assert!(!is_unknown_host_key("Permission denied (password)."));
     }
 
     #[test]

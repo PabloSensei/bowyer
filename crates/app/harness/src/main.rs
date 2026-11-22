@@ -107,11 +107,36 @@ fn start_tray(hwnd: usize, cx: &mut App) {
     .detach();
 }
 
+/// `ssh` started Bowyer as its askpass program: the question is the only argument, and the
+/// answer is the kept password of the host on standard output, or nothing and a failure.
+fn answer_askpass() -> ! {
+    use std::io::Write;
+    let host = std::env::var(envs::ASKPASS_HOST).unwrap_or_default();
+    let prompt = std::env::args().nth(1).unwrap_or_default();
+    match envs::askpass_answer(&host, &prompt) {
+        Some(password) => {
+            let mut out = std::io::stdout().lock();
+            let written = writeln!(out, "{password}").and_then(|()| out.flush());
+            std::process::exit(i32::from(written.is_err()));
+        }
+        None => std::process::exit(1),
+    }
+}
+
 fn main() {
+    if std::env::var_os(envs::ASKPASS_HOST).is_some() && std::env::args().len() == 2 {
+        answer_askpass();
+    }
     init_log();
     #[cfg(windows)]
     set_app_id();
     let data = data_dir();
+    // `ssh` asks this program for the passwords of password hosts, and reads the host keys
+    // the user trusted in the window from the data folder.
+    if let Ok(exe) = std::env::current_exe() {
+        envs::set_askpass(exe);
+    }
+    envs::set_known_hosts(data.join("known_hosts"));
     let library = match Library::open(&data.join("library.db")) {
         Ok(library) => library,
         Err(error) => {

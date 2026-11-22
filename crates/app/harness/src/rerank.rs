@@ -150,36 +150,47 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The models the local servers that run now offer; a server that does not answer offers none.
 pub fn local_models() -> Vec<LocalModel> {
-    let mut models = Vec::new();
-    for server in Server::ALL {
-        let path = match server {
-            Server::Ollama => "/api/tags",
-            Server::LmStudio => "/v1/models",
-        };
-        let Ok(body) = http(server.port(), "GET", path, None, LIST_TIMEOUT) else { continue };
-        let Ok(value) = serde_json::from_str::<Value>(&body) else { continue };
-        let (list, key) = match server {
-            Server::Ollama => (value.get("models"), "name"),
-            Server::LmStudio => (value.get("data"), "id"),
-        };
-        let names = list.and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get(key).and_then(Value::as_str));
-        models.extend(names.map(|name| LocalModel { server, name: name.to_owned() }));
-    }
-    models
+    Server::ALL.into_iter().flat_map(|server| models_at(server, server.port())).collect()
+}
+
+/// The chat models `server` offers on `port`. Embedding models answer no chat, so they are
+/// left out (both servers list them with the rest).
+fn models_at(server: Server, port: u16) -> Vec<LocalModel> {
+    let path = match server {
+        Server::Ollama => "/api/tags",
+        Server::LmStudio => "/v1/models",
+    };
+    let Ok(body) = http(port, "GET", path, None, LIST_TIMEOUT) else { return Vec::new() };
+    let Ok(value) = serde_json::from_str::<Value>(&body) else { return Vec::new() };
+    let (list, key) = match server {
+        Server::Ollama => (value.get("models"), "name"),
+        Server::LmStudio => (value.get("data"), "id"),
+    };
+    let names = list.and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get(key).and_then(Value::as_str));
+    names
+        .filter(|name| !name.to_ascii_lowercase().contains("embed"))
+        .map(|name| LocalModel { server, name: name.to_owned() })
+        .collect()
 }
 
 /// The answer of a local model to the ranking question.
 pub fn ask_local(model: &LocalModel, prompt: &str) -> Result<String, String> {
+    ask_at(model, model.server.port(), prompt)
+}
+
+fn ask_at(model: &LocalModel, port: u16, prompt: &str) -> Result<String, String> {
     let messages = json!([{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]);
     let (path, body) = match model.server {
         // Thinking off: the answer is a list of numbers.
         Server::Ollama => ("/api/chat", json!({"model": model.name, "messages": messages, "stream": false, "think": false, "options": {"temperature": 0}})),
         Server::LmStudio => ("/v1/chat/completions", json!({"model": model.name, "messages": messages, "stream": false, "temperature": 0})),
     };
-    let answer = http(model.server.port(), "POST", path, Some(&body.to_string()), ANSWER_TIMEOUT).map_err(|e| format!("{}: {e}", model.server.label()))?;
+    let answer = http(port, "POST", path, Some(&body.to_string()), ANSWER_TIMEOUT).map_err(|e| format!("{}: {e}", model.server.label()))?;
     let value: Value = serde_json::from_str(&answer).map_err(|_| model::shorten(answer.trim(), 200))?;
     if let Some(error) = value.get("error") {
-        return Err(error.as_str().map(str::to_owned).unwrap_or_else(|| error.to_string()));
+        // Ollama names the error in a string, an OpenAI server in an object with a message.
+        let message = error.as_str().or_else(|| error.pointer("/message").and_then(Value::as_str));
+        return Err(message.map(str::to_owned).unwrap_or_else(|| error.to_string()));
     }
     let text = match model.server {
         Server::Ollama => value.pointer("/message/content"),
@@ -261,7 +272,8 @@ mod tests {
     use super::*;
 
     /// A server on a free port that answers one request with `response`, and the request.
-    fn serve_once(response: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+    fn serve_once(response: impl Into<String>) -> (u16, std::thread::JoinHandle<String>) {
+        let response = response.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
@@ -284,6 +296,62 @@ mod tests {
         assert_eq!(http(port, "GET", "/v1/models", None, LIST_TIMEOUT).unwrap(), "{\"a\":1}");
         let (port, _server) = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nno model.");
         assert!(http(port, "GET", "/", None, LIST_TIMEOUT).unwrap_err().to_string().contains("404"));
+    }
+
+    /// A 200 answer with `body` and its length.
+    fn ok(body: &str) -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// The JSON body of a captured request.
+    fn body_of(request: &str) -> Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").expect("a body").1).expect("JSON")
+    }
+
+    #[test]
+    fn lm_studio_lists_its_chat_models_and_answers_through_the_openai_route() {
+        let (port, server) = serve_once(ok(
+            r#"{"object":"list","data":[{"id":"qwen/qwen3-4b","object":"model"},{"id":"text-embedding-nomic-embed-text-v1.5","object":"model"},{"id":"x","object":"model"}]}"#,
+        ));
+        let models = models_at(Server::LmStudio, port);
+        assert!(server.join().unwrap().starts_with("GET /v1/models HTTP/1.1\r\n"));
+        let names: Vec<&str> = models.iter().map(|model| model.name.as_str()).collect();
+        assert_eq!(names, ["qwen/qwen3-4b", "x"], "the embedding model is left out");
+
+        let (port, server) = serve_once(ok(r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"2 1"}}]}"#));
+        assert_eq!(ask_at(&models[0], port, "Search: x").unwrap(), "2 1");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"), "{request}");
+        let body = body_of(&request);
+        assert_eq!(body["model"], "qwen/qwen3-4b");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"][0]["content"], SYSTEM);
+        assert_eq!(body["messages"][1]["content"], "Search: x");
+        assert!(body.get("think").is_none(), "Ollama's switch is not sent to LM Studio");
+    }
+
+    #[test]
+    fn ollama_lists_its_chat_models_and_answers_without_thinking() {
+        let (port, _server) = serve_once(ok(r#"{"models":[{"name":"qwen3:8b"},{"name":"nomic-embed-text:v1"}]}"#));
+        let models = models_at(Server::Ollama, port);
+        assert_eq!(models, [LocalModel { server: Server::Ollama, name: "qwen3:8b".into() }]);
+
+        let (port, server) = serve_once(ok(r#"{"message":{"role":"assistant","content":"<think>hm</think>3 1 2"}}"#));
+        assert_eq!(ask_at(&models[0], port, "q").unwrap(), "3 1 2");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /api/chat HTTP/1.1\r\n"), "{request}");
+        assert_eq!(body_of(&request)["think"], false);
+    }
+
+    #[test]
+    fn an_error_answer_reads_as_its_message() {
+        let model = LocalModel { server: Server::LmStudio, name: "m".into() };
+        let (port, _server) = serve_once(ok(r#"{"error":{"message":"No models loaded","x":1}}"#));
+        assert_eq!(ask_at(&model, port, "q").unwrap_err(), "No models loaded");
+        let (port, _server) = serve_once(ok(r#"{"error":"model absent"}"#));
+        assert_eq!(ask_at(&model, port, "q").unwrap_err(), "model absent");
+        let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert!(models_at(Server::LmStudio, nobody).is_empty(), "a server that is not there offers nothing");
     }
 
     #[test]

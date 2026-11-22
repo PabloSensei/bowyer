@@ -220,7 +220,10 @@ impl Server {
             .filter(|record| record.enabled)
             .map(|record| SshEnvironment::new(&record.host).with_identity(record.identity.map(PathBuf::from)))
             .find(|ssh| &ssh.id() == id)
-            .map(|ssh| Box::new(ssh) as Box<dyn Environment>)
+            .map(|ssh| {
+                let password = envs::secret::exists(&ssh.host);
+                Box::new(ssh.with_password(password)) as Box<dyn Environment>
+            })
             .ok_or_else(|| "the SSH host of this session is not set up or is turned off in Bowyer".to_owned())
     }
 

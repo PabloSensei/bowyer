@@ -14,12 +14,16 @@ use model::EnvId;
 
 mod git;
 mod local;
+pub mod secret;
 mod session;
 mod ssh;
 
 pub use git::{GitInfo, git_info_local, parse_head};
 pub use local::LocalEnvironment;
-pub use ssh::{SshEnvironment, SshHost, read_ssh_config, shell_quote};
+pub use ssh::{
+    ASKPASS_HOST, HostKeys, SshEnvironment, SshHost, askpass_answer, is_unknown_host_key, read_ssh_config, set_askpass, set_known_hosts,
+    shell_quote,
+};
 
 /// A file as a listing returns it.
 #[derive(Clone, Debug, PartialEq, Eq)]

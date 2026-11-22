@@ -242,20 +242,32 @@ impl Shell {
 
     fn settings_general(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = i18n::lang();
-        let languages = choices(
-            "lang",
-            [(Lang::En, "English"), (Lang::Ru, "Русский")].into_iter().map(|(option, label)| (label.to_owned(), option == lang, option)).collect(),
-            theme,
-            cx,
-            |this, option, cx| this.set_language(option, cx),
-        );
+        let languages = div().flex().flex_col().gap(px(2.)).children(Lang::ALL.into_iter().map(|option| {
+            let selected = option == lang;
+            div()
+                .id(SharedString::from(format!("settings-lang-{}", option.id())))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .h(px(30.))
+                .px(px(10.))
+                .rounded(px(6.))
+                .when(selected, |this| this.bg(theme.selection_inactive))
+                .when(!selected, |this| this.hover(|style| style.bg(theme.hover)))
+                .child(div().w(px(12.)).flex_none().text_color(theme.accent).child(if selected { "✓" } else { "" }))
+                .child(div().flex_none().text_size(px(13.)).child(option.label()))
+                .when(option != Lang::En, |this| {
+                    this.child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_muted).child(option.english_name()))
+                })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_language(option, cx)))
+        }));
         let notify = self.notifications_enabled();
         let tray_close = tray::close_to_tray();
         let data = self.settings_dir.clone();
         let data_text = data.to_string_lossy().into_owned();
         vec![
+            group(t("settings.language"), theme).child(languages).into_any_element(),
             group("", theme)
-                .child(row(t("settings.language"), None, languages, theme))
                 .child(row(
                     t("settings.notify"),
                     Some(t("settings.notify_hint")),
@@ -396,7 +408,13 @@ impl Shell {
 
     fn settings_hosts(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let hosts: Vec<(String, Option<String>)> =
-            self.ssh_hosts.iter().map(|ssh| (ssh.host.clone(), ssh.identity.as_ref().map(|key| key.to_string_lossy().into_owned()))).collect();
+            self.ssh_hosts
+                .iter()
+                .map(|ssh| {
+                    let how = if ssh.password { Some(t("ssh.password_auth").to_owned()) } else { ssh.identity.as_ref().map(|key| key.to_string_lossy().into_owned()) };
+                    (ssh.host.clone(), how)
+                })
+                .collect();
         let list = div().flex().flex_col().gap(px(6.)).when(hosts.is_empty(), |this| {
             this.child(div().text_size(px(12.5)).text_color(theme.text_muted).child(t("settings.no_hosts")))
         });

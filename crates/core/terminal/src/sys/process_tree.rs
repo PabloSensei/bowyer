@@ -1,9 +1,10 @@
 //! The programs below a process, and how to end them.
 //!
-//! A job holds what the process starts, but not everything: a shell from the Store, a
-//! program that breaks away from a job, or a service that starts a child on behalf of
-//! another one leave programs outside it. Such a program keeps the id of its parent in
-//! the snapshot, so the tree is walked by parent ids rather than by a job.
+//! The job of a session holds the shell, and everything the shell starts leaves it at once
+//! (a window program the user opens must outlive the session). A program keeps the id of
+//! its parent in the snapshot, so the console programs are found by walking parent ids
+//! and pulled back into the job; a shell from the Store or a service that starts a child
+//! on behalf of another one are found the same way.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;

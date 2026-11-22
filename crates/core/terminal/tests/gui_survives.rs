@@ -23,10 +23,10 @@ const GUI: &str = env!("CARGO_BIN_EXE_gui-sleeper");
 const IMAGE: &str = "gui-sleeper.exe";
 const WAIT: Duration = Duration::from_secs(20);
 
-/// Opens a terminal of the default shell in a folder of the test.
-fn session(folder: &Path) -> TerminalSession {
+/// Opens a terminal of `shell` in a folder of the test.
+fn session(folder: &Path, shell: &str) -> TerminalSession {
     TerminalSession::spawn(&SpawnSpec {
-        command_line: terminal::default_shell().expect("a shell"),
+        command_line: shell.to_string(),
         cwd: Some(folder.to_path_buf()),
         env: allowlisted(),
         cols: 80,
@@ -38,10 +38,8 @@ fn session(folder: &Path) -> TerminalSession {
 
 /// The line that starts `program` in the shell of the terminal. PowerShell needs `&` for
 /// a quoted path; the command prompt and bash run the path as it is.
-fn start_line(program: &Path) -> String {
-    let shell = terminal::default_shell()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+fn start_line(program: &Path, shell: &str) -> String {
+    let shell = shell.to_ascii_lowercase();
     if shell.contains("pwsh") || shell.contains("powershell") {
         format!("& '{}'", program.display())
     } else if shell.contains("bash") {
@@ -98,19 +96,24 @@ impl Drop for EndOnDrop {
 
 #[test]
 fn a_window_program_outlives_the_session_while_a_console_program_does_not() {
-    // On the Windows runners of GitHub Actions the window program ends with the session,
-    // while on a desktop it survives; the cause is not known yet, so CI skips the test.
-    if std::env::var_os("CI").is_some() {
-        eprintln!("skipped on CI: the window program does not outlive the session there");
-        return;
-    }
+    outlives(&terminal::default_shell().expect("a shell"));
+}
+
+/// The command prompt starts its programs itself, so they are born in the job of the
+/// session; a PowerShell from the Store starts them from its own package and hid that.
+#[test]
+fn a_window_program_of_the_command_prompt_outlives_the_session() {
+    outlives("cmd.exe");
+}
+
+fn outlives(shell_line: &str) {
     let folder = test_support::TempDir::new("terminal-gui");
-    let session = session(&folder);
+    let session = session(&folder, shell_line);
     let shell = session.pid();
 
     // The window program comes first: the console program takes the shell for itself.
     session
-        .send(format!("{}\r", start_line(Path::new(GUI))).into_bytes())
+        .send(format!("{}\r", start_line(Path::new(GUI), shell_line)).into_bytes())
         .expect("input");
     let window = wait_for_child(shell, IMAGE);
 

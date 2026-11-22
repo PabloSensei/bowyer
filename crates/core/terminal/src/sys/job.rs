@@ -6,14 +6,17 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
-/// A process tree that dies together. Children stay in the job, so closing it, even by a
-/// crash of this process, ends the whole tree.
+/// The processes that die together: closing the job, even by a crash of this process, ends
+/// every process in it. What a process of the job starts leaves the job at once, so a
+/// window program the user opens from the terminal is not ended with it; the console
+/// programs are pulled back in by [`super::process_tree::ProcessTree::adopt`].
 pub(crate) struct Job {
     handle: OwnedHandle,
 }
@@ -29,14 +32,17 @@ impl Job {
         let job = Self {
             handle: unsafe { OwnedHandle::from_raw_handle(handle) },
         };
-        job.kill_on_close()?;
+        job.set_limits()?;
         Ok(job)
     }
 
-    fn kill_on_close(&self) -> io::Result<()> {
+    fn set_limits(&self) -> io::Result<()> {
         // SAFETY: an all-zero struct is valid, it is plain data.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Without the breakaway every child of the shell would be born in the job, a window
+        // program too, and `TerminateJobObject` or the close would end it with the session.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         // SAFETY: the pointer and the size describe `limits`.
         let done = unsafe {
             SetInformationJobObject(

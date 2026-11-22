@@ -193,16 +193,16 @@ fn list_commands(env: &SharedEnv, cwd: &str) -> Vec<(String, String)> {
     let home = env.home().ok();
     let mut roots = Vec::new();
     if let Some(home) = &home {
-        roots.push((env.join(home, ".claude"), "user"));
+        roots.push((env.join(home, ".claude"), ("cmd.user_command", "cmd.user_skill")));
     }
-    roots.push((env.join(cwd, ".claude"), "project"));
-    for (root, from) in roots {
+    roots.push((env.join(cwd, ".claude"), ("cmd.project_command", "cmd.project_skill")));
+    for (root, (command_label, skill_label)) in roots {
         let commands = env.join(&root, "commands");
         for meta in env.find_files(&commands, ".md", 4).unwrap_or_default() {
             let relative = meta.path.strip_prefix(commands.as_str()).unwrap_or(&meta.path);
             let name = relative.trim_start_matches(['/', '\\']).trim_end_matches(".md").replace(['/', '\\'], ":");
             if !name.is_empty() {
-                out.push((name, format!("{from} {}", t("cmd.custom"))));
+                out.push((name, t(command_label).to_owned()));
             }
         }
         let skills = env.join(&root, "skills");
@@ -210,7 +210,7 @@ fn list_commands(env: &SharedEnv, cwd: &str) -> Vec<(String, String)> {
             let folder = meta.path.trim_end_matches("SKILL.md").trim_end_matches(['/', '\\']);
             let name = folder.rsplit(['/', '\\']).next().unwrap_or("").to_owned();
             if !name.is_empty() {
-                out.push((name, format!("{from} {}", t("cmd.skill"))));
+                out.push((name, t(skill_label).to_owned()));
             }
         }
     }

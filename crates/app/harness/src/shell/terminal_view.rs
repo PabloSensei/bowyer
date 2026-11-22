@@ -29,6 +29,8 @@ pub(super) struct TermSpec {
     /// The whole command line for the pseudoterminal.
     pub command_line: String,
     pub cwd: Option<PathBuf>,
+    /// Variables besides the window's own.
+    pub env: Vec<(String, String)>,
     /// The name in the header: the shell or the program, and where.
     pub title: String,
 }
@@ -59,7 +61,7 @@ fn start(spec: &TermSpec) -> io::Result<TerminalSession> {
     TerminalSession::spawn(&SpawnSpec {
         command_line: spec.command_line.clone(),
         cwd: spec.cwd.clone(),
-        env: environment(),
+        env: { let mut env = environment(); env.extend(spec.env.iter().cloned()); env },
         cols: START_COLS,
         rows: START_ROWS,
         shift_enter: Default::default(),
@@ -227,7 +229,7 @@ impl Shell {
     /// it could not start: the caller opens an external terminal instead.
     pub(super) fn show_in_terminal(&mut self, line: Option<launch::TerminalLine>, title: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(line) = line else { return false };
-        let spec = TermSpec { command_line: line.line, cwd: line.cwd, title };
+        let spec = TermSpec { command_line: line.line, cwd: line.cwd, env: line.env, title };
         let session = match start(&spec) {
             Ok(session) => session,
             Err(error) => {

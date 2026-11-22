@@ -484,25 +484,30 @@ fn adopt_loop(signals: Receiver<()>, pty: Arc<Pty>) {
         if signals.recv().is_err() {
             return;
         }
-        if let Some(previous) = last {
-            let rest = ADOPT_INTERVAL.saturating_sub(previous.elapsed());
-            if !rest.is_zero() {
-                thread::sleep(rest);
-                while signals.try_recv().is_ok() {}
+        // One burst: a look at most once per interval while the output goes on, and one
+        // last look when it stops, however many signals the burst sent.
+        loop {
+            if let Some(previous) = last {
+                let rest = ADOPT_INTERVAL.saturating_sub(previous.elapsed());
+                if !rest.is_zero() {
+                    thread::sleep(rest);
+                    while signals.try_recv().is_ok() {}
+                }
             }
-        }
-        pty.adopt();
-        last = Some(Instant::now());
-        match signals.recv_timeout(ADOPT_INTERVAL) {
-            Ok(()) => {}
-            Err(RecvTimeoutError::Timeout) => {
-                // The output stopped: one last look at the tree it may have started.
-                pty.adopt();
-                last = Some(Instant::now());
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                pty.adopt();
-                return;
+            pty.adopt();
+            last = Some(Instant::now());
+            match signals.recv_timeout(ADOPT_INTERVAL) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // The output stopped: one last look at the tree it may have started.
+                    pty.adopt();
+                    last = Some(Instant::now());
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    pty.adopt();
+                    return;
+                }
             }
         }
     }
@@ -655,7 +660,14 @@ mod tests {
         while !session.shared.pty.job_ids().contains(&program) {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
-                "the job does not hold the program {program}"
+                "the job does not hold the program {program}; job {:?}, snapshots {}, tree {:?}",
+                session.shared.pty.job_ids(),
+                session.shared.pty.adopt_calls(),
+                crate::sys::process_table()
+                    .into_iter()
+                    .filter(|p| p.pid == program || p.pid == shell || p.parent == Some(shell))
+                    .map(|p| (p.pid, p.parent, p.name))
+                    .collect::<Vec<_>>()
             );
             thread::sleep(Duration::from_millis(20));
         }

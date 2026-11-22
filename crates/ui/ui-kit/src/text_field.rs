@@ -259,6 +259,17 @@ impl TextField {
         true
     }
 
+    /// The field as a password field shows it: a `•` for every character, with the caret
+    /// and the selection where they are in the text.
+    pub fn masked(&self) -> TextField {
+        let dots = |byte: usize| self.text[..byte].chars().count() * '•'.len_utf8();
+        TextField {
+            text: "•".repeat(self.text.chars().count()),
+            caret: dots(self.caret),
+            anchor: dots(self.anchor),
+        }
+    }
+
     /// [`TextField::key`] plus Ctrl+C, Ctrl+X and Ctrl+V through the clipboard.
     pub fn key_with_clipboard(
         &mut self,

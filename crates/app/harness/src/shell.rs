@@ -24,7 +24,7 @@ use live::{Permission, StopHandle};
 use crate::display::{self, Item, Piece, ToolView};
 use crate::extensions::{self, Extension, ExtensionKind};
 use crate::highlight;
-use crate::i18n::{self, Lang, t};
+use crate::i18n::t;
 use crate::launch;
 use crate::rerank;
 use crate::markdown::{Inline, MdBlock, Rich};
@@ -107,18 +107,18 @@ fn part_color(part: ContextPart) -> Hsla {
 
 /// A category of Claude Code's own count of its context, in the language of the window.
 fn claude_category_label(name: &str) -> String {
-    let ru = match name {
-        "System prompt" => "Системный промпт",
-        "System tools" => "Системные тулы",
-        "MCP tools" => "Тулы MCP",
-        "MCP server instructions" => "Инструкции серверов MCP",
-        "Custom agents" => "Свои агенты",
-        "Memory files" => "Файлы памяти",
-        "Skills" => "Навыки",
-        "Messages" => "Сообщения",
+    let key = match name {
+        "System prompt" => "claude_part.system_prompt",
+        "System tools" => "claude_part.system_tools",
+        "MCP tools" => "claude_part.mcp_tools",
+        "MCP server instructions" => "claude_part.mcp_instructions",
+        "Custom agents" => "claude_part.agents",
+        "Memory files" => "claude_part.memory",
+        "Skills" => "claude_part.skills",
+        "Messages" => "claude_part.messages",
         _ => return name.to_owned(),
     };
-    if i18n::lang() == Lang::Ru { ru.to_owned() } else { name.to_owned() }
+    t(key).to_owned()
 }
 
 /// Colours of Claude's categories, in their order.
@@ -136,18 +136,17 @@ fn claude_category_color(name: &str, index: usize) -> Hsla {
 }
 
 fn part_label(part: ContextPart) -> &'static str {
-    match (i18n::lang(), part) {
-        (Lang::Ru, ContextPart::System) => "Системный промпт, тулы и прочее",
-        (Lang::Ru, ContextPart::Memory) => "Файлы памяти (CLAUDE.md, AGENTS.md)",
-        (Lang::Ru, ContextPart::Prompts) => "Ваши сообщения",
-        (Lang::Ru, ContextPart::Answers) => "Ответы",
-        (Lang::Ru, ContextPart::Thinking) => "Размышления",
-        (Lang::Ru, ContextPart::ToolCalls) => "Вызовы тулов",
-        (Lang::Ru, ContextPart::ToolResults) => "Результаты тулов",
-        (Lang::Ru, ContextPart::Images) => "Изображения",
-        (Lang::Ru, ContextPart::Summary) => "Итог сжатия",
-        (_, part) => part.label(),
-    }
+    t(match part {
+        ContextPart::System => "part.system",
+        ContextPart::Memory => "part.memory",
+        ContextPart::Prompts => "part.prompts",
+        ContextPart::Answers => "part.answers",
+        ContextPart::Thinking => "part.thinking",
+        ContextPart::ToolCalls => "part.tool_calls",
+        ContextPart::ToolResults => "part.tool_results",
+        ContextPart::Images => "part.images",
+        ContextPart::Summary => "part.summary",
+    })
 }
 
 fn now_ms() -> i64 {
@@ -461,7 +460,9 @@ impl Shell {
         let mut ssh_hosts = Vec::new();
         for record in library.ssh_environments().unwrap_or_default() {
             if record.enabled {
-                let ssh = SshEnvironment::new(&record.host).with_identity(record.identity.map(PathBuf::from));
+                let ssh = SshEnvironment::new(&record.host)
+                    .with_identity(record.identity.map(PathBuf::from))
+                    .with_password(envs::secret::exists(&record.host));
                 envs.push(Arc::new(ssh.clone()));
                 ssh_hosts.push(ssh);
             }
@@ -1443,17 +1444,6 @@ impl Shell {
         cx.notify();
     }
 
-    fn cycle_language(&mut self, cx: &mut Context<Self>) {
-        let next = match i18n::lang() {
-            Lang::En => Lang::Ru,
-            Lang::Ru => Lang::En,
-        };
-        i18n::set_lang(next);
-        let _ = self.lib().set_setting("language", next.id());
-        self.status = Some(format!("{}: {}", t("language"), next.label()));
-        cx.notify();
-    }
-
     fn new_folder(&mut self, cx: &mut Context<Self>, window: &mut Window) {
         let id = self.lib().create_folder(None, t("new_folder"));
         if let Ok(id) = id {
@@ -2009,9 +1999,6 @@ impl Shell {
                     .children(self.render_update_chip(&theme, cx))
                     .child(chip("ssh", "SSH +", &theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| this.toggle_ssh_form(window, cx),
-                    )))
-                    .child(chip("lang", i18n::lang().id().to_uppercase(), &theme).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.cycle_language(cx),
                     )))
                     .child(icon_button("settings", "general/settings", t("settings"), Some("Ctrl+,".into()), &theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| match this.settings {

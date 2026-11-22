@@ -1,52 +1,111 @@
-//! Interface strings in English and Russian. A key missing in a language falls back to
-//! English, so a new string never shows up empty. Plugins will add languages as files.
+//! Interface strings. English and Russian live side by side in [`STRINGS`]; every other
+//! language is a table of its own in `i18n/<id>.rs`, with the same keys. A key missing in a
+//! language falls back to English, so a new string never shows up empty.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+
+mod de;
+mod es;
+mod fr;
+mod ja;
+mod pt;
+mod zh;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,
     Ru,
+    Zh,
+    Es,
+    Pt,
+    De,
+    Fr,
+    Ja,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 2] = [Lang::En, Lang::Ru];
+    pub const ALL: [Lang; 8] = [Lang::En, Lang::Zh, Lang::Es, Lang::Pt, Lang::De, Lang::Fr, Lang::Ja, Lang::Ru];
 
     pub fn id(self) -> &'static str {
         match self {
             Lang::En => "en",
             Lang::Ru => "ru",
+            Lang::Zh => "zh",
+            Lang::Es => "es",
+            Lang::Pt => "pt",
+            Lang::De => "de",
+            Lang::Fr => "fr",
+            Lang::Ja => "ja",
         }
     }
 
+    /// The name of the language in itself.
     pub fn label(self) -> &'static str {
         match self {
             Lang::En => "English",
             Lang::Ru => "Русский",
+            Lang::Zh => "简体中文",
+            Lang::Es => "Español",
+            Lang::Pt => "Português (Brasil)",
+            Lang::De => "Deutsch",
+            Lang::Fr => "Français",
+            Lang::Ja => "日本語",
         }
     }
 
+    /// The name of the language in English, under its own name.
+    pub fn english_name(self) -> &'static str {
+        match self {
+            Lang::En => "English",
+            Lang::Ru => "Russian",
+            Lang::Zh => "Chinese, Simplified",
+            Lang::Es => "Spanish",
+            Lang::Pt => "Portuguese",
+            Lang::De => "German",
+            Lang::Fr => "French",
+            Lang::Ja => "Japanese",
+        }
+    }
+
+    /// The language of a locale or setting such as `de`, `pt-BR` or `zh_CN`. Chinese is
+    /// Simplified only: a Traditional locale (`zh-TW`, `zh-HK`, `zh-Hant`) is not ours.
     pub fn from_id(id: &str) -> Option<Lang> {
-        Self::ALL.into_iter().find(|lang| id.to_ascii_lowercase().starts_with(lang.id()))
+        let id = id.to_ascii_lowercase().replace('_', "-");
+        let primary = id.split('-').next().unwrap_or_default();
+        if primary == "zh" && ["-tw", "-hk", "-mo", "-hant"].iter().any(|traditional| id.contains(traditional)) {
+            return None;
+        }
+        Self::ALL.into_iter().find(|lang| lang.id() == primary)
     }
 
     /// The language of the system, English when it is not one we have.
     pub fn system() -> Lang {
         sys_locale::get_locale().as_deref().and_then(Lang::from_id).unwrap_or(Lang::En)
     }
+
+    /// The table of a language other than English and Russian.
+    fn table(self) -> Option<&'static [(&'static str, &'static str)]> {
+        match self {
+            Lang::En | Lang::Ru => None,
+            Lang::Zh => Some(zh::STRINGS),
+            Lang::Es => Some(es::STRINGS),
+            Lang::Pt => Some(pt::STRINGS),
+            Lang::De => Some(de::STRINGS),
+            Lang::Fr => Some(fr::STRINGS),
+            Lang::Ja => Some(ja::STRINGS),
+        }
+    }
 }
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_lang(lang: Lang) {
-    CURRENT.store(lang as u8, Ordering::Relaxed);
+    let index = Lang::ALL.iter().position(|known| *known == lang).unwrap_or(0);
+    CURRENT.store(index as u8, Ordering::Relaxed);
 }
 
 pub fn lang() -> Lang {
-    match CURRENT.load(Ordering::Relaxed) {
-        1 => Lang::Ru,
-        _ => Lang::En,
-    }
+    Lang::ALL.get(CURRENT.load(Ordering::Relaxed) as usize).copied().unwrap_or(Lang::En)
 }
 
 /// `(key, English, Russian)`.
@@ -268,7 +327,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("theme.group.code", "Code", "Код"),
     ("theme.group.editor", "Editor", "Редактор"),
     ("theme.group.status", "Status", "Состояния"),
-    ("language", "Language", "Язык"),
     ("local", "This computer", "Этот компьютер"),
     ("tools.show", "Show tool calls", "Показать вызовы"),
     ("tools.hide", "Hide tool calls", "Скрыть вызовы"),
@@ -305,8 +363,10 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("cmd.terminal", "Terminal in the session folder", "Терминал в папке сессии"),
     ("cmd.resume", "Resume in a terminal", "Продолжить в терминале"),
     ("cmd.compact", "Compact the context in a terminal", "Сжать контекст в терминале"),
-    ("cmd.custom", "command", "команда"),
-    ("cmd.skill", "skill", "скилл"),
+    ("cmd.user_command", "user command", "команда пользователя"),
+    ("cmd.project_command", "project command", "команда проекта"),
+    ("cmd.user_skill", "user skill", "скилл пользователя"),
+    ("cmd.project_skill", "project skill", "скилл проекта"),
     ("composer.attach", "Attach files: or drop them here, or paste a picture", "Прикрепить файлы: можно перетащить или вставить картинку"),
     ("composer.indexing", "Listing the files…", "Читаю список файлов…"),
     ("live.uploading", "Copying the files to the host…", "Копирую файлы на хост…"),
@@ -315,6 +375,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("ssh.connect", "Connect", "Подключить"),
     ("ssh.probing", "Connecting…", "Подключаюсь…"),
     ("ssh.unknown", "this host is not added", "этот хост не добавлен"),
+    ("ssh.password", "Password", "Пароль"),
+    ("ssh.password_auth", "sign-in: password", "вход: по паролю"),
+    ("ssh.password_needed", "Type the password of this host", "Введите пароль этого хоста"),
+    ("ssh.password_stored", "The password is kept in Windows Credential Manager, never in Bowyer's files.", "Пароль хранится в диспетчере учётных данных Windows, а не в файлах Bowyer."),
+    ("ssh.unknown_key", "Bowyer does not know this host's key yet. Compare the fingerprint with the one the host shows before you trust it:", "Bowyer ещё не знает ключ этого хоста. Сверьте отпечаток с тем, что показывает сам хост, прежде чем доверять ему:"),
+    ("ssh.trust", "Trust and connect", "Доверять и подключить"),
+    ("ssh.keyscan_failed", "Could not read the host key", "Не удалось прочитать ключ хоста"),
     ("live.no_folder", "The session has no working folder", "У сессии нет рабочей папки"),
     ("model.default", "default model", "модель по умолчанию"),
     ("composer.placeholder", "Message · / commands · @ files · Enter to send, Shift+Enter for a new line", "Сообщение · / команды · @ файлы · Enter — отправить, Shift+Enter — новая строка"),
@@ -348,33 +415,84 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("cache.unknown", "no data", "нет данных"),
     ("cache.auto", "auto · idle", "авто · простой"),
     ("price.unknown", "no price for this model", "нет цены для этой модели"),
+    ("part.system", "System prompt, tools and the rest", "Системный промпт, тулы и прочее"),
+    ("part.memory", "Memory files (CLAUDE.md, AGENTS.md)", "Файлы памяти (CLAUDE.md, AGENTS.md)"),
+    ("part.prompts", "Your messages", "Ваши сообщения"),
+    ("part.answers", "Answers", "Ответы"),
+    ("part.thinking", "Thinking", "Размышления"),
+    ("part.tool_calls", "Tool calls", "Вызовы тулов"),
+    ("part.tool_results", "Tool results", "Результаты тулов"),
+    ("part.images", "Images", "Изображения"),
+    ("part.summary", "Compaction summary", "Итог сжатия"),
+    ("claude_part.system_prompt", "System prompt", "Системный промпт"),
+    ("claude_part.system_tools", "System tools", "Системные тулы"),
+    ("claude_part.mcp_tools", "MCP tools", "Тулы MCP"),
+    ("claude_part.mcp_instructions", "MCP server instructions", "Инструкции серверов MCP"),
+    ("claude_part.agents", "Custom agents", "Свои агенты"),
+    ("claude_part.memory", "Memory files", "Файлы памяти"),
+    ("claude_part.skills", "Skills", "Навыки"),
+    ("claude_part.messages", "Messages", "Сообщения"),
 ];
 
 /// The text of a key in the current language.
 pub fn t(key: &str) -> &'static str {
+    let Some((_, en, ru)) = STRINGS.iter().find(|(k, _, _)| *k == key) else { return "?" };
     let lang = lang();
-    STRINGS
-        .iter()
-        .find(|(k, _, _)| *k == key)
-        .map(|(_, en, ru)| match lang {
-            Lang::En => *en,
-            Lang::Ru => *ru,
-        })
-        .unwrap_or("?")
+    match lang {
+        Lang::En => en,
+        Lang::Ru => ru,
+        _ => lang.table().and_then(|table| table.iter().find(|(k, _)| *k == key)).map_or(en, |(_, text)| text),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn keys_are_unique_and_filled() {
-        let mut keys = std::collections::HashSet::new();
+        let mut keys = HashSet::new();
         for (key, en, ru) in STRINGS {
             assert!(keys.insert(*key), "{key} twice");
             assert!(!en.is_empty() && !ru.is_empty(), "{key} empty");
         }
+    }
+
+    /// The placeholders of a text, such as `{n}`.
+    fn placeholders(text: &str) -> Vec<&str> {
+        let mut found: Vec<&str> = text.match_indices('{').filter_map(|(start, _)| text[start..].find('}').map(|end| &text[start..=start + end])).collect();
+        found.sort_unstable();
+        found
+    }
+
+    #[test]
+    fn every_language_has_every_key_once_with_its_placeholders() {
+        let english: Vec<&str> = STRINGS.iter().map(|(key, _, _)| *key).collect();
+        for lang in Lang::ALL {
+            let Some(table) = lang.table() else { continue };
+            let mut seen = HashSet::new();
+            for (key, text) in table {
+                assert!(seen.insert(*key), "{}: {key} twice", lang.id());
+                assert!(!text.trim().is_empty(), "{}: {key} empty", lang.id());
+                let (_, en, _) = STRINGS.iter().find(|(k, _, _)| k == key).unwrap_or_else(|| panic!("{}: {key} is not a key", lang.id()));
+                assert_eq!(placeholders(text), placeholders(en), "{}: {key} placeholders", lang.id());
+            }
+            let missing: Vec<&&str> = english.iter().filter(|key| !seen.contains(**key)).collect();
+            assert!(missing.is_empty(), "{}: missing {missing:?}", lang.id());
+        }
+    }
+
+    #[test]
+    fn locales_find_their_language() {
         assert_eq!(Lang::from_id("ru-RU"), Some(Lang::Ru));
-        assert_eq!(Lang::from_id("de-DE"), None);
+        assert_eq!(Lang::from_id("de-DE"), Some(Lang::De));
+        assert_eq!(Lang::from_id("pt_BR"), Some(Lang::Pt));
+        assert_eq!(Lang::from_id("zh-CN"), Some(Lang::Zh));
+        assert_eq!(Lang::from_id("zh-Hans-SG"), Some(Lang::Zh));
+        assert_eq!(Lang::from_id("zh-TW"), None);
+        assert_eq!(Lang::from_id("ko-KR"), None);
+        assert_eq!(Lang::from_id("en"), Some(Lang::En));
+        assert_eq!(Lang::from_id("e"), None, "a prefix of an id is not a language");
     }
 }

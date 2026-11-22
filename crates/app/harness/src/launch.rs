@@ -392,6 +392,8 @@ pub struct TerminalLine {
     pub line: String,
     /// The folder on this computer; a remote host gets its folder inside the line.
     pub cwd: Option<std::path::PathBuf>,
+    /// Variables the program needs besides the window's own: the askpass of a password host.
+    pub env: Vec<(String, String)>,
 }
 
 fn line_of(command: &Command) -> String {
@@ -420,7 +422,9 @@ pub fn terminal_line(env: &dyn Environment, cwd: Option<&str>, program: Option<(
             Some((program, args)) => (program, args.iter().map(String::as_str).collect()),
             None => ("", Vec::new()),
         };
-        return Some(TerminalLine { line: line_of(&env.interactive(program, &args, cwd)), cwd: None });
+        let command = env.interactive(program, &args, cwd);
+        let vars = command.get_envs().filter_map(|(key, value)| Some((key.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect();
+        return Some(TerminalLine { line: line_of(&command), cwd: None, env: vars });
     }
     let cwd = cwd.map(std::path::PathBuf::from);
     let line = match program {
@@ -443,7 +447,7 @@ pub fn terminal_line(env: &dyn Environment, cwd: Option<&str>, program: Option<(
             terminal::command_line(std::path::Path::new("sh"), &["-c".to_owned(), inner])
         }
     };
-    Some(TerminalLine { line, cwd })
+    Some(TerminalLine { line, cwd, env: Vec::new() })
 }
 
 /// [`run_in_terminal`] for the terminal of the window.
@@ -468,7 +472,7 @@ pub fn block_line(env: &dyn Environment, cwd: Option<&str>, shell: Shell, script
         let _ = shell;
         terminal::command_line(std::path::Path::new("sh"), &["-c".to_owned(), format!("{script}\nexec \"${{SHELL:-sh}}\"")])
     };
-    Some(TerminalLine { line, cwd: cwd_path })
+    Some(TerminalLine { line, cwd: cwd_path, env: Vec::new() })
 }
 
 /// [`resume_in_terminal`] for the terminal of the window.
