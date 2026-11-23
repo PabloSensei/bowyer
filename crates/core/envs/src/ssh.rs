@@ -3,7 +3,8 @@
 //! a password typed in shows up as an error, never as a prompt hidden behind the window.
 //! A host the user gave a password to signs in without `BatchMode`: `ssh` asks Bowyer for
 //! the password (`SSH_ASKPASS`), which reads it from the system's store, and an unknown
-//! host key fails instead of being asked about. Host keys the user trusted in the window go
+//! host key fails instead of being asked about. The same secret answers the passphrase of a
+//! key, for a host whose server takes keys only. Host keys the user trusted in the window go
 //! to Bowyer's own file, never to `~/.ssh`.
 //! Short calls go through a persistent shell session of the host ([`crate::session`]);
 //! whole-file reads, uploads, terminals and harness turns get connections of their own.
@@ -123,15 +124,19 @@ fn askpass() -> Option<PathBuf> {
     ASKPASS.get().cloned().or_else(|| std::env::current_exe().ok())
 }
 
-/// The answer of the askpass program to `prompt` for `host`: the kept password when `ssh`
-/// asks for a password, nothing for any other question. A host key question in particular
-/// must never get the password: `ssh` would ask again and again.
+/// The answer of the askpass program to `prompt` for `host`: the kept secret when `ssh`
+/// asks for a password, or for the passphrase of the key it signs in with (a host whose
+/// server takes keys only, with a key that has a passphrase), nothing for any other
+/// question. The passphrase opens the key on this computer and never reaches the host. A
+/// host key question in particular must never get the secret: `ssh` would ask again and
+/// again.
 pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
     let prompt = prompt.to_lowercase();
     // The host key question is "(yes/no/[fingerprint])?" and then "Please type 'yes', 'no' or
     // the fingerprint"; a password prompt names the user and host, which may hold any word.
     let host_key_question = prompt.contains("(yes/no") || prompt.contains("'yes'");
-    if !prompt.contains("password") || host_key_question {
+    let asks_secret = prompt.contains("password") || prompt.trim_start().starts_with("enter passphrase for");
+    if !asks_secret || host_key_question {
         return None;
     }
     crate::secret::load(host)
@@ -280,10 +285,19 @@ impl SshEnvironment {
         }
         if self.password {
             // One try of the password, and no question about an unknown host key: askpass
-            // would get it, and only the window may answer it.
+            // would get it, and only the window may answer it. Keys come after the password,
+            // for a server that takes keys only: the kept secret then opens a key that has a
+            // passphrase, one try of it too.
             options.extend(
-                ["-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=yes"]
-                    .map(str::to_owned),
+                [
+                    "-o",
+                    "PreferredAuthentications=keyboard-interactive,password,publickey",
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                ]
+                .map(str::to_owned),
             );
         }
         options
@@ -842,7 +856,7 @@ mod tests {
         for command in [host.headless("claude", &[], None), host.session_command(), host.interactive("", &[], None)] {
             let args = words(&command);
             assert!(!args.contains(&"BatchMode=yes".to_owned()), "{args:?}");
-            for option in ["StrictHostKeyChecking=yes", "NumberOfPasswordPrompts=1", "PreferredAuthentications=keyboard-interactive,password"] {
+            for option in ["StrictHostKeyChecking=yes", "NumberOfPasswordPrompts=1", "PreferredAuthentications=keyboard-interactive,password,publickey"] {
                 assert!(args.windows(2).any(|w| w == ["-o", option]), "{option} in {args:?}");
             }
             let envs = envs(&command);
@@ -869,12 +883,12 @@ mod tests {
         for prompt in [
             "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
             "Please type 'yes', 'no' or the fingerprint: ",
-            "Enter passphrase for key '/home/me/.ssh/id_ed25519': ",
             "Verification code: ",
         ] {
             assert_eq!(askpass_answer(nobody, prompt), None, "{prompt}");
         }
         assert_eq!(askpass_answer(nobody, "(me@vm) Password: "), None, "no password kept, no answer");
+        assert_eq!(askpass_answer(nobody, "Enter passphrase for key '/home/me/.ssh/id_ed25519': "), None, "no secret kept, no answer");
     }
 
     #[test]
@@ -889,14 +903,20 @@ mod tests {
             askpass_answer(&host, "me@vm's password: "),
             // A user or host may hold "yes" or "fingerprint" in its name.
             askpass_answer(&host, "(hayes@fingerprint-yes.example) Password: "),
+            // A server that takes keys only, and a key with a passphrase (Windows OpenSSH
+            // doubles the backslashes of the path).
+            askpass_answer(&host, "Enter passphrase for key '/home/me/.ssh/work_ed25519': "),
+            askpass_answer(&host, r"Enter passphrase for key 'C:\\Users\\me/.ssh/work': "),
         ];
         let refused = [
             askpass_answer(&host, "Please type 'yes', 'no' or the fingerprint: "),
             askpass_answer(&host, "Are you sure you want to continue connecting (yes/no/[fingerprint])? password"),
+            askpass_answer(&host, "Enter PIN for ED25519-SK key /home/me/.ssh/id_ed25519_sk: "),
+            askpass_answer(&host, "Confirm user presence for key ED25519-SK SHA256:AAAA"),
         ];
         crate::secret::remove(&host).unwrap();
-        assert_eq!(answers, [Some("s3cret".into()), Some("s3cret".into()), Some("s3cret".into())]);
-        assert_eq!(refused, [None, None]);
+        assert_eq!(answers, [Some("s3cret".into()), Some("s3cret".into()), Some("s3cret".into()), Some("s3cret".into()), Some("s3cret".into())]);
+        assert_eq!(refused, [None, None, None, None]);
     }
 
     #[test]
@@ -1090,6 +1110,36 @@ mod tests {
         let late = ssh.script_text(&format!("cat \"$HOME/.cache/bowyer/runs/{run}.out\"")).unwrap();
         assert!(!late.contains("late"));
         let _ = ssh.script_text(&format!("rm -f \"$HOME/.cache/bowyer/runs/\"test-* \"$HOME/.cache/bowyer/runs/\"stop-*"));
+    }
+
+    /// A password host whose server takes keys only, signed in by a key with a passphrase:
+    /// the kept secret opens the key through Bowyer as the askpass program.
+    /// `BOWYER_SSH_HOST=ssh://user@host:port BOWYER_SSH_KEY=key BOWYER_SSH_PASSPHRASE=…
+    /// BOWYER_ASKPASS=path/to/bowyer BOWYER_KNOWN_HOSTS=file [BOWYER_SSH=ssh] cargo test -p envs
+    /// -- --ignored passphrase`.
+    #[test]
+    #[ignore = "needs an SSH host"]
+    fn a_kept_secret_opens_a_key_with_a_passphrase() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        set_askpass(PathBuf::from(var("BOWYER_ASKPASS")));
+        set_known_hosts(PathBuf::from(var("BOWYER_KNOWN_HOSTS")));
+        let host = var("BOWYER_SSH_HOST");
+        let mut ssh = SshEnvironment::new(&host).with_identity(Some(PathBuf::from(var("BOWYER_SSH_KEY")))).with_password(true);
+        if let Ok(program) = std::env::var("BOWYER_SSH") {
+            ssh.ssh = PathBuf::from(program);
+        }
+        let before = crate::secret::load(&host);
+        crate::secret::store(&host, "not the passphrase").unwrap();
+        let wrong = ssh.script_alone("echo in");
+        crate::secret::store(&host, &var("BOWYER_SSH_PASSPHRASE")).unwrap();
+        let right = ssh.script_alone("echo in");
+        match before {
+            Some(old) => crate::secret::store(&host, &old).unwrap(),
+            None => crate::secret::remove(&host).unwrap(),
+        }
+        let wrong = wrong.expect_err("a wrong passphrase opens nothing").to_string();
+        assert!(host_takes_no_password(&wrong), "{wrong}");
+        assert_eq!(String::from_utf8_lossy(&right.unwrap()).trim(), "in");
     }
 
     #[test]
