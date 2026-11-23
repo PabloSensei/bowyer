@@ -362,6 +362,25 @@ pub struct Transcript {
     pub usage_by_model: Vec<(String, Usage)>,
     /// When the last model call answered, for the state of the prompt cache.
     pub last_call_ms: Option<i64>,
+    /// Tokens per UTC day (days since the Unix epoch) and bucket, to sum a part of the
+    /// session such as this month's.
+    #[serde(default)]
+    pub usage_by_day: Vec<(i64, String, Usage)>,
+    /// The last prompt of a Claude Code session when the model never answered it (only API
+    /// errors came back): the harness can resume without it.
+    #[serde(default)]
+    pub failed_turn: Option<FailedTurn>,
+}
+
+/// A prompt that only got API errors, at the end of a Claude Code session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedTurn {
+    /// The history line of the prompt (`uuid`).
+    pub prompt: String,
+    /// The line before it: the session goes on from there without the prompt.
+    pub kept: String,
+    /// The first entry of the turn in [`Transcript::entries`].
+    pub start: usize,
 }
 
 impl Transcript {
@@ -369,6 +388,11 @@ impl Transcript {
     pub fn add_call(&mut self, model: Option<&str>, usage: Usage, timestamp_ms: i64) {
         self.total_usage.add(&usage);
         let bucket = pricing::bucket(model.unwrap_or("unknown"), &usage, timestamp_ms);
+        let day = timestamp_ms.div_euclid(DAY_MS);
+        match self.usage_by_day.iter_mut().find(|(at, name, _)| *at == day && *name == bucket) {
+            Some((_, _, sum)) => sum.add(&usage),
+            None => self.usage_by_day.push((day, bucket.clone(), usage)),
+        }
         match self.usage_by_model.iter_mut().find(|(name, _)| *name == bucket) {
             Some((_, sum)) => sum.add(&usage),
             None => self.usage_by_model.push((bucket, usage)),
@@ -377,6 +401,31 @@ impl Transcript {
             self.last_usage = Some(usage);
             self.last_call_ms = Some(self.last_call_ms.map_or(timestamp_ms, |last| last.max(timestamp_ms)));
         }
+    }
+
+    /// Leaves out the failed turn of `prompt` when it is the transcript's: the user dropped
+    /// it and the next turn resumes before it.
+    pub fn hide_failed_turn(&mut self, prompt: &str) -> bool {
+        match &self.failed_turn {
+            Some(failed) if failed.prompt == prompt && failed.start <= self.entries.len() => {
+                self.entries.truncate(failed.start);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Tokens per bucket of the calls from the UTC day of `since_ms` on.
+    pub fn usage_since(&self, since_ms: i64) -> Vec<(String, Usage)> {
+        let first = since_ms.div_euclid(DAY_MS);
+        let mut sums: Vec<(String, Usage)> = Vec::new();
+        for (_, bucket, usage) in self.usage_by_day.iter().filter(|(day, _, _)| *day >= first) {
+            match sums.iter_mut().find(|(name, _)| name == bucket) {
+                Some((_, sum)) => sum.add(usage),
+                None => sums.push((bucket.clone(), *usage)),
+            }
+        }
+        sums
     }
 
     /// Files the session changed, from its edit and write calls, in first-touch order.
@@ -438,6 +487,25 @@ impl Transcript {
         tasks
     }
 
+    /// The titles of the sessions this one started in a separate session of its host app
+    /// (the `start_session` tool of Claude's desktop app): the new session takes the title,
+    /// and nothing in its own history names the session that started it.
+    pub fn started_sessions(&self) -> Vec<String> {
+        let mut titles: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            for block in &entry.blocks {
+                if let Block::ToolCall { name, input, .. } = block
+                    && name.ends_with("start_session")
+                    && let Some(title) = input.get("title").and_then(Value::as_str).map(str::trim).filter(|title| !title.is_empty())
+                    && !titles.iter().any(|known| known == title)
+                {
+                    titles.push(title.to_owned());
+                }
+            }
+        }
+        titles
+    }
+
     /// The text of the session for the search index: prompts and answers, no tool output.
     /// The text for the search index of a long session: its start and its end, about
     /// `limit` bytes in all, so both how it began and what it came to are found.
@@ -473,6 +541,28 @@ impl Transcript {
         }
         text
     }
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// The start of the UTC month holding `ms`, in milliseconds since the Unix epoch.
+pub fn month_start_utc_ms(ms: i64) -> i64 {
+    let days = ms.div_euclid(DAY_MS);
+    let (_, _, day) = civil_from_days(days);
+    (days - (day - 1)) * DAY_MS
+}
+
+/// The year, month and day of a count of days since 1970-01-01 (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
 }
 
 /// A time as `2026-11-20 18:42 UTC`, from milliseconds since the Unix epoch.
@@ -573,6 +663,27 @@ fn task_title(name: &str, input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_month_starts_on_its_first_utc_day() {
+        // 2026-11-23T18:42:00Z and 2024-02-29T00:00:00Z (a leap day).
+        assert_eq!(super::month_start_utc_ms(1_795_459_320_000), 1_793_491_200_000);
+        assert_eq!(super::format_ms_utc(super::month_start_utc_ms(1_795_459_320_000)), "2026-11-01 00:00 UTC");
+        assert_eq!(super::format_ms_utc(super::month_start_utc_ms(1_709_164_800_000)), "2024-02-01 00:00 UTC");
+        assert_eq!(super::month_start_utc_ms(1_793_491_200_000), 1_793_491_200_000, "the first moment is its own start");
+    }
+
+    #[test]
+    fn usage_since_a_day_keeps_the_calls_from_that_day_on() {
+        let mut transcript = super::Transcript::default();
+        let call = |output| super::Usage { output, ..Default::default() };
+        transcript.add_call(Some("claude-haiku-4-5"), call(10), 1_793_400_000_000); // 2026-10-30
+        transcript.add_call(Some("claude-haiku-4-5"), call(5), 1_793_500_000_000); // 2026-11-01
+        transcript.add_call(Some("claude-opus-4-5"), call(7), 1_793_600_000_000);
+        let month = transcript.usage_since(super::month_start_utc_ms(1_795_459_320_000));
+        assert_eq!(month.iter().map(|(name, usage)| (name.as_str(), usage.output)).collect::<Vec<_>>(), vec![("claude-haiku-4-5", 5), ("claude-opus-4-5", 7)]);
+        assert_eq!(transcript.usage_since(0), transcript.usage_by_model, "all of it is the whole session");
+    }
+
     use super::*;
 
     #[test]

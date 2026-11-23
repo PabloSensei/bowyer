@@ -112,10 +112,13 @@ pub(super) fn with_selection(
 impl Shell {
     /// A block's text that the pointer can select. A drag that started in another block
     /// moves its end here while the pointer is over this one.
-    pub(super) fn selectable(&self, block: (usize, usize), styled: StyledText, cx: &mut Context<Self>) -> AnyElement {
+    /// A click that selects nothing on one of `links` (byte ranges of the text and web
+    /// addresses) opens the address in the browser.
+    pub(super) fn selectable(&self, block: (usize, usize), styled: StyledText, links: Vec<(std::ops::Range<usize>, String)>, cx: &mut Context<Self>) -> AnyElement {
         let layout = styled.layout().clone();
         let move_layout = layout.clone();
         let drawn_layout = layout.clone();
+        let up_layout = layout.clone();
         let drawn = self.drawn_text.clone();
         // Where the block is drawn, after its text: its layout is ready then.
         let record = canvas(
@@ -132,7 +135,7 @@ impl Shell {
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     let place = Place { block, offset: index_at(&layout, event.position) };
                     // Shift extends the selection there is.
                     let anchor = match &this.selection {
@@ -140,6 +143,11 @@ impl Shell {
                         _ => place,
                     };
                     this.selection = Some(TextSelection { anchor, head: place, dragging: true, bubble: None });
+                    // Ctrl+C then copies the selection: the composer may keep the focus,
+                    // another field (the search, say) gives it to the window.
+                    if !this.composer_focus.is_focused(window) {
+                        this.focus.focus(window, cx);
+                    }
                     cx.notify();
                 }),
             )
@@ -154,7 +162,26 @@ impl Shell {
                     }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.end_selection(event.position, cx)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                    let place = Place { block, offset: index_at(&up_layout, event.position) };
+                    // A click selected nothing: it began and ended here. `dragging` says
+                    // nothing by now: the other blocks saw the button let go outside them
+                    // first (their handler runs in the capture phase) and ended the drag.
+                    let click = this.selection.as_ref().is_some_and(|selection| selection.anchor == place && selection.head == place);
+                    log::debug!("text click at {:?}: click {click}, {} links", place, links.len());
+                    let link = links.iter().find(|(range, _)| range.start <= place.offset && place.offset < range.end);
+                    if click && let Some((_, url)) = link {
+                        this.selection = None;
+                        this.autoscroll = None;
+                        cx.open_url(url);
+                        cx.notify();
+                        return;
+                    }
+                    this.end_selection(event.position, cx)
+                }),
+            )
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.end_selection(event.position, cx)))
             .child(styled)
             .child(record)
@@ -251,13 +278,8 @@ impl Shell {
             (position.y - (view.bottom() - zone)) / zone
         };
         let step = depth.clamp(-3., 3.) * AUTOSCROLL_STEP;
+        // Scrolling up leaves the end of a running turn by itself.
         open.list.scroll_by(px(step));
-        // Scrolling up leaves the end of a running turn.
-        if step < 0.
-            && let Some(live) = &mut self.live
-        {
-            live.follow = false;
-        }
         if let Some(place) = self.place_near(position)
             && let Some(selection) = &mut self.selection
         {
@@ -282,6 +304,19 @@ impl Shell {
             selection.bubble = Some(position);
         }
         cx.notify();
+    }
+
+    /// Puts the selected text of the conversation on the clipboard. The selection stays.
+    /// Returns whether there was text to copy.
+    pub(super) fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let selected = self.selection_text();
+        if selected.trim().is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+        self.status = Some(t("code.copied").to_owned());
+        cx.notify();
+        true
     }
 
     /// The text of the selection, from the conversation itself: blocks scrolled out of

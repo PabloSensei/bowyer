@@ -1,7 +1,9 @@
 //! The menu of a row of the tree, on a right click: what a folder or a session can do
-//! besides being clicked and dragged. Deleting a folder asks for a second click.
+//! besides being clicked and dragged. Deleting a folder or a session asks for a second
+//! click.
 
 use library::TreeNodeKind;
+use model::SessionKey;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
@@ -11,7 +13,7 @@ use crate::i18n::t;
 pub(super) struct ContextMenu {
     position: Point<Pixels>,
     row: Row,
-    /// "Delete folder" was clicked once and waits for the second click.
+    /// "Delete folder" or "Delete session" was clicked once and waits for the second click.
     confirm_delete: bool,
 }
 
@@ -25,6 +27,7 @@ enum MenuAction {
     ResetName,
     MoveOut,
     CopyId,
+    DeleteSession,
 }
 
 impl Shell {
@@ -39,7 +42,7 @@ impl Shell {
     fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = &mut self.context_menu else { return };
         let row = menu.row.clone();
-        if matches!(action, MenuAction::DeleteFolder) && !menu.confirm_delete {
+        if matches!(action, MenuAction::DeleteFolder | MenuAction::DeleteSession) && !menu.confirm_delete {
             menu.confirm_delete = true;
             cx.notify();
             return;
@@ -76,9 +79,59 @@ impl Shell {
                 cx.write_to_clipboard(ClipboardItem::new_string(key.id.clone()));
                 self.status = Some(format!("{}: {}", t("code.copied"), key.id));
             }
+            (MenuAction::DeleteSession, TreeNodeKind::Session(key)) => self.delete_session(key.clone(), cx),
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Deletes a session the user asked to delete: its files go to the trash of its
+    /// machine. A session inside a store other sessions share is only hidden here.
+    fn delete_session(&mut self, key: SessionKey, cx: &mut Context<Self>) {
+        let running = self.runs_turn_of(&key);
+        if running {
+            self.status = Some(t("menu.delete_running").to_owned());
+            return;
+        }
+        let (Some(summary), Some(env)) = (self.summary(&key).cloned(), self.env_for(&key.env)) else { return };
+        let Some(files) = history::session_files(&summary) else {
+            let _ = self.lib().set_hidden(&key, true);
+            self.forget_session(&key);
+            self.status = Some(t("menu.session_hidden").to_owned());
+            self.reload(cx);
+            return;
+        };
+        self.status = Some(t("menu.deleting").to_owned());
+        let harness = key.harness.clone();
+        let task = cx.background_spawn(async move { history::move_to_trash(&*env, &harness, &files) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.forget_session(&key);
+                        this.status = Some(format!("{} ~/{}/{}", t("menu.session_deleted"), history::TRASH_DIR, key.harness.id()));
+                        this.rebuild_rows();
+                        this.rescan(cx);
+                    }
+                    Err(error) => this.status = Some(format!("{}: {error}", t("error"))),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Drops a deleted session from what the window shows; the open one closes.
+    fn forget_session(&mut self, key: &SessionKey) {
+        self.summaries.retain(|summary| summary.key != *key);
+        if self.open.as_ref().is_some_and(|open| open.summary.key == *key) {
+            self.open = None;
+        }
+        if self.selected.as_ref() == Some(key) {
+            self.selected = None;
+        }
     }
 
     pub(super) fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -103,6 +156,14 @@ impl Shell {
                     entries.push((MenuAction::MoveOut, t("menu.move_out"), false));
                 }
                 entries.push((MenuAction::CopyId, t("menu.copy_id"), false));
+                let own_files = self.summary(key).and_then(history::session_files).is_some();
+                let label = match (menu.confirm_delete, own_files) {
+                    (true, true) => t("menu.confirm_delete_session"),
+                    (true, false) => t("menu.confirm_hide_session"),
+                    (false, true) => t("menu.delete_session"),
+                    (false, false) => t("menu.hide_session"),
+                };
+                entries.push((MenuAction::DeleteSession, label, true));
             }
             TreeNodeKind::Group(_) | TreeNodeKind::More(..) => return None,
         }

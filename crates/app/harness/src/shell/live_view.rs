@@ -10,56 +10,304 @@ use model::{EnvId, HarnessKind, SessionKey, SessionSummary, SourceStamp, TaskRun
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{LiveRun, OpenSession, Shell, can_run_live, chip, composer, harness_color, model_presets, now_ms};
+use super::{LiveRun, OpenSession, Shell, can_run_live, chip, composer, effort_presets, harness_color, model_presets, now_ms};
 use crate::display;
 use crate::i18n::t;
 
+/// A list of the composer: the model, the effort or the permissions of the next turns. The
+/// value is the index of its button among the composer's anchors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComposerMenu {
+    Model = 0,
+    Effort = 1,
+    Permission = 2,
+}
+
+/// The setting that keeps the model or the effort of one session.
+fn choice_setting(kind: &str, key: &SessionKey) -> String {
+    format!("choice.{kind}.{}", key.encode())
+}
+
+/// The model a session's history names, as its next turn asks for it: the preset it is
+/// (OpenCode's carry the provider in front), else the id itself for a harness that takes
+/// any model id. `None` for a placeholder such as Claude Code's `<synthetic>`.
+fn history_model(harness: &HarnessKind, used: &str) -> Option<String> {
+    let used = used.trim();
+    if used.is_empty() || used.starts_with('<') || foreign_model(harness, used) {
+        return None;
+    }
+    let preset = model_presets(harness).iter().flatten().find(|preset| **preset == used || preset.ends_with(&format!("/{used}")));
+    if let Some(preset) = preset {
+        return Some((*preset).to_owned());
+    }
+    matches!(harness, HarnessKind::Claude | HarnessKind::Codex).then(|| used.to_owned())
+}
+
+/// A Claude model named the way one provider names it (Bedrock's `us.anthropic.…`, a
+/// gateway's own names): passed back to the harness it can fail where another provider
+/// serves the session, so the harness keeps its own choice instead.
+fn foreign_model(harness: &HarnessKind, model: &str) -> bool {
+    *harness == HarnessKind::Claude && !model.starts_with("claude-") && !model_presets(harness).contains(&Some(model))
+}
+
+/// `effort: high`, or the harness default.
+fn effort_label(effort: Option<&str>) -> String {
+    match effort {
+        Some(effort) => t("effort.level").replace("{level}", effort),
+        None => t("effort.default").to_owned(),
+    }
+}
+
 impl Shell {
-    /// Items of the running turn, after the items of the history.
-    pub(super) fn live_items(&self) -> Option<Arc<Vec<display::Item>>> {
-        let live = self.live.as_ref()?;
+    /// Where the turn of the open session is in `runs`: the one started from this view, or
+    /// one of the same session.
+    pub(super) fn live_ix(&self) -> Option<usize> {
         let open = self.open.as_ref()?;
-        let same = match (&live.session, open.summary.key.id.is_empty()) {
-            (_, true) => true,
-            (Some(session), false) => *session == open.summary.key.id,
-            (None, false) => false,
-        };
-        same.then(|| live.items.clone())
+        self.runs.iter().position(|run| open.run == Some(run.id) || (!run.key.id.is_empty() && run.key == open.summary.key))
     }
 
+    /// The turn of the open session, running or just finished.
+    pub(super) fn live(&self) -> Option<&LiveRun> {
+        self.live_ix().map(|ix| &self.runs[ix])
+    }
+
+    /// Items of the open session's turn, after the items of the history.
+    pub(super) fn live_items(&self) -> Option<Arc<Vec<display::Item>>> {
+        self.live().map(|live| live.items.clone())
+    }
+
+    /// Whether the open session runs a turn.
     pub(super) fn live_running(&self) -> bool {
-        self.live.as_ref().is_some_and(|live| !live.finished)
+        self.live().is_some_and(|live| !live.finished)
+    }
+
+    /// Keeps what was typed for the session being left and brings back what was typed for
+    /// `to`: every session has its own composer.
+    pub(super) fn switch_composer(&mut self, to: Option<&SessionKey>) {
+        let from = self.open.as_ref().map(|open| open.summary.key.clone());
+        if from.as_ref() == to {
+            return;
+        }
+        let text = std::mem::replace(&mut self.composer, TextField::from_text(""));
+        let attachments = std::mem::take(&mut self.attachments);
+        if let Some(from) = from
+            && (!text.text.is_empty() || !attachments.is_empty())
+        {
+            self.drafts.insert(from, (text, attachments));
+        }
+        if let Some((text, attachments)) = to.and_then(|to| self.drafts.remove(to)) {
+            self.composer = text;
+            self.attachments = attachments;
+        }
+        self.completion = None;
+        self.composer_menu = None;
     }
 
     /// Tasks of the running turn, newest first, with the ones still running marked so.
     pub(super) fn live_tasks(&self) -> Vec<TaskRun> {
-        let Some(live) = &self.live else { return Vec::new() };
+        let Some(live) = self.live() else { return Vec::new() };
         live.turn.as_ref().map(|turn| turn.tasks(!live.finished)).unwrap_or_default()
     }
 
-    pub(super) fn model_choice(&self, harness: &HarnessKind) -> Option<&'static str> {
-        let presets = model_presets(harness);
-        let index = self
-            .lib()
-            .setting(&format!("model.{}", harness.id()))
-            .and_then(|value| presets.iter().position(|p| p.unwrap_or("") == value))
-            .unwrap_or(0);
-        presets[index]
+    /// The model the next turn of the open session asks for: the one picked for this
+    /// session, else the one its history used last, else the one picked for new sessions
+    /// of `harness`. `None` is the harness default.
+    pub(super) fn model_choice(&self, harness: &HarnessKind) -> Option<String> {
+        if let Some(key) = self.open_session_key()
+            && let Some(kept) = self.lib().setting(&choice_setting("model", &key))
+        {
+            // A provider's own name kept from the history: the harness picks on that host.
+            return (!kept.is_empty() && !foreign_model(harness, &kept)).then_some(kept);
+        }
+        if let Some(open) = self.open.as_ref().filter(|open| open.summary.key.harness == *harness && !open.summary.key.id.is_empty())
+            && let Some(used) = open.model.as_deref().or(open.summary.model.as_deref())
+        {
+            // A session another provider serves goes on with that host's own model.
+            if foreign_model(harness, used.trim()) {
+                return None;
+            }
+            if let Some(model) = history_model(harness, used) {
+                return Some(model);
+            }
+        }
+        self.default_model(harness).map(str::to_owned)
+    }
+
+    /// The model new sessions of `harness` start with, as the settings keep it.
+    pub(super) fn default_model(&self, harness: &HarnessKind) -> Option<&'static str> {
+        let value = self.lib().setting(&format!("model.{}", harness.id()))?;
+        model_presets(harness).iter().flatten().find(|preset| **preset == value).copied()
+    }
+
+    /// The key of the open session when the harness named it; a new session has none.
+    fn open_session_key(&self) -> Option<SessionKey> {
+        self.open.as_ref().map(|open| open.summary.key.clone()).filter(|key| !key.id.is_empty())
+    }
+
+    /// Remembers the model and the effort a session's turn ran with, for its next turns.
+    pub(super) fn keep_choice(&self, key: &SessionKey, model: Option<&str>, effort: Option<&str>) {
+        let library = self.lib();
+        let _ = library.set_setting(&choice_setting("model", key), model.unwrap_or(""));
+        let _ = library.set_setting(&choice_setting("effort", key), effort.unwrap_or(""));
     }
 
     pub(super) fn cycle_model(&mut self, harness: &HarnessKind, cx: &mut Context<Self>) {
         let presets = model_presets(harness);
         let current = self.model_choice(harness);
-        let index = presets.iter().position(|p| *p == current).unwrap_or(0);
-        let next = presets[(index + 1) % presets.len()];
-        let _ = self.lib().set_setting(&format!("model.{}", harness.id()), next.unwrap_or(""));
+        let index = presets.iter().position(|p| p.map(str::to_owned) == current).unwrap_or(0);
+        self.set_composer_model(harness, presets[(index + 1) % presets.len()]);
         cx.notify();
+    }
+
+    /// A model picked in the composer: for the open session, and for new sessions of
+    /// `harness` too.
+    fn set_composer_model(&self, harness: &HarnessKind, model: Option<&str>) {
+        let library = self.lib();
+        if let Some(key) = self.open_session_key() {
+            let _ = library.set_setting(&choice_setting("model", &key), model.unwrap_or(""));
+        }
+        let _ = library.set_setting(&format!("model.{}", harness.id()), model.unwrap_or(""));
+    }
+
+    fn set_composer_effort(&self, harness: &HarnessKind, effort: Option<&str>) {
+        let library = self.lib();
+        if let Some(key) = self.open_session_key() {
+            let _ = library.set_setting(&choice_setting("effort", &key), effort.unwrap_or(""));
+        }
+        let _ = library.set_setting(&format!("effort.{}", harness.id()), effort.unwrap_or(""));
     }
 
     pub(super) fn cycle_permission(&mut self, cx: &mut Context<Self>) {
         let index = Permission::ALL.iter().position(|p| *p == self.permission).unwrap_or(0);
         self.permission = Permission::ALL[(index + 1) % Permission::ALL.len()];
         cx.notify();
+    }
+
+    /// The effort turns of `harness` run at, kept per harness like the model; `None` is the
+    /// harness default, and a harness without efforts has none.
+    pub(super) fn effort_choice(&self, harness: &HarnessKind) -> Option<String> {
+        let presets = effort_presets(harness);
+        let kept = self.open_session_key().and_then(|key| self.lib().setting(&choice_setting("effort", &key)));
+        let value = kept.or_else(|| self.lib().setting(&format!("effort.{}", harness.id())))?;
+        presets.iter().flatten().find(|preset| **preset == value).map(|preset| (*preset).to_owned())
+    }
+
+    /// What a pick from a list of the composer does.
+    fn pick(&mut self, menu: ComposerMenu, index: usize, harness: &HarnessKind, cx: &mut Context<Self>) {
+        match menu {
+            ComposerMenu::Model => {
+                if let Some(model) = self.model_rows(harness).get(index) {
+                    self.set_composer_model(harness, model.as_deref());
+                }
+            }
+            ComposerMenu::Effort => {
+                if let Some(effort) = effort_presets(harness).get(index) {
+                    self.set_composer_effort(harness, *effort);
+                }
+            }
+            ComposerMenu::Permission => {
+                if let Some(permission) = Permission::ALL.get(index) {
+                    self.permission = *permission;
+                }
+            }
+        }
+        self.composer_menu = None;
+        cx.notify();
+    }
+
+    /// The models of the list: the presets, and the session's own model when it is none
+    /// of them (a full model id from its history).
+    fn model_rows(&self, harness: &HarnessKind) -> Vec<Option<String>> {
+        let mut rows: Vec<Option<String>> = model_presets(harness).iter().map(|model| model.map(str::to_owned)).collect();
+        let current = self.model_choice(harness);
+        if !rows.contains(&current) {
+            rows.push(current);
+        }
+        rows
+    }
+
+    /// The rows of a list of the composer: label and whether it is the current choice.
+    fn menu_rows(&self, menu: ComposerMenu, harness: &HarnessKind) -> Vec<(String, bool)> {
+        match menu {
+            ComposerMenu::Model => {
+                let current = self.model_choice(harness);
+                self.model_rows(harness)
+                    .into_iter()
+                    .map(|model| {
+                        let chosen = model == current;
+                        (model.unwrap_or_else(|| t("model.default").to_owned()), chosen)
+                    })
+                    .collect()
+            }
+            ComposerMenu::Effort => {
+                let current = self.effort_choice(harness);
+                effort_presets(harness).iter().map(|effort| (effort_label(*effort), effort.map(str::to_owned) == current)).collect()
+            }
+            ComposerMenu::Permission => {
+                Permission::ALL.iter().map(|permission| (t(&format!("permission.{}", permission.id())).to_owned(), *permission == self.permission)).collect()
+            }
+        }
+    }
+
+    /// The open list of the composer, above the button it belongs to.
+    fn render_composer_menu(&self, harness: &HarnessKind, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let menu = self.composer_menu?;
+        let bounds = self.composer_anchors[menu as usize].bounds()?;
+        let rows = self.menu_rows(menu, harness);
+        let list = div()
+            .id("composer-menu")
+            .min_w(bounds.size.width.max(px(180.)))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .p(px(4.))
+            .rounded(px(9.))
+            .bg(theme.popup_bg)
+            .border_1()
+            .border_color(theme.popup_border)
+            .shadow(popup_shadow(&theme))
+            .text_size(px(12.5))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.composer_menu = None;
+                cx.notify();
+            }))
+            .children(rows.into_iter().enumerate().map(|(ix, (label, chosen))| {
+                let harness = harness.clone();
+                div()
+                    .id(("composer-menu-row", ix))
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .when(chosen, |this| this.bg(theme.selection).text_color(theme.text))
+                    .when(!chosen, |this| this.text_color(theme.text_secondary).hover(|style| style.bg(theme.selection_hover)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.pick(menu, ix, &harness, cx)))
+            }));
+        // The composer sits at the bottom: the list opens upwards.
+        let at = point(bounds.left(), bounds.top() - px(4.));
+        Some(deferred(anchored().anchor(Anchor::BottomLeft).position(at).snap_to_window_with_margin(px(8.)).child(list)).with_priority(2).into_any_element())
+    }
+
+    /// A button of the composer that opens its list.
+    fn menu_button(&self, menu: ComposerMenu, label: String, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = *cx.global::<Theme>();
+        let id = match menu {
+            ComposerMenu::Model => "model-chip",
+            ComposerMenu::Effort => "effort-chip",
+            ComposerMenu::Permission => "permission-chip",
+        };
+        let open = self.composer_menu == Some(menu);
+        chip(id, format!("{label}  ▾"), &theme)
+            .relative()
+            .when(open, |this| this.bg(theme.hover))
+            .child(self.composer_anchors[menu as usize].canvas())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.composer_menu = if this.composer_menu == Some(menu) { None } else { Some(menu) };
+                cx.notify();
+            }))
     }
 
     /// A new session of `harness` in the folder of the open session, or the home folder.
@@ -71,6 +319,16 @@ impl Shell {
             .as_ref()
             .and_then(|open| open.summary.cwd.clone())
             .or_else(|| shared.as_ref().and_then(|env| env.home().ok()));
+        self.open_draft(env, harness, cwd, window, cx);
+    }
+
+    /// A new session where the + of a project row says: its environment, folder and harness.
+    pub(super) fn start_draft_at(&mut self, start: library::SessionStart, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_draft(start.env, start.harness, Some(start.cwd), window, cx);
+    }
+
+    fn open_draft(&mut self, env: EnvId, harness: HarnessKind, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let shared = self.env_for(&env);
         let summary = SessionSummary {
             key: SessionKey { env, harness, id: String::new() },
             title: t("new_session").to_owned(),
@@ -85,7 +343,8 @@ impl Shell {
             source: SourceStamp::default(),
         };
         self.selected = None;
-        self.live = None;
+        self.runs.retain(|run| !run.finished);
+        self.switch_composer(Some(&summary.key));
         self.open = Some(OpenSession {
             git: summary.cwd.as_deref().and_then(|cwd| shared.as_ref().and_then(|env| env.git_info(cwd))),
             summary,
@@ -93,7 +352,7 @@ impl Shell {
             usage: Default::default(),
             cost_usd: None,
             items: Arc::new(Vec::new()),
-            list: ListState::new(0, ListAlignment::Top, px(1200.)),
+            list: super::conversation_list(0),
             breakdown: Default::default(),
             changes: Vec::new(),
             tasks: Vec::new(),
@@ -105,6 +364,8 @@ impl Shell {
             memory_tokens: 0,
             exact: None,
             exact_busy: false,
+            run: None,
+            failed: None,
         });
         self.composer_focus.focus(window, cx);
         cx.notify();
@@ -114,6 +375,14 @@ impl Shell {
     /// print-mode run answers from the session file without a call to the model, and
     /// without persistence it writes nothing to the session.
     pub(super) fn exact_context(&mut self, cx: &mut Context<Self>) {
+        // A plain resume would read the prompt the user deleted.
+        if let Some(key) = self.open.as_ref().map(|open| open.summary.key.clone())
+            && self.turn_drop(&key).is_some()
+        {
+            self.status = Some(t("drop.first").to_owned());
+            cx.notify();
+            return;
+        }
         let Some(open) = &self.open else { return };
         let summary = &open.summary;
         if open.exact_busy || summary.key.harness != HarnessKind::Claude || summary.key.id.is_empty() {
@@ -197,7 +466,11 @@ impl Shell {
 
     pub(super) fn send(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.text.trim().to_owned();
-        if (prompt.is_empty() && self.attachments.is_empty()) || self.live_running() || self.uploading {
+        if self.live_running() {
+            self.queue_prompt(prompt, cx);
+            return;
+        }
+        if (prompt.is_empty() && self.attachments.is_empty()) || self.uploading {
             return;
         }
         let Some(open) = &self.open else { return };
@@ -224,19 +497,24 @@ impl Shell {
             return;
         };
         let session = (!summary.key.id.is_empty()).then(|| summary.key.id.clone());
+        let ide = if ssh.is_none() { self.ide_of(&cwd) } else { None };
         let mut spec = TurnSpec {
             harness: summary.key.harness.clone(),
             session,
             cwd,
             prompt,
-            model: self.model_choice(&summary.key.harness).map(str::to_owned),
+            model: self.model_choice(&summary.key.harness),
+            effort: self.effort_choice(&summary.key.harness),
             permission: self.permission,
             ssh,
             attachments: Vec::new(),
+            ide,
+            drop_turn: if summary.key.harness == HarnessKind::Claude { self.turn_drop(&summary.key) } else { None },
         };
         let attached = std::mem::take(&mut self.attachments);
         let backup = attached.clone();
         let harness = spec.harness.clone();
+        let key = summary.key.clone();
         // Claude takes pictures inline; every other file must be on the machine of the turn.
         let inline = move |a: &composer::Attached| harness == HarnessKind::Claude && a.picture.is_some();
         let as_live = |a: composer::Attached, path: String| live::Attachment {
@@ -266,10 +544,14 @@ impl Shell {
                         match uploaded {
                             Ok(list) => {
                                 spec.attachments = list;
-                                this.start_turn(spec, backup, cx);
+                                this.start_turn(key, spec, backup, cx);
                             }
                             Err(error) => {
-                                this.attachments = backup;
+                                if this.open.as_ref().is_some_and(|open| open.summary.key == key) {
+                                    this.attachments = backup;
+                                } else {
+                                    this.drafts.entry(key).or_insert_with(|| (TextField::from_text(""), Vec::new())).1 = backup;
+                                }
                                 this.status = Some(format!("{}: {error}", t("error")));
                                 cx.notify();
                             }
@@ -288,32 +570,148 @@ impl Shell {
                         as_live(a, path)
                     })
                     .collect();
-                self.start_turn(spec, backup, cx);
+                self.start_turn(summary.key.clone(), spec, backup, cx);
             }
         }
     }
 
-    fn start_turn(&mut self, spec: TurnSpec, attached: Vec<composer::Attached>, cx: &mut Context<Self>) {
-        let session = spec.session.clone();
+    /// A prompt sent while the open session's turn runs: it waits for the end of the turn.
+    /// Attachments stay in the composer for the turn after.
+    fn queue_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        let Some(ix) = self.live_ix() else { return };
+        if prompt.is_empty() {
+            return;
+        }
+        self.runs[ix].queued.push(prompt);
+        self.composer = TextField::from_text("");
+        self.completion = None;
+        cx.notify();
+    }
+
+    /// Takes a waiting prompt back into the composer.
+    fn unqueue(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.live_ix() else { return };
+        let queued = &mut self.runs[ix].queued;
+        if at >= queued.len() {
+            return;
+        }
+        let prompt = queued.remove(at);
+        let text = if self.composer.text.trim().is_empty() { prompt } else { format!("{prompt}\n\n{}", self.composer.text) };
+        self.composer = TextField::from_text(&text);
+        cx.notify();
+    }
+
+    /// The prompts waiting for the end of the open session's turn, above the composer.
+    fn render_queued(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let live = self.live().filter(|live| !live.finished && !live.queued.is_empty())?;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .mb(px(8.))
+                .child(div().text_size(px(11.5)).text_color(theme.text_muted).child(t("live.queued")))
+                .children(live.queued.iter().enumerate().map(|(at, prompt)| {
+                    div()
+                        .id(("queued", at))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(theme.island_bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(12.5))
+                        .child(div().flex_1().min_w_0().truncate().child(prompt.lines().next().unwrap_or("").to_owned()))
+                        .child(
+                            div()
+                                .id(("unqueue", at))
+                                .flex_none()
+                                .px(px(6.))
+                                .rounded(px(5.))
+                                .text_color(theme.text_muted)
+                                .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                                .child("×")
+                                .tooltip(|_, cx| tooltip(t("live.unqueue"), None, cx))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.unqueue(at, cx))),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The next turn of a session whose turn just ended, with the prompts sent meanwhile.
+    fn send_queued(&mut self, mut spec: TurnSpec, key: SessionKey, queued: Vec<String>, base: Option<usize>, cx: &mut Context<Self>) {
+        spec.session = Some(key.id.clone());
+        spec.prompt = queued.join("\n\n");
+        spec.attachments = Vec::new();
+        if spec.ssh.is_none() {
+            spec.ide = self.ide_of(&spec.cwd);
+        }
+        self.start_turn_from(key, spec, Vec::new(), false, base, cx);
+    }
+
+    fn start_turn(&mut self, key: SessionKey, spec: TurnSpec, attached: Vec<composer::Attached>, cx: &mut Context<Self>) {
+        self.start_turn_from(key, spec, attached, true, None, cx);
+    }
+
+    /// Starts a turn of the session `key`. `from_composer` empties the composer it was typed
+    /// in; `base` is how many items of the history the turn follows, when it is not what
+    /// the open view shows.
+    fn start_turn_from(&mut self, key: SessionKey, spec: TurnSpec, attached: Vec<composer::Attached>, from_composer: bool, base: Option<usize>, cx: &mut Context<Self>) {
+        // The upload of the attachments may end after the user went to another session.
+        let here = self.open.as_ref().is_some_and(|open| open.summary.key == key);
+        let choice = (spec.model.clone(), spec.effort.clone());
+        let template = spec.clone();
         let turn = match live::start(spec) {
             Ok(turn) => turn,
             Err(error) => {
-                self.attachments = attached;
+                if here {
+                    self.attachments = attached;
+                } else if let Some((_, kept)) = self.drafts.get_mut(&key) {
+                    *kept = attached;
+                }
                 self.status = Some(format!("{}: {error}", t("error")));
                 cx.notify();
                 return;
             }
         };
-        self.composer = TextField::from_text("");
-        self.completion = None;
+        let id = self.next_run;
+        self.next_run += 1;
+        // Unknown when the turn began in a session the user had left.
+        let mut base_items = usize::MAX;
+        if here {
+            if from_composer {
+                self.composer = TextField::from_text("");
+                self.completion = None;
+            }
+            if let Some(open) = &mut self.open {
+                open.run = Some(id);
+                base_items = base.unwrap_or(open.items.len());
+                // A sent message shows its answer: the view goes to the end and follows it.
+                open.list.scroll_to_end();
+            }
+        } else if from_composer {
+            self.drafts.remove(&key);
+        }
+        if !key.id.is_empty() {
+            self.keep_choice(&key, choice.0.as_deref(), choice.1.as_deref());
+        }
         let (stop, mut events) = turn.into_parts();
-        self.live = Some(LiveRun {
+        self.runs.push(LiveRun {
+            id,
+            key,
+            base_items,
+            model: choice.0,
+            effort: choice.1,
+            spec: template,
+            queued: Vec::new(),
             stop,
-            session,
             items: Arc::new(Vec::new()),
             turn: None,
             started: std::time::Instant::now(),
-            follow: true,
             asks: Vec::new(),
             stopping: Vec::new(),
             picks: Default::default(),
@@ -326,7 +724,7 @@ impl Shell {
         });
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
-                let keep = this.update(cx, |this, cx| this.on_live_event(event, cx)).is_ok();
+                let keep = this.update(cx, |this, cx| this.on_live_event(id, event, cx)).is_ok();
                 if !keep {
                     break;
                 }
@@ -338,7 +736,9 @@ impl Shell {
 
     /// Stops one command or agent of the running turn; the turn goes on.
     fn stop_command(&mut self, call: String, command: Option<String>, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+        let Some(ix) = self.live_ix() else { return };
+        let live = &mut self.runs[ix];
+        let run = live.id;
         if live.finished || live.stopping.contains(&call) {
             return;
         }
@@ -353,7 +753,7 @@ impl Shell {
                 // A stopped command stays "stopping" until its result comes: a second click
                 // would find nothing to stop.
                 if let Err(error) = result {
-                    if let Some(live) = &mut this.live {
+                    if let Some(live) = this.runs.iter_mut().find(|live| live.id == run) {
                         live.stopping.retain(|id| *id != call);
                     }
                     this.status = Some(format!("{}: {error}", t("live.stop_command_failed")));
@@ -367,7 +767,8 @@ impl Shell {
 
     /// Answers the question of the harness about `tool_call_id` with an option it offered.
     fn answer_permission(&mut self, tool_call_id: &str, option: String, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+        let Some(ix) = self.live_ix() else { return };
+        let live = &mut self.runs[ix];
         if let Some(at) = live.asks.iter().position(|ask| ask.tool_call_id == tool_call_id) {
             let ask = live.asks.remove(at);
             let _ = ask.reply.send(Some(option));
@@ -382,7 +783,8 @@ impl Shell {
 
     /// Picks or unpicks a choice of a question with several answers.
     fn toggle_pick(&mut self, tool_call_id: &str, question: usize, choice: usize, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+        let Some(ix) = self.live_ix() else { return };
+        let live = &mut self.runs[ix];
         let Some(ask) = live.asks.iter().find(|ask| ask.tool_call_id == tool_call_id) else { return };
         let Some(multi) = ask.questions.get(question).map(|q| q.multi) else { return };
         let count = ask.questions.len();
@@ -418,7 +820,7 @@ impl Shell {
 
     /// Sends the answers once every question has one.
     fn send_answers(&mut self, tool_call_id: &str, cx: &mut Context<Self>) {
-        let Some(live) = &self.live else { return };
+        let Some(live) = self.live() else { return };
         let Some(ask) = live.asks.iter().find(|ask| ask.tool_call_id == tool_call_id) else { return };
         let answers = Self::answers_of(live, ask);
         if answers.iter().any(live::Answer::is_empty) {
@@ -429,7 +831,8 @@ impl Shell {
 
     /// Puts the caret into the own answer to a question.
     fn start_typing(&mut self, tool_call_id: &str, question: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+        let Some(ix) = self.live_ix() else { return };
+        let live = &mut self.runs[ix];
         let Some(ask) = live.asks.iter().find(|ask| ask.tool_call_id == tool_call_id) else { return };
         let count = ask.questions.len().max(1);
         let texts = live.texts.entry(tool_call_id.to_owned()).or_insert_with(|| vec![TextField::from_text(""); count]);
@@ -444,7 +847,8 @@ impl Shell {
     /// Keys of the own answer being typed: Enter sends the answers when every question
     /// has one, Escape leaves the field.
     fn answer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+        let Some(ix) = self.live_ix() else { return };
+        let live = &mut self.runs[ix];
         let Some((call, question)) = live.typing.clone() else { return };
         match event.keystroke.key.as_str() {
             "enter" => {
@@ -479,7 +883,7 @@ impl Shell {
 
     /// The field for an answer of the user's own to question `q` of `ask`.
     fn own_answer_field(&self, ask: &live::PermissionAsk, ix: usize, q: usize, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(live) = self.live.as_ref() else { return div().into_any_element() };
+        let Some(live) = self.live() else { return div().into_any_element() };
         let active = live.typing.as_ref().is_some_and(|(call, at)| *call == ask.tool_call_id && *at == q);
         let focused = active && live.answer_focus.is_focused(window);
         let field = live.texts.get(&ask.tool_call_id).and_then(|texts| texts.get(q));
@@ -514,8 +918,7 @@ impl Shell {
     /// do and the answers it offers.
     fn render_asks(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Only above the session the turn runs in, like its items.
-        self.live_items()?;
-        let live = self.live.as_ref()?;
+        let live = self.live()?;
         if live.asks.is_empty() {
             return None;
         }
@@ -662,9 +1065,10 @@ impl Shell {
     }
 
     pub(super) fn stop_live(&mut self, cx: &mut Context<Self>) {
-        if let Some(live) = &mut self.live
-            && !live.finished
+        if let Some(ix) = self.live_ix()
+            && !self.runs[ix].finished
         {
+            let live = &mut self.runs[ix];
             live.asks.clear();
             let stop = live.stop.clone();
             // Over SSH the stop is a round trip to the host: off the window thread.
@@ -674,17 +1078,23 @@ impl Shell {
         }
     }
 
-    fn on_live_event(&mut self, event: LiveEvent, cx: &mut Context<Self>) {
-        let Some(live) = &mut self.live else { return };
+    fn on_live_event(&mut self, run: u64, event: LiveEvent, cx: &mut Context<Self>) {
+        let Some(ix) = self.runs.iter().position(|live| live.id == run) else { return };
+        // Whether the conversation on screen is this run's session.
+        let shown = self.live_ix() == Some(ix);
+        let live = &mut self.runs[ix];
         match event {
             LiveEvent::Session(id) => {
-                live.session = Some(id.clone());
+                live.key.id = id.clone();
+                let (key, model, effort) = (live.key.clone(), live.model.clone(), live.effort.clone());
                 if let Some(open) = &mut self.open
+                    && open.run == Some(run)
                     && open.summary.key.id.is_empty()
                 {
                     open.summary.key.id = id;
                     self.selected = Some(open.summary.key.clone());
                 }
+                self.keep_choice(&key, model.as_deref(), effort.as_deref());
             }
             LiveEvent::Update(turn) => {
                 let items = Arc::new(display::items(&turn));
@@ -692,26 +1102,22 @@ impl Shell {
                 let new = items.len();
                 live.items = items;
                 live.turn = Some(turn);
-                if let Some(open) = &self.open {
+                // The list follows the end by itself while the reader is there, and stays
+                // where they read otherwise.
+                if shown && let Some(open) = &self.open {
                     let base = open.items.len();
-                    // A growing last item can leave the view short of the end before the
-                    // next update: following is remembered, not measured each time.
-                    let following = live.follow || open.list.is_scrolled_to_end().unwrap_or(true) || old == 0;
-                    live.follow = following;
-                    open.list.splice(base..base + old, new);
+                    super::splice_in_place(&open.list, base..base + old, new);
                     if new > 0 {
                         open.list.remeasure_items(base + new - 1..base + new);
-                    }
-                    if following && base + new > 0 {
-                        open.list.scroll_to_end();
                     }
                 }
             }
             LiveEvent::Stderr(text) => live.stderr = text,
             LiveEvent::Permission(ask) => {
                 live.asks.push(ask);
+                let key = live.key.clone();
                 // The turn waits for the user: call them back if they went elsewhere.
-                self.call_attention(None, super::Call::Asks);
+                self.call_attention(Some(key), super::Call::Asks);
             }
             LiveEvent::Finished { ok, error } => {
                 live.finished = true;
@@ -719,23 +1125,58 @@ impl Shell {
                 live.asks.clear();
                 live.error = if ok { None } else { error.or_else(|| Some(live.stderr.clone())) };
                 let seconds = live.started.elapsed().as_secs_f32();
-                self.status = Some(match &live.error {
-                    None => format!("{} · {seconds:.1}s", t("live.done")),
-                    Some(error) => format!("{}: {}", t("error"), model::shorten(error, 300)),
-                });
-                // The harness wrote the turn into its own history: read it back from there,
-                // and open the session once the scan has it.
-                if let Some(session) = live.session.clone()
-                    && let Some(open) = &self.open
-                {
-                    let key = SessionKey { id: session, ..open.summary.key.clone() };
-                    self.pending_open = Some(key);
+                let key = live.key.clone();
+                // A turn that left a failed one out has done it: the ones after go on as usual.
+                let dropped = ok && live.spec.drop_turn.take().is_some();
+                let forget = dropped.then(|| key.clone());
+                let queued = std::mem::take(&mut live.queued);
+                let follow = (ok && !queued.is_empty() && !key.id.is_empty()).then(|| live.spec.clone());
+                // The turn after follows the history and this turn's items.
+                let base = self.open.as_ref().filter(|_| shown).map(|open| open.items.len() + self.runs[ix].items.len());
+                if follow.is_none() && !queued.is_empty() {
+                    let text = queued.join("\n\n");
+                    if shown {
+                        let typed = self.composer.text.trim();
+                        let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
+                        self.composer = TextField::from_text(&text);
+                    } else {
+                        let draft = self.drafts.entry(key.clone()).or_insert_with(|| (TextField::from_text(""), Vec::new()));
+                        let typed = draft.0.text.trim();
+                        let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
+                        draft.0 = TextField::from_text(&text);
+                    }
                 }
-                // A turn of the window ended: call the user back if they went elsewhere.
-                self.call_attention(None, if ok { super::Call::Done } else { super::Call::Failed });
+                let live = &mut self.runs[ix];
+                if shown {
+                    self.status = Some(match &live.error {
+                        None => format!("{} · {seconds:.1}s", t("live.done")),
+                        Some(error) => format!("{}: {}", t("error"), model::shorten(error, 300)),
+                    });
+                    // The harness wrote the turn into its own history: read it back from
+                    // there, and open the session once the scan has it.
+                    if !key.id.is_empty() {
+                        self.pending_open = Some(key.clone());
+                    }
+                } else {
+                    // Its session is read anew when it is opened.
+                    self.runs.remove(ix);
+                }
+                if let Some(spec) = follow {
+                    // The session goes on with what was sent meanwhile: nobody to call yet.
+                    self.send_queued(spec, key, queued, base, cx);
+                } else {
+                    // A turn of the window ended: call the user back if they went elsewhere.
+                    let key = (!key.id.is_empty()).then_some(key);
+                    self.call_attention(key, if ok { super::Call::Done } else { super::Call::Failed });
+                }
                 if self.right_tab == super::files_view::RightTab::Changes {
                     self.refresh_changes(cx);
                 }
+                if let Some(key) = forget {
+                    self.forget_drop(&key);
+                }
+                // The turn used some of the plan.
+                self.look_at_plan(true, cx);
                 self.rescan(cx);
             }
         }
@@ -776,6 +1217,10 @@ impl Shell {
             return;
         }
         if self.composer.key_with_clipboard(event, true, cx) {
+            // Typing at the end of a text taller than the field keeps the end in view.
+            if self.composer.caret() == self.composer.text.len() {
+                self.composer_scroll.scroll_to_bottom();
+            }
             self.update_completion(cx);
             cx.notify();
             cx.stop_propagation();
@@ -789,13 +1234,16 @@ impl Shell {
         let focused = self.composer_focus.is_focused(window);
         let running = self.live_running();
         let supported = can_run_live(&harness);
-        let model_label = self.model_choice(&harness).unwrap_or(t("model.default")).to_owned();
+        let model_label = self.model_choice(&harness).unwrap_or_else(|| t("model.default").to_owned());
         let permission_label = t(&format!("permission.{}", self.permission.id()));
         let placeholder = if supported { t("composer.placeholder") } else { t("live.unsupported") };
+        // Lines wrap to the width of the field, and a text taller than it scrolls.
         let field = div()
+            .id("composer-text")
             .min_h(px(44.))
             .max_h(px(220.))
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.composer_scroll)
             .flex()
             .flex_col()
             .text_size(px(13.5))
@@ -803,25 +1251,70 @@ impl Shell {
                 this.child(div().text_color(theme.text_muted).child(placeholder))
             })
             .when(!self.composer.text.is_empty() || focused, |this| {
-                this.children(text_field_lines(
-                    &self.composer,
-                    theme.text,
-                    theme.over_accent,
-                    theme.selection,
-                    theme.caret,
-                    20.,
-                    focused,
-                ))
+                let (text, layout) = text_field_wrapped(&self.composer, theme.text, theme.over_accent, theme.selection, theme.caret, 20., focused);
+                let move_layout = layout.clone();
+                // The mouse places the caret and selects: a click, Shift+click, a double
+                // click for a word, a triple one for the line, and a drag.
+                this.child(
+                    div()
+                        .id("composer-input")
+                        .cursor_text()
+                        .child(text)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                let at = text_index_at(&layout, event.position);
+                                match event.click_count {
+                                    2 => this.composer.select_word_at(at),
+                                    count if count >= 3 => this.composer.select_line_at(at),
+                                    _ if event.modifiers.shift => this.composer.select_to(at),
+                                    _ => this.composer.set_caret(at),
+                                }
+                                this.composer_selecting = event.click_count < 2;
+                                this.composer_focus.focus(window, cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            if this.composer_selecting && event.pressed_button == Some(MouseButton::Left) {
+                                let at = text_index_at(&move_layout, event.position);
+                                if at != this.composer.caret() {
+                                    this.composer.select_to(at);
+                                    cx.notify();
+                                }
+                            }
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = false))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = false)),
+                )
             });
         let elapsed = self
-            .live
-            .as_ref()
+            .live()
             .filter(|live| !live.finished)
             .map(|live| format!("{:.0}s", live.started.elapsed().as_secs_f32()));
         if running {
             // Repaint once a second for the timer.
             self.repaint_after(std::time::Duration::from_secs(1), cx);
         }
+        // While a turn runs, a typed prompt can wait for its end beside the Stop button.
+        let queue = (running && !self.composer.text.trim().is_empty()).then(|| {
+            div()
+                .id("send-next")
+                .flex()
+                .items_center()
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.accent)
+                .text_color(theme.accent)
+                .font_weight(FontWeight::MEDIUM)
+                .hover(|style| style.bg(theme.hover))
+                .child(t("live.queue"))
+                .tooltip(|_, cx| tooltip(t("live.queue_tip"), Some("Enter".into()), cx))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send(cx)))
+        });
         let action = if running {
             div()
                 .id("stop")
@@ -851,16 +1344,43 @@ impl Shell {
                 .child(t("live.send"))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send(cx)))
         };
-        let harness_for_model = harness.clone();
+        let model_button = self.menu_button(ComposerMenu::Model, model_label, cx);
+        // Only a harness whose effort Bowyer can set shows the list.
+        let effort_button = (!effort_presets(&harness).is_empty())
+            .then(|| self.menu_button(ComposerMenu::Effort, effort_label(self.effort_choice(&harness).as_deref()), cx));
+        let permission_button = self.menu_button(ComposerMenu::Permission, permission_label.to_owned(), cx);
+        // The IDE Claude Code works with, when one has the session's folder open.
+        let ide = open.summary.cwd.as_deref().and_then(|cwd| self.ide_of(cwd)).map(|ide| {
+            let tip = t("ide.connected").replace("{ide}", &ide.name);
+            div()
+                .id("ide-chip")
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(24.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .text_color(theme.text_secondary)
+                .child(div().size(px(6.)).rounded_full().bg(theme.success))
+                .child(ide.name.clone())
+                .tooltip(move |_, cx| tooltip(tip.clone(), None, cx))
+        });
+        let menu = self.render_composer_menu(&harness, cx);
         let completion = self.render_completion(&theme, cx);
         let attachments = self.render_attachments(&theme, cx);
         let asks = self.render_asks(&theme, window, cx);
+        let queued = self.render_queued(&theme, cx);
+        let failed = self.render_failed_turn(&theme, cx);
         div()
             .id("composer-area")
+            .flex_none()
             .p(px(12.))
             .border_t_1()
             .border_color(theme.border)
             .children(asks)
+            .children(failed)
+            .children(queued)
             .child(
                 div()
                     .id("composer")
@@ -906,15 +1426,24 @@ impl Shell {
                                             .tooltip(|_, cx| tooltip(t("composer.attach"), None, cx))
                                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_files(cx))),
                                     )
-                                    .child(div().size(px(8.)).rounded_full().bg(harness_color(&harness)))
-                                    .child(chip("model-chip", model_label, &theme).on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _, cx| this.cycle_model(&harness_for_model, cx),
-                                    )))
-                                    .child(chip("permission-chip", permission_label, &theme).on_click(cx.listener(
-                                        |this, _: &ClickEvent, _, cx| this.cycle_permission(cx),
-                                    ))),
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .px(px(4.))
+                                            .text_size(px(12.))
+                                            .text_color(theme.text_secondary)
+                                            .child(div().size(px(8.)).rounded_full().bg(harness_color(&harness)))
+                                            .child(harness.label().to_owned()),
+                                    )
+                                    .child(model_button)
+                                    .children(effort_button)
+                                    .child(permission_button)
+                                    .children(ide)
+                                    .children(menu),
                             )
-                            .child(action),
+                            .child(div().flex().items_center().gap(px(6.)).children(queue).child(action)),
                     ),
             )
             .into_any_element()
@@ -923,7 +1452,7 @@ impl Shell {
     /// Running and finished commands of the live turn, for the right pane.
     pub(super) fn render_live_tasks(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.global::<Theme>();
-        let live = self.live.as_ref()?;
+        let live = self.live()?;
         let tasks = self.live_tasks();
         let running = !live.finished;
         // While the harness asks, the command it asks about has not started yet.
@@ -996,5 +1525,26 @@ impl Shell {
                 })
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{foreign_model, history_model};
+    use model::HarnessKind;
+
+    #[test]
+    fn a_session_goes_on_with_the_model_its_history_used() {
+        assert_eq!(history_model(&HarnessKind::Claude, "claude-opus-5-5").as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(history_model(&HarnessKind::Claude, "haiku").as_deref(), Some("haiku"));
+        assert_eq!(history_model(&HarnessKind::Claude, "<synthetic>"), None);
+        assert_eq!(history_model(&HarnessKind::Claude, "us.anthropic.claude-sonnet-5-5"), None, "a provider's own name stays with its host");
+        assert!(foreign_model(&HarnessKind::Claude, "us.anthropic.claude-sonnet-5-5"));
+        assert!(!foreign_model(&HarnessKind::Claude, "sonnet") && !foreign_model(&HarnessKind::Claude, "claude-opus-5-5"));
+        assert!(!foreign_model(&HarnessKind::Codex, "gpt-5.5-codex"));
+        assert_eq!(history_model(&HarnessKind::OpenCode, "deepseek-v4.1-flash").as_deref(), Some("opencode-go/deepseek-v4.1-flash"));
+        assert_eq!(history_model(&HarnessKind::OpenCode, "some-other-model"), None, "OpenCode needs its provider");
+        assert_eq!(history_model(&HarnessKind::Codex, "gpt-5.5-codex").as_deref(), Some("gpt-5.5-codex"));
+        assert_eq!(history_model(&HarnessKind::Codex, " "), None);
     }
 }

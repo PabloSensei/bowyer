@@ -12,6 +12,7 @@ fn main() {
     let spec = TurnSpec {
         harness: HarnessKind::from_id(&head[0]),
         model: Some(head[1].clone()),
+        effort: None,
         cwd: head[2].clone(),
         session: head.get(3).cloned(),
         prompt,
@@ -35,6 +36,12 @@ fn main() {
             .unwrap_or_default(),
         ssh: std::env::var("BOWYER_SSH").ok().map(|host| {
             envs::SshEnvironment::new(&host).with_identity(std::env::var_os("BOWYER_SSH_KEY").map(Into::into))
+        }),
+        ide: None,
+        // BOWYER_DROP="<kept line> <failed prompt>" resumes before a failed turn.
+        drop_turn: std::env::var("BOWYER_DROP").ok().and_then(|value| {
+            let (kept, prompt) = value.split_once(' ')?;
+            Some((kept.to_owned(), prompt.to_owned()))
         }),
     };
     let started = Instant::now();

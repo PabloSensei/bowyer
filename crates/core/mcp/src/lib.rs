@@ -1,7 +1,13 @@
 //! Bowyer's memory for harnesses: an MCP server on standard input and output
-//! (`bowyer mcp`). A harness asks for what it needs instead of carrying it in its context:
-//! past sessions found by words, the conversation of one of them, and notes kept per
-//! project. Everything stays in Bowyer's own `library.db`; nothing goes over the network.
+//! (`bowyer mcp`). A harness asks for what it needs instead of carrying it in its context.
+//! `recall` answers "we did something like this before" with notes and digests of past
+//! sessions (problem, fix, commits, tickets, files, see [`digest`]); `read_session` gives
+//! the passages of one conversation; `save_note` keeps a fact. Everything stays in
+//! Bowyer's own `library.db`; nothing goes over the network.
+//!
+//! The tools of the first version (`search_sessions`, `search_notes`, `delete_note`) still
+//! answer for harness sessions that listed them, but are no longer offered: every tool
+//! offered costs its description in every request of every session.
 //!
 //! The server answers for the project it was started in (the harness starts it in its
 //! working folder): searching and reading other projects takes `all_projects: true`.
@@ -9,17 +15,27 @@
 //! off in the window takes effect at once; `memory.off_projects` turns it off for some
 //! projects only.
 
+pub mod digest;
+
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use envs::{Environment, LocalEnvironment, SshEnvironment};
 use library::Library;
-use model::{Block, EnvId, Role, SessionKey, SessionSummary};
+use model::{Block, EnvId, Role, SessionKey, SessionSummary, Transcript};
 use serde_json::{Value, json};
 
 /// The most text one answer carries.
 const MAX_ANSWER: usize = 60_000;
-const DEFAULT_READ: usize = 20_000;
+/// What `read_session` gives without `max_chars`: the end of the conversation, where the
+/// outcome is, or the passages around the words asked for.
+const DEFAULT_READ: usize = 6_000;
+/// Text around each passage that holds the words of a `read_session` query.
+const PASSAGE: usize = 600;
+const PASSAGES: usize = 3;
+/// The server's instructions, in the system prompt of every session that connects it.
+pub const INSTRUCTIONS: &str = "Bowyer's memory of this project: past sessions (problem, fix, commits, tickets) and notes. When the user refers to earlier work, call recall before searching files.";
 const PROTOCOL: &str = "2025-06-18";
 
 pub struct Server {
@@ -78,6 +94,18 @@ fn in_project(cwd: Option<&str>, project: &str) -> bool {
     cwd == project || cwd.starts_with(&format!("{project}/"))
 }
 
+/// The last `limit` bytes of a text, with a mark that the start is left out.
+fn tail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… (the start is left out)\n{}", &text[start..])
+}
+
 fn cut(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
@@ -89,50 +117,174 @@ fn cut(text: &str, limit: usize) -> String {
     format!("{}\n… (cut at {limit} characters)", &text[..end])
 }
 
+/// The tools offered: few and short, since each description rides in every request.
 fn tools() -> Value {
     json!([
         {
-            "name": "search_sessions",
-            "description": "Find past AI coding sessions (Claude Code, OpenCode, Codex) by words in their titles, first prompts and folders, and in the conversations opened in Bowyer before. Answers with keys for read_session. Only this project's sessions unless all_projects is true.",
+            "name": "recall",
+            "description": "Search this project's notes and past AI coding sessions. Gives notes, then digests of the best sessions: problem, fix, commits, tickets, files, and a key for read_session.",
             "inputSchema": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "Words to look for."},
-                "limit": {"type": "integer", "description": "At most this many sessions (default 10, at most 30)."},
-                "all_projects": {"type": "boolean", "description": "Search every project, not only this one."}
+                "query": {"type": "string", "description": "Words of the problem, error, component or ticket."},
+                "all_projects": {"type": "boolean"}
             }, "required": ["query"]}
         },
         {
             "name": "read_session",
-            "description": "The conversation of a past session found with search_sessions: prompts and answers, tool calls in one line each, tool output left out. Long sessions come cut; ask for less with max_chars.",
+            "description": "Passages of a past session that hold the query words, or its end. Tool output is left out.",
             "inputSchema": {"type": "object", "properties": {
-                "key": {"type": "string", "description": "The key search_sessions gave."},
-                "max_chars": {"type": "integer", "description": "At most this many characters (default 20000, at most 60000)."},
-                "from_end": {"type": "boolean", "description": "Keep the end of a long session instead of its start."},
-                "all_projects": {"type": "boolean", "description": "Allow a session of another project."}
+                "key": {"type": "string"},
+                "query": {"type": "string"},
+                "max_chars": {"type": "integer"}
             }, "required": ["key"]}
         },
         {
             "name": "save_note",
-            "description": "Keep a short note for this project: a decision, a fact, a command that works. Notes outlive sessions and cost no context until searched.",
-            "inputSchema": {"type": "object", "properties": {
-                "text": {"type": "string", "description": "The note."}
-            }, "required": ["text"]}
-        },
-        {
-            "name": "search_notes",
-            "description": "The notes of this project that hold all the given words, newest first; with no words, the latest notes.",
-            "inputSchema": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "Words the notes must hold."},
-                "all_projects": {"type": "boolean", "description": "Notes of every project."}
-            }}
-        },
-        {
-            "name": "delete_note",
-            "description": "Remove a note by its id from search_notes.",
-            "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "integer"}
-            }, "required": ["id"]}
+            "description": "Keep a short note for this project: a decision, a fact, a command that works.",
+            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
         }
     ])
+}
+
+/// One version of a session's digest: the text, and whether a model wrote it.
+pub struct StoredDigest {
+    pub text: String,
+    pub by_model: bool,
+}
+
+/// Builds the digest of a session without a model and keeps it, unless the library holds
+/// one of the same version of the session file.
+pub fn ensure_digest(library: &Library, summary: &SessionSummary, transcript: &Transcript) -> StoredDigest {
+    let stamp = library::stamp_of(summary);
+    if let Some((known, text, by_model)) = library.digest(&summary.key)
+        && known == stamp
+    {
+        return StoredDigest { text, by_model };
+    }
+    let text = digest::extract(summary, transcript).render();
+    let _ = library.set_digest(&summary.key, &stamp, &text, false);
+    StoredDigest { text, by_model: false }
+}
+
+/// Builds the digest of a session with a model and keeps it.
+pub fn store_model_digest(library: &Library, summary: &SessionSummary, transcript: &Transcript, summarizer: &dyn digest::Summarizer) -> Result<(), String> {
+    let answer = summarizer.summarize(&digest::prompt(summary, transcript))?;
+    let mut made = digest::extract(summary, transcript);
+    if !digest::apply_answer(&mut made, &answer) {
+        return Err(format!("the model did not answer in four lines: {}", model::shorten(answer.trim(), 200)));
+    }
+    library.set_digest(&summary.key, &library::stamp_of(summary), &made.render(), true).map_err(|e| e.to_string())
+}
+
+/// Sessions of this computer worth a digest by a model: changed within `days`, quiet for
+/// ten minutes (a live one would change again), and without a model's digest of this
+/// version; newest first, at most `limit`.
+pub fn sessions_to_digest(library: &Library, now_ms: i64, days: i64, limit: usize) -> Vec<SessionSummary> {
+    const QUIET_MS: i64 = 10 * 60_000;
+    let since = now_ms - days * 86_400_000;
+    let mut sessions: Vec<SessionSummary> = library
+        .summaries()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|summary| summary.key.env.is_local() && summary.updated_ms >= since && summary.updated_ms <= now_ms - QUIET_MS)
+        .filter(|summary| {
+            library.digest(&summary.key).is_none_or(|(stamp, _, by_model)| !by_model || stamp != library::stamp_of(summary))
+        })
+        .collect();
+    sessions.sort_by_key(|summary| std::cmp::Reverse(summary.updated_ms));
+    sessions.truncate(limit);
+    sessions
+}
+
+/// The conversation as `read_session` gives it: prompts and answers, tool calls in one
+/// line, commits with their hash.
+fn conversation(summary: &SessionSummary, harness: &str, transcript: &Transcript) -> String {
+    let mut text = format!("# {}\n{} · {}\n\n", summary.display_title(), harness, summary.cwd.as_deref().unwrap_or("?"));
+    for entry in &transcript.entries {
+        let who = match entry.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => "Note",
+        };
+        for block in &entry.blocks {
+            match block {
+                Block::Text { text: part } if !part.trim().is_empty() => {
+                    text.push_str(&format!("{who}: {}\n\n", part.trim()));
+                }
+                Block::ToolCall { name, input, result, .. } => {
+                    let what = ["command", "file_path", "path", "pattern", "description", "url"]
+                        .iter()
+                        .find_map(|field| input.get(*field).and_then(Value::as_str).map(str::to_owned))
+                        .or_else(|| digest::command_of(input))
+                        .unwrap_or_default();
+                    let commit = result
+                        .as_ref()
+                        .filter(|_| what.contains("git commit"))
+                        .and_then(|result| digest::commit_line(&result.text))
+                        .map(|commit| format!(" → {} {}", commit.hash, commit.subject))
+                        .unwrap_or_default();
+                    text.push_str(&format!("[{name} {}]{commit}\n", model::shorten(&what, 160)));
+                }
+                _ => {}
+            }
+        }
+    }
+    text
+}
+
+/// Up to [`PASSAGES`] stretches of `text` around the places that hold the most words of
+/// the query, in the order of the text.
+fn passages(text: &str, words: &[String], limit: usize) -> Option<String> {
+    let lower = text.to_lowercase();
+    if lower.len() != text.len() {
+        // Lower case changed the length (some scripts do): search the text as it is.
+        return passages_in(text, text, words, limit);
+    }
+    passages_in(text, &lower, words, limit)
+}
+
+fn passages_in(text: &str, haystack: &str, words: &[String], limit: usize) -> Option<String> {
+    let mut places: Vec<usize> = Vec::new();
+    for word in words {
+        places.extend(haystack.match_indices(word.as_str()).map(|(at, _)| at));
+    }
+    if places.is_empty() {
+        return None;
+    }
+    places.sort_unstable();
+    // Each place scores the distinct words found near it.
+    let mut scored: Vec<(usize, usize)> = places
+        .iter()
+        .map(|&at| {
+            let from = at.saturating_sub(PASSAGE);
+            let to = (at + PASSAGE).min(haystack.len());
+            let near = &haystack[floor(haystack, from)..floor(haystack, to)];
+            (words.iter().filter(|word| near.contains(word.as_str())).count(), at)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    let budget = (limit / PASSAGES).max(200);
+    for (_, at) in scored {
+        if chosen.len() == PASSAGES {
+            break;
+        }
+        let from = floor(text, at.saturating_sub(budget / 3));
+        let to = floor(text, (at + budget * 2 / 3).min(text.len()));
+        if chosen.iter().any(|&(a, b)| from < b && a < to) {
+            continue;
+        }
+        chosen.push((from, to));
+    }
+    chosen.sort_unstable();
+    let parts: Vec<String> = chosen.iter().map(|&(from, to)| text[from..to].trim().to_owned()).collect();
+    Some(format!("… {} …", parts.join("\n…\n")))
+}
+
+fn floor(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 impl Server {
@@ -170,7 +322,7 @@ impl Server {
                 "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "bowyer", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Bowyer's memory: search past sessions and keep notes for this project. Look here before asking the user what was decided earlier."
+                "instructions": INSTRUCTIONS
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
@@ -190,6 +342,7 @@ impl Server {
             Err("Bowyer's memory is turned off in the Bowyer window.".to_owned())
         } else {
             match name {
+                "recall" => self.recall(&args),
                 "search_sessions" => self.search_sessions(&args),
                 "read_session" => self.read_session(&args),
                 "save_note" => self.save_note(&args),
@@ -266,49 +419,137 @@ impl Server {
         Ok(lines.join("\n"))
     }
 
-    fn read_session(&self, args: &Value) -> Result<String, String> {
-        let key = args.get("key").and_then(Value::as_str).and_then(SessionKey::decode).ok_or("no such key")?;
-        let summary = self.summary(&key).ok_or("no session with this key")?;
-        if !Self::all_projects(args) && !in_project(summary.cwd.as_deref(), &self.project) {
+    /// The summary and the transcript of a session the key names, within the project
+    /// unless `all_projects`.
+    fn load(&self, key: &SessionKey, all: bool) -> Result<(SessionSummary, Transcript), String> {
+        let summary = self.summary(key).ok_or("no session with this key")?;
+        if !all && !in_project(summary.cwd.as_deref(), &self.project) {
             return Err("this session belongs to another project; pass all_projects: true to read it".into());
         }
-        let limit = args.get("max_chars").and_then(Value::as_u64).unwrap_or(DEFAULT_READ as u64).clamp(500, MAX_ANSWER as u64) as usize;
         let source = history::source_for(&key.harness).ok_or("no reader for this harness")?;
         // A session on an SSH host is read over a connection of its own, with the host's key.
         let env = self.env_for(&key.env)?;
         let transcript = source.load(&*env, &summary, &self.cache.join("remote")).map_err(|e| e.to_string())?;
-        let mut text = format!("# {}\n{} · {}\n\n", summary.display_title(), key.harness, summary.cwd.as_deref().unwrap_or("?"));
-        for entry in &transcript.entries {
-            let who = match entry.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::System => "Note",
+        Ok((summary, transcript))
+    }
+
+    fn read_session(&self, args: &Value) -> Result<String, String> {
+        let key = args.get("key").and_then(Value::as_str).and_then(SessionKey::decode).ok_or("no such key")?;
+        let limit = args.get("max_chars").and_then(Value::as_u64).unwrap_or(DEFAULT_READ as u64).clamp(500, MAX_ANSWER as u64) as usize;
+        let (summary, transcript) = self.load(&key, Self::all_projects(args))?;
+        let text = conversation(&summary, &key.harness.to_string(), &transcript);
+        let header_end = text.find("\n\n").map_or(0, |at| at + 2);
+        let words = library::meaningful_words(args.get("query").and_then(Value::as_str).unwrap_or(""));
+        if !words.is_empty() {
+            return match passages(&text, &words, limit) {
+                Some(found) => Ok(format!("{}{}", &text[..header_end], cut(&found, limit))),
+                None => Ok(format!("{}No passage holds {}; the end of the session follows.\n{}", &text[..header_end], words.join(", "), tail(&text, limit))),
             };
-            for block in &entry.blocks {
-                match block {
-                    Block::Text { text: part } if !part.trim().is_empty() => {
-                        text.push_str(&format!("{who}: {}\n\n", part.trim()));
-                    }
-                    Block::ToolCall { name, input, .. } => {
-                        let what = ["command", "file_path", "path", "pattern", "description", "url"]
-                            .iter()
-                            .find_map(|field| input.get(*field).and_then(Value::as_str))
-                            .unwrap_or("");
-                        text.push_str(&format!("[{name} {}]\n", model::shorten(what, 160)));
-                    }
-                    _ => {}
+        }
+        // The first version read from the start unless asked; now the end, where the
+        // outcome is, unless `from_end: false`.
+        if args.get("from_end").and_then(Value::as_bool) == Some(false) {
+            return Ok(cut(&text, limit));
+        }
+        if text.len() <= limit {
+            return Ok(text);
+        }
+        Ok(format!("{}{}", &text[..header_end], tail(&text, limit)))
+    }
+
+    /// Notes and digests of the past sessions that best match the words.
+    fn recall(&self, args: &Value) -> Result<String, String> {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+        let words = library::meaningful_words(query);
+        if words.is_empty() {
+            return Err("give the words of the problem, error, component or ticket".into());
+        }
+        let all = Self::all_projects(args);
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(3).clamp(1, 10) as usize;
+        let mut out = Vec::new();
+
+        let project = normalize(&self.project);
+        let notes = self.library.notes((!all).then_some(project.as_str())).map_err(|e| e.to_string())?;
+        let mut scored: Vec<(usize, &library::Note)> = notes
+            .iter()
+            .map(|note| {
+                let lower = note.text.to_lowercase();
+                (words.iter().filter(|word| lower.contains(word.as_str())).count(), note)
+            })
+            .filter(|(score, _)| *score > 0)
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.created_ms.cmp(&a.1.created_ms)));
+        let best = scored.first().map_or(0, |(score, _)| *score);
+        let notes: Vec<String> = scored
+            .iter()
+            .filter(|(score, _)| *score * 2 >= best)
+            .take(3)
+            .map(|(_, note)| format!("- [{}] {}", note.id, note.text))
+            .collect();
+        if !notes.is_empty() {
+            out.push(format!("Notes:\n{}", notes.join("\n")));
+        }
+
+        // Sessions: every word in title, prompt or text; any word; words of digests. Each
+        // list votes by rank.
+        let summaries: HashMap<SessionKey, SessionSummary> =
+            self.library.summaries().map_err(|e| e.to_string())?.into_iter().map(|s| (s.key.clone(), s)).collect();
+        let mut votes: HashMap<SessionKey, f64> = HashMap::new();
+        let every = self.library.search(query, 100).map_err(|e| e.to_string())?;
+        let any = self.library.search_any(query, 100).map_err(|e| e.to_string())?;
+        let digests = self.library.search_digests(query, 100).map_err(|e| e.to_string())?;
+        let lists: [(Vec<SessionKey>, f64); 3] = [
+            (every.into_iter().map(|hit| hit.key).collect(), 1.0),
+            (any.into_iter().map(|hit| hit.key).collect(), 1.0),
+            (digests, 1.5),
+        ];
+        for (list, weight) in lists {
+            let mut rank = 0;
+            for key in list {
+                let Some(summary) = summaries.get(&key) else { continue };
+                if !all && !in_project(summary.cwd.as_deref(), &self.project) {
+                    continue;
                 }
+                rank += 1;
+                *votes.entry(key).or_default() += weight / (10.0 + rank as f64);
             }
         }
-        let from_end = args.get("from_end").and_then(Value::as_bool).unwrap_or(false);
-        if from_end && text.len() > limit {
-            let mut start = text.len() - limit;
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            return Ok(format!("… (the start is left out)\n{}", &text[start..]));
+        let mut ranked: Vec<(&SessionKey, f64)> = votes.iter().map(|(key, score)| (key, *score)).collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| summaries[b.0].updated_ms.cmp(&summaries[a.0].updated_ms)));
+        // Sessions far behind the best are noise: they cost a digest each.
+        let best = ranked.first().map_or(0.0, |(_, score)| *score);
+        ranked.retain(|(_, score)| *score * 2.0 >= best);
+        let mut sessions = Vec::new();
+        for (index, (key, _)) in ranked.iter().take(limit).enumerate() {
+            let summary = &summaries[*key];
+            // A digest of this version of the session needs no reading of its file (over
+            // SSH, a connection).
+            let kept = self.library.digest(key);
+            let body = match kept {
+                Some((stamp, text, _)) if stamp == library::stamp_of(summary) => text,
+                kept => match self.load(key, true) {
+                    Ok((summary, transcript)) => ensure_digest(&self.library, &summary, &transcript).text,
+                    Err(error) => kept.map(|(_, text, _)| text).unwrap_or_else(|| format!("(not read: {error})")),
+                },
+            };
+            let body = body.lines().map(|line| format!("   {line}")).collect::<Vec<_>>().join("\n");
+            sessions.push(format!(
+                "{}. {} — {}, {}\n   key: {}\n{body}",
+                index + 1,
+                summary.display_title(),
+                model::format_ms_utc(summary.updated_ms).get(..10).unwrap_or(""),
+                summary.key.harness,
+                summary.key.encode(),
+            ));
         }
-        Ok(cut(&text, limit))
+        if !sessions.is_empty() {
+            out.push(format!("Sessions:\n{}", sessions.join("\n")));
+        }
+        if out.is_empty() {
+            let scope = if all { "any project" } else { "this project (try all_projects: true)" };
+            return Ok(format!("Nothing in {scope} matches {}.", words.join(", ")));
+        }
+        Ok(out.join("\n\n"))
     }
 
     fn save_note(&self, args: &Value) -> Result<String, String> {
@@ -391,7 +632,13 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert!(server.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let list = server.handle(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+        let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["recall", "read_session", "save_note"]);
+        // The tools of the first version still answer for sessions that listed them.
+        for legacy in ["search_sessions", "search_notes", "delete_note"] {
+            let (text, _) = call(&server, legacy, json!({"query": "parser", "id": 999}));
+            assert!(!text.starts_with("unknown tool"), "{legacy}: {text}");
+        }
         let unknown = server.handle(r#"{"jsonrpc":"2.0","id":3,"method":"nope"}"#).unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
     }
@@ -493,6 +740,127 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(text.contains("\"result\":{}"));
+    }
+
+    /// A synthetic Claude Code session in which a problem was solved and committed.
+    fn solved_session(dir: &Path) -> (Library, SessionSummary) {
+        let lines = [
+            json!({"type": "user", "uuid": "u1", "sessionId": "pay", "cwd": "/w/app", "timestamp": "2026-11-20T10:00:00Z",
+                   "message": {"role": "user", "content": "SHOP-142: customers are charged twice when the provider times out"}}),
+            json!({"type": "assistant", "uuid": "a1", "sessionId": "pay", "timestamp": "2026-11-20T10:00:05Z",
+                   "message": {"id": "m1", "role": "assistant", "content": [{"type": "text", "text": format!("The retry builds a new idempotency key each time. Early chatter about logging levels. {}", "Other things. ".repeat(60))}]}}),
+            json!({"type": "assistant", "uuid": "a2", "sessionId": "pay", "timestamp": "2026-11-20T10:00:06Z",
+                   "message": {"id": "m2", "role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git commit -am \"Reuse the key\""}}]}}),
+            json!({"type": "user", "uuid": "u2", "sessionId": "pay", "timestamp": "2026-11-20T10:00:07Z", "toolUseResult": {},
+                   "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "[fix/shop-142 a3f9c21] Reuse the idempotency key on timeouts (SHOP-142)\n 2 files changed"}]}}),
+            json!({"type": "assistant", "uuid": "a3", "sessionId": "pay", "timestamp": "2026-11-20T10:00:08Z",
+                   "message": {"id": "m3", "role": "assistant", "content": [{"type": "text", "text": "Done: retries reuse one key per order."}]}}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+        let path = dir.join("pay.jsonl");
+        std::fs::write(&path, &lines).unwrap();
+        let mut session = summary("pay", "Double charge", "/w/app");
+        session.first_prompt = Some("SHOP-142: customers are charged twice when the provider times out".into());
+        session.source.path = path.to_string_lossy().into_owned();
+        session.source.size = lines.len() as u64;
+        let mut library = Library::in_memory().unwrap();
+        library.store_scan("local", "claude", &[session.clone(), summary("b", "Parser docs", "/w/app")]).unwrap();
+        library.add_note(None, Some(&normalize("/w/app")), "Payment retries keep one idempotency key per order", 5).unwrap();
+        library.add_note(None, Some(&normalize("/w/app")), "Release builds use thin LTO", 6).unwrap();
+        (library, session)
+    }
+
+    #[test]
+    fn recall_answers_with_notes_and_the_digest_of_the_session() {
+        let dir = test_support::TempDir::new("mcp-recall");
+        let (library, session) = solved_session(dir.path());
+        let server = Server::new(library, "/w/app", dir.path());
+        let (text, error) = call(&server, "recall", json!({"query": "remember when customers got charged twice?"}));
+        assert!(!error, "{text}");
+        assert!(text.contains("Sessions:\n1. Double charge"), "{text}");
+        assert!(text.contains("Commits: a3f9c21 Reuse the idempotency key") && text.contains("Tickets: SHOP-142"), "{text}");
+        assert!(!text.contains("Parser docs") && !text.contains("thin LTO"), "{text}");
+        // The digest is kept for the version of the file it was made from.
+        let (stamp, kept, by_model) = server.library.digest(&session.key).unwrap();
+        assert_eq!((stamp, by_model), (library::stamp_of(&session), false));
+        assert!(kept.starts_with("Problem: SHOP-142"));
+        let (notes, _) = call(&server, "recall", json!({"query": "idempotency key"}));
+        assert!(notes.starts_with("Notes:\n- [1] Payment retries"), "{notes}");
+        let (none, error) = call(&server, "recall", json!({"query": "how did we"}));
+        assert!(error && none.contains("give the words"), "{none}");
+        let (nothing, _) = call(&server, "recall", json!({"query": "kubernetes"}));
+        assert!(nothing.starts_with("Nothing in this project"), "{nothing}");
+    }
+
+    #[test]
+    fn read_session_gives_passages_or_the_end_and_keeps_commits() {
+        let dir = test_support::TempDir::new("mcp-read");
+        let (library, session) = solved_session(dir.path());
+        let server = Server::new(library, "/w/app", dir.path());
+        let key = session.key.encode();
+        let (all, _) = call(&server, "read_session", json!({"key": key}));
+        assert!(all.contains("[Bash git commit -am \"Reuse the key\"] → a3f9c21 Reuse the idempotency key"), "{all}");
+        let (end, _) = call(&server, "read_session", json!({"key": key, "max_chars": 500}));
+        assert!(end.contains("Done: retries reuse") && !end.contains("logging levels"), "{end}");
+        let (start, _) = call(&server, "read_session", json!({"key": key, "max_chars": 500, "from_end": false}));
+        assert!(start.contains("SHOP-142: customers") && !start.contains("Done: retries"), "{start}");
+        let (found, _) = call(&server, "read_session", json!({"key": key, "query": "logging"}));
+        assert!(found.contains("logging levels"), "{found}");
+        let (missing, _) = call(&server, "read_session", json!({"key": key, "query": "kubernetes"}));
+        assert!(missing.contains("No passage holds kubernetes"), "{missing}");
+    }
+
+    #[test]
+    fn passages_pick_the_places_with_most_words() {
+        let filler = "lorem ipsum ".repeat(400);
+        let text = format!("{filler}refund alone{filler}refund webhook queue here{filler}");
+        let found = passages(&text, &["refund".into(), "webhook".into()], 1_500).unwrap();
+        assert!(found.contains("refund webhook queue"), "{found}");
+        assert!(found.len() < 2_000);
+        assert!(passages(&text, &["absent".into()], 1_500).is_none());
+    }
+
+    #[test]
+    fn model_digests_go_to_recent_quiet_sessions_once_per_version() {
+        let dir = test_support::TempDir::new("mcp-digest-job");
+        let (mut library, mut session) = solved_session(dir.path());
+        let day = 86_400_000;
+        let now = 100 * day;
+        session.updated_ms = now - day;
+        let mut live = summary("live", "Still running", "/w/app");
+        live.updated_ms = now - 60_000;
+        let mut old = summary("old", "Last year", "/w/app");
+        old.updated_ms = now - 400 * day;
+        let mut remote = summary("far", "On a host", "/w/app");
+        remote.key.env = EnvId::ssh("dev@host");
+        remote.updated_ms = now - day;
+        library.store_scan("local", "claude", &[session.clone(), live, old]).unwrap();
+        library.store_scan(&remote.key.env.0.clone(), "claude", &[remote]).unwrap();
+        let due = sessions_to_digest(&library, now, 30, 10);
+        assert_eq!(due.iter().map(|s| s.key.id.as_str()).collect::<Vec<_>>(), ["pay"]);
+
+        struct Fake;
+        impl digest::Summarizer for Fake {
+            fn summarize(&self, _: &str) -> Result<String, String> {
+                Ok("PROBLEM: Paid twice.\nCAUSE: New key per retry.\nFIX: One key per order.\nKEYWORDS: double charge, duplicate payment".into())
+            }
+        }
+        let transcript = history::source_for(&session.key.harness).unwrap().load(&LocalEnvironment::new(), &session, dir.path()).unwrap();
+        store_model_digest(&library, &session, &transcript, &Fake).unwrap();
+        assert!(sessions_to_digest(&library, now, 30, 10).is_empty(), "done for this version");
+        let server = Server::new(library, "/w/app", dir.path());
+        let (text, _) = call(&server, "recall", json!({"query": "duplicate debit"}));
+        assert!(text.contains("Fix: One key per order.") && text.contains("Commits: a3f9c21"), "{text}");
+
+        struct Rambling;
+        impl digest::Summarizer for Rambling {
+            fn summarize(&self, _: &str) -> Result<String, String> {
+                Ok("Sure! Here is a summary of the session.".into())
+            }
+        }
+        let error = store_model_digest(&server.library, &session, &transcript, &Rambling).unwrap_err();
+        assert!(error.contains("four lines"), "{error}");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use model::HarnessKind;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{EDGE, MONO, Shell, island, model_presets, switch};
+use super::{MONO, Shell, island, model_presets, switch};
 use crate::i18n::{self, Lang, t};
 use crate::{launch, tray};
 use library::{Grouping, SortOrder};
@@ -139,7 +139,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn set_grouping(&mut self, grouping: Grouping, cx: &mut Context<Self>) {
+    pub(super) fn set_grouping(&mut self, grouping: Grouping, cx: &mut Context<Self>) {
         self.grouping = grouping;
         let _ = self.lib().set_setting("grouping", grouping.id());
         self.rebuild_rows();
@@ -219,21 +219,32 @@ impl Shell {
             .overflow_y_scroll()
             .track_scroll(&self.settings_scroll)
             .child(div().max_w(px(760.)).px(px(24.)).py(px(18.)).flex().flex_col().gap(px(22.)).children(body));
-        let _ = window;
+        // A dialog over the window: the sessions stay behind it, a click beside it closes it.
+        let viewport = window.viewport_size();
+        let width = (f32::from(viewport.width) - 80.).clamp(480., 1040.);
+        let height = (f32::from(viewport.height) - 100.).clamp(360., 820.);
         div()
+            .id("settings-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
             .flex()
-            .flex_1()
-            .min_h_0()
-            .px(px(EDGE))
-            .pb(px(EDGE))
+            .items_center()
+            .justify_center()
+            .bg(hsla(0., 0., 0., 0.45))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_settings(cx)))
             .child(
                 island(&theme)
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
+                    .id("settings-dialog")
+                    .w(px(width))
+                    .h(px(height))
                     .flex()
                     .flex_row()
                     .bg(theme.editor_bg)
+                    .shadow(popup_shadow(&theme))
+                    .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx: &mut App| cx.stop_propagation())
                     .child(nav)
                     .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(header).child(content)),
             )
@@ -368,7 +379,7 @@ impl Shell {
                     Some(path) => path.to_string_lossy().into_owned(),
                     None => t("settings.not_found").replace("{program}", harness_program(&harness)),
                 };
-                let current = self.model_choice(&harness);
+                let current = self.default_model(&harness);
                 let models: Vec<(String, bool, Option<&'static str>)> = model_presets(&harness)
                     .iter()
                     .map(|preset| (preset.unwrap_or(t("model.default")).to_owned(), *preset == current, *preset))
@@ -536,6 +547,14 @@ impl Shell {
                     t("settings.memory_on"),
                     Some(t("settings.memory_hint")),
                     toggle("memory", on, theme, cx, |this, _, cx| this.toggle_memory(cx)),
+                    theme,
+                ))
+                .child(row(
+                    t("settings.digests"),
+                    Some(t("settings.digests_hint")),
+                    button("settings-digests", t("settings.digests_run"), theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.build_digests(cx)))
+                        .into_any_element(),
                     theme,
                 ))
                 .into_any_element(),

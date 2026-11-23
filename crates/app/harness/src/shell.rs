@@ -37,6 +37,9 @@ mod cost_view;
 mod files_view;
 mod live_view;
 mod memory_view;
+mod drop_view;
+mod plan_view;
+mod quit_view;
 mod context_menu;
 mod selection;
 mod settings_view;
@@ -49,6 +52,7 @@ mod update_view;
 
 pub use titlebar::window_options;
 mod ssh_view;
+mod new_session;
 
 pub const APP_NAME: &str = "Bowyer";
 
@@ -56,6 +60,29 @@ const LEFT_WIDTH: f32 = 300.;
 const RIGHT_WIDTH: f32 = 330.;
 /// How often the local history is looked at for sessions running elsewhere.
 const POLL_SECONDS: u64 = 6;
+
+/// When to try again something that failed: 10 s after the first failure, twice as long
+/// after each next one, at most every 5 minutes.
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    next: std::time::Instant,
+    delay: std::time::Duration,
+}
+
+impl Retry {
+    const FIRST: std::time::Duration = std::time::Duration::from_secs(10);
+    const LONGEST: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The retry after a failure, `before` being the one of the failure before it.
+    fn after(before: Option<&Retry>) -> Retry {
+        let delay = before.map_or(Self::FIRST, |before| (before.delay * 2).min(Self::LONGEST));
+        Retry { next: std::time::Instant::now() + delay, delay }
+    }
+
+    fn due(&self) -> bool {
+        std::time::Instant::now() >= self.next
+    }
+}
 /// Session files bigger than this are not read for the search index in the background.
 const INDEX_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// The text of one session in the search index: its start and its end.
@@ -75,6 +102,11 @@ enum Side {
     Right,
 }
 const TREE_ROW: f32 = 30.;
+/// The width of the stripe a folded side pane leaves.
+const STRIPE_WIDTH: f32 = 40.;
+/// The height of the terminal panel under the conversation, and how far it goes.
+const TERMINAL_HEIGHT: f32 = 300.;
+const TERMINAL_RANGE: (f32, f32) = (120., 2000.);
 pub(crate) const MONO: &str = "JetBrains Mono";
 
 fn hex(color: u32) -> Hsla {
@@ -188,6 +220,8 @@ struct Row {
     count: usize,
     updated_ms: i64,
     turn: Option<model::TurnState>,
+    /// Where the + of a project row starts a new session.
+    start: Option<library::SessionStart>,
 }
 
 /// What a session is doing now, by where its last turn stands and when it last wrote.
@@ -270,18 +304,34 @@ struct OpenSession {
     /// file it was asked at: once the session grows it is out of date and not shown.
     exact: Option<(u64, model::ClaudeContext)>,
     exact_busy: bool,
+    /// The turn started from this view, before the harness names a new session.
+    run: Option<u64>,
+    /// The last prompt, when the model never answered it.
+    failed: Option<model::FailedTurn>,
 }
 
-/// A turn running in the open session (or in a new one).
+/// A turn the window runs. Each belongs to its session: several sessions can run at once,
+/// and the composer and the conversation show the one of the open session.
 struct LiveRun {
+    /// Names the run for its events and for the draft session it was started from.
+    id: u64,
+    /// The session the turn runs in; the id is empty until the harness names a new one.
+    key: SessionKey,
+    /// How many items of the history the conversation had when the turn began: the
+    /// history read while the turn runs already has part of it. `usize::MAX` when unknown.
+    base_items: usize,
+    /// What the turn was started with, kept for the session once the harness names it.
+    model: Option<String>,
+    effort: Option<String>,
+    /// The turn as it was asked for: a prompt sent while it runs goes the same way.
+    spec: live::TurnSpec,
+    /// Prompts sent while the turn runs: they go as the next turn of the session when this
+    /// one ends well, and back into the composer when it fails or is stopped.
+    queued: Vec<String>,
     stop: StopHandle,
-    /// The session the turn runs in, once the harness named it.
-    session: Option<String>,
     items: Arc<Vec<Item>>,
     turn: Option<Transcript>,
     started: std::time::Instant,
-    /// The view stays at the end while the answer grows, until the user scrolls up.
-    follow: bool,
     /// Questions of the harness before it acts, waiting for the user's answer.
     asks: Vec<live::PermissionAsk>,
     /// Commands being stopped one by one, by tool call.
@@ -308,6 +358,38 @@ fn model_presets(harness: &HarnessKind) -> &'static [Option<&'static str>] {
     }
 }
 
+/// The efforts a harness takes for a turn, the harness default first; none for a harness
+/// whose effort Bowyer cannot set (OpenCode over ACP, DeepSeek Harness).
+fn effort_presets(harness: &HarnessKind) -> &'static [Option<&'static str>] {
+    match harness {
+        HarnessKind::Claude => &[None, Some("low"), Some("medium"), Some("high"), Some("xhigh"), Some("max")],
+        HarnessKind::Codex => &[None, Some("minimal"), Some("low"), Some("medium"), Some("high")],
+        _ => &[],
+    }
+}
+
+/// The list of a conversation. It follows its end while the reader is there: new text
+/// scrolls it, and a scroll up leaves the end until the reader comes back to it.
+fn conversation_list(items: usize) -> ListState {
+    let list = ListState::new(items, ListAlignment::Top, px(1200.)).with_uniform_item_height(ROW_HEIGHT_GUESS);
+    list.set_follow_mode(FollowMode::Tail);
+    list
+}
+
+/// The height a row of a conversation is taken to have until it is drawn: GPUI counts a
+/// row it has not measured as empty, and the scrollbar of a long session would lie.
+const ROW_HEIGHT_GUESS: Pixels = px(120.);
+
+/// Replaces rows of a conversation where the reader may be. GPUI moves a place inside
+/// the replaced rows to the first of them; a reader who is not at the end keeps theirs.
+fn splice_in_place(list: &ListState, range: std::ops::Range<usize>, count: usize) {
+    let top = list.logical_scroll_top();
+    list.splice(range, count);
+    if !list.is_following_tail() {
+        list.scroll_to(top);
+    }
+}
+
 fn can_run_live(harness: &HarnessKind) -> bool {
     matches!(harness, HarnessKind::Claude | HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::DeepSeek)
 }
@@ -329,6 +411,8 @@ pub struct Shell {
     catalog: ThemeCatalog,
 
     summaries: Vec<SessionSummary>,
+    /// Sessions that started others in separate sessions, with the titles they gave them.
+    started: Vec<(SessionKey, String)>,
     folders: Vec<Folder>,
     placements: HashMap<SessionKey, Placement>,
     collapsed: HashSet<String>,
@@ -348,7 +432,11 @@ pub struct Shell {
     rows: Vec<Row>,
     tree_scroll: UniformListScrollHandle,
     scanning: usize,
-    scan_errors: Vec<String>,
+    /// Scans that failed, by environment and harness: the error and when to try again. A
+    /// host that dropped comes back by itself, and its error goes once a scan answers.
+    scan_failures: HashMap<(model::EnvId, HarnessKind), (String, Retry)>,
+    /// Scans running now, so a retry never runs next to one.
+    scans_running: HashSet<(model::EnvId, HarnessKind)>,
 
     search: TextField,
     search_focus: FocusHandle,
@@ -358,13 +446,16 @@ pub struct Shell {
 
     renaming: Option<(RenameTarget, TextField)>,
     rename_focus: FocusHandle,
-    new_menu: bool,
+    /// The dialog of a new session, when open.
+    new_session: Option<new_session::NewSession>,
 
     selected: Option<SessionKey>,
     open: Option<OpenSession>,
     loading: bool,
     load_generation: u64,
     load_error: Option<String>,
+    /// The session that failed to load and when to load it again.
+    load_retry: Option<(SessionKey, Retry)>,
     open_runs: HashSet<(usize, usize)>,
     open_calls: HashSet<(usize, usize, usize)>,
     open_thinking: HashSet<(usize, usize)>,
@@ -373,6 +464,10 @@ pub struct Shell {
 
     composer: TextField,
     composer_focus: FocusHandle,
+    /// The scroll of the composer's text, taller than the field when long.
+    composer_scroll: ScrollHandle,
+    /// A drag of the mouse selects in the composer.
+    composer_selecting: bool,
     ssh_hosts: Vec<SshEnvironment>,
     ssh_form: Option<ssh_view::SshForm>,
     ssh_focus: FocusHandle,
@@ -391,12 +486,19 @@ pub struct Shell {
     repaint_at: std::cell::Cell<Option<std::time::Instant>>,
     left_width: f32,
     right_width: f32,
+    /// Side panes the user hid: the conversation takes their room.
+    left_hidden: bool,
+    right_hidden: bool,
     /// The pane whose edge is being dragged.
     resizing: Option<Side>,
     /// A look at the local history for changes is under way.
     polling: bool,
     /// A look at the file of the open remote session is under way.
     polling_remote: bool,
+    /// The IDE that has the open session's folder open, by that folder: Claude Code on
+    /// this computer started from the window connects to it. Looked for at each poll.
+    ide: Option<(String, live::IdeLink)>,
+    looking_for_ide: bool,
     /// The text of local sessions is being read into the search index.
     indexing: bool,
     /// The menu of a tree row, open after a right click.
@@ -428,9 +530,25 @@ pub struct Shell {
     /// The last status of each watched session (pinned or open), to see it change.
     statuses: HashMap<SessionKey, Option<RowStatus>>,
     statuses_seeded: bool,
-    /// The terminal of the window and whether it is shown in place of the conversation.
-    terminal: Option<Entity<terminal_view::TermView>>,
+    /// The terminals of the window, as tabs of the panel under the conversation.
+    terminals: Vec<Entity<terminal_view::TermView>>,
+    active_terminal: usize,
+    /// The height of the terminal panel, kept between runs.
+    terminal_height: f32,
+    /// The edge between the conversation and the terminal panel is being dragged.
+    resizing_terminal: bool,
     terminal_shown: bool,
+    /// The sections of the right pane folded to their titles, by id, kept between runs.
+    folded: HashSet<&'static str>,
+    /// How many of the open session's commands and agents the right pane lists, newest first;
+    /// another session starts again from `TASKS_SHOWN`.
+    tasks_shown: Option<(SessionKey, usize)>,
+    /// The plan of each account the open sessions used, and an API account's month.
+    plans: HashMap<(model::EnvId, HarnessKind), plan_view::PlanState>,
+    months: HashMap<(model::EnvId, HarnessKind), plan_view::MonthState>,
+    month_cache: plan_view::MonthCache,
+    /// The question before quitting while turns or terminals run.
+    quit_ask: Option<quit_view::QuitAsk>,
     /// A watched session wants its user (no key: the open one): on the next draw the
     /// window flashes and the system shows a notification, if the window is not in front.
     attention: Option<(Option<SessionKey>, Call)>,
@@ -443,8 +561,20 @@ pub struct Shell {
     diff_view: Option<changes_view::DiffView>,
     /// A commit of the history opened in the centre.
     commit_view: Option<changes_view::CommitView>,
-    live: Option<LiveRun>,
+    /// Turns the window runs, of any session; finished ones stay until their session is
+    /// read again.
+    runs: Vec<LiveRun>,
+    next_run: u64,
+    /// What was typed in the composer of each session the user left, with its attachments.
+    drafts: std::collections::HashMap<SessionKey, (TextField, Vec<composer::Attached>)>,
     permission: Permission,
+    /// The list of the composer that is open: models, efforts or permissions, and the
+    /// buttons the lists open under (in that order).
+    composer_menu: Option<live_view::ComposerMenu>,
+    composer_anchors: [MenuAnchor; 3],
+    /// The open list of the sessions pane's footer, and where its buttons are.
+    footer_menu: Option<FooterMenu>,
+    footer_anchors: [MenuAnchor; 2],
     /// A session to open as soon as a scan has it: the one a new turn just created.
     pending_open: Option<SessionKey>,
     extensions_open: bool,
@@ -472,8 +602,26 @@ impl Shell {
         };
         let left_width = width("layout.left", LEFT_WIDTH, LEFT_RANGE);
         let right_width = width("layout.right", RIGHT_WIDTH, RIGHT_RANGE);
+        let hidden = |key: &str| library.setting(key).is_some_and(|value| value == "1");
+        let (left_hidden, right_hidden) = (hidden("layout.left_hidden"), hidden("layout.right_hidden"));
+        let terminal_height = width("layout.terminal", TERMINAL_HEIGHT, TERMINAL_RANGE);
+        let mut folded: HashSet<&'static str> = library
+            .setting("layout.folded")
+            .map(|ids| ids.split(',').filter_map(|id| FOLDING.iter().find(|known| **known == id).copied()).collect())
+            .unwrap_or_default();
+        if hidden("layout.tasks_collapsed") {
+            folded.insert("tasks");
+        }
         let sort = library.setting("sort").map_or_else(SortOrder::default, |id| SortOrder::from_id(&id));
-        let grouping = library.setting("grouping").map_or_else(Grouping::default, |id| Grouping::from_id(&id));
+        // Nested groups became the default after users had saved a grouping: they get it
+        // once, and keep whatever they choose after.
+        let grouping = if library.setting("grouping.nested_default").is_none() {
+            let _ = library.set_setting("grouping", Grouping::Nested.id());
+            let _ = library.set_setting("grouping.nested_default", "1");
+            Grouping::Nested
+        } else {
+            library.setting("grouping").map_or_else(Grouping::default, |id| Grouping::from_id(&id))
+        };
         let ranker = library.setting("rerank.model").map_or(rerank::Ranker::Haiku, |value| rerank::Ranker::from_setting(&value));
         let collapsed = library
             .setting("collapsed")
@@ -488,6 +636,7 @@ impl Shell {
             cache_dir,
             catalog,
             summaries: Vec::new(),
+            started: Vec::new(),
             folders: Vec::new(),
             placements: HashMap::new(),
             collapsed,
@@ -503,19 +652,21 @@ impl Shell {
             rows: Vec::new(),
             tree_scroll: UniformListScrollHandle::new(),
             scanning: 0,
-            scan_errors: Vec::new(),
+            scan_failures: HashMap::new(),
+            scans_running: HashSet::new(),
             search: TextField::from_text(""),
             search_focus: cx.focus_handle(),
             hits: None,
             search_seq: 0,
             renaming: None,
             rename_focus: cx.focus_handle(),
-            new_menu: false,
+            new_session: None,
             selected: None,
             open: None,
             loading: false,
             load_generation: 0,
             load_error: None,
+            load_retry: None,
             open_runs: HashSet::new(),
             open_calls: HashSet::new(),
             open_thinking: HashSet::new(),
@@ -523,6 +674,8 @@ impl Shell {
             info_scroll: ScrollHandle::new(),
             composer: TextField::from_text(""),
             composer_focus: cx.focus_handle(),
+            composer_scroll: ScrollHandle::new(),
+            composer_selecting: false,
             ssh_hosts,
             ssh_form: None,
             ssh_focus: cx.focus_handle(),
@@ -536,9 +689,13 @@ impl Shell {
             repaint_at: Default::default(),
             left_width,
             right_width,
+            left_hidden,
+            right_hidden,
             resizing: None,
             polling: false,
             polling_remote: false,
+            ide: None,
+            looking_for_ide: false,
             remote_watch: HashMap::new(),
             polling_pinned: false,
             remote_unknown: Default::default(),
@@ -557,16 +714,31 @@ impl Shell {
             statuses: HashMap::new(),
             statuses_seeded: false,
             attention: None,
-            terminal: None,
+            terminals: Vec::new(),
+            active_terminal: 0,
+            terminal_height,
+            resizing_terminal: false,
             terminal_shown: false,
+            folded,
+            tasks_shown: None,
+            plans: HashMap::new(),
+            months: HashMap::new(),
+            month_cache: Default::default(),
+            quit_ask: None,
             right_tab: Default::default(),
             files: Default::default(),
             preview: None,
             changes: Default::default(),
             diff_view: None,
             commit_view: None,
-            live: None,
+            runs: Vec::new(),
+            next_run: 1,
+            drafts: Default::default(),
             permission: Permission::default(),
+            composer_menu: None,
+            composer_anchors: Default::default(),
+            footer_menu: None,
+            footer_anchors: Default::default(),
             pending_open: None,
             extensions_open: false,
             theme_editor: None,
@@ -583,8 +755,11 @@ impl Shell {
                 cx.background_executor().timer(std::time::Duration::from_secs(POLL_SECONDS)).await;
                 let polled = this.update(cx, |this, cx| {
                     this.poll_local(cx);
+                    this.look_for_ide(cx);
+                    this.look_at_plan(false, cx);
                     this.poll_open_remote(cx);
                     this.poll_pinned_remote(cx);
+                    this.retry_failures(cx);
                 });
                 if polled.is_err() {
                     break;
@@ -611,15 +786,17 @@ impl Shell {
 
     /// Reads the cached tree from the library and rebuilds the rows.
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let (summaries, folders, placements) = {
+        let (summaries, folders, placements, started) = {
             let library = self.lib();
             (
                 library.summaries().unwrap_or_default(),
                 library.folders().unwrap_or_default(),
                 library.placements().unwrap_or_default(),
+                library.started().unwrap_or_default(),
             )
         };
         self.summaries = summaries;
+        self.started = started;
         self.apply_remote_watch(true);
         // The open remote session knows its state better than the last scan of its host.
         if let Some(open) = &self.open
@@ -686,13 +863,14 @@ impl Shell {
                         count: 0,
                         updated_ms: summary.updated_ms,
                         turn: summary.turn,
+                        start: None,
                     })
                 })
                 .collect();
             return;
         }
         let tree =
-            build_tree(&self.summaries, &self.folders, &self.placements, self.sort, self.grouping, &self.collapsed, &self.show_all);
+            build_tree(&library::link_started(&self.summaries, &self.started), &self.folders, &self.placements, self.sort, self.grouping, &self.collapsed, &self.show_all);
         let turns: HashMap<&SessionKey, model::TurnState> =
             self.summaries.iter().filter_map(|s| s.turn.map(|turn| (&s.key, turn))).collect();
         self.rows = flatten_visible(&tree)
@@ -702,6 +880,8 @@ impl Shell {
                 kind: node.kind.clone(),
                 label: match &node.kind {
                     TreeNodeKind::Group(id) if id == library::PINNED_GROUP => t("group.pinned").into(),
+                    // The group of the local environment, alone or around its harnesses.
+                    TreeNodeKind::Group(id) if id == model::EnvId::LOCAL => t("group.local").into(),
                     TreeNodeKind::More(_, hidden) => t("tree.show_more").replace("{n}", &hidden.to_string()).into(),
                     _ => node.label.clone().into(),
                 },
@@ -715,6 +895,8 @@ impl Shell {
                     TreeNodeKind::Session(key) => turns.get(key).copied(),
                     _ => None,
                 },
+                // Only a harness the window can run takes a new session from the tree.
+                start: node.start.clone().filter(|start| can_run_live(&start.harness)),
             })
             .collect();
     }
@@ -756,7 +938,7 @@ impl Shell {
 
     /// Reads every environment's history again, each harness on a thread of its own.
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        self.scan_errors.clear();
+        self.scan_failures.clear();
         for env in self.envs.clone() {
             for source in history::builtin_sources() {
                 self.scan_source(env.clone(), source, cx);
@@ -765,8 +947,42 @@ impl Shell {
         cx.notify();
     }
 
+    /// Scans that failed are tried again when their time comes, and a session that failed
+    /// to load is loaded again: a host that dropped (a network gone for a while, a rebuilt
+    /// askpass program) comes back without a restart.
+    fn retry_failures(&mut self, cx: &mut Context<Self>) {
+        let due: Vec<(model::EnvId, HarnessKind)> = self
+            .scan_failures
+            .iter()
+            .filter(|(key, (_, retry))| retry.due() && !self.scans_running.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (env_id, harness) in due {
+            match (self.env_for(&env_id), history::source_for(&harness)) {
+                (Some(env), Some(source)) => self.scan_source(env, source, cx),
+                // A host the user forgot: nothing to try again.
+                _ => {
+                    self.scan_failures.remove(&(env_id, harness));
+                }
+            }
+        }
+        if let Some((key, retry)) = &self.load_retry
+            && retry.due()
+            && !self.loading
+            && self.load_error.is_some()
+            && self.selected.as_ref() == Some(key)
+        {
+            let key = key.clone();
+            self.open_session(key, cx);
+        }
+    }
+
     /// Reads the history of one harness in one environment again, on a thread of its own.
     fn scan_source(&mut self, env: SharedEnv, source: Box<dyn history::HistorySource>, cx: &mut Context<Self>) {
+        let scan_key = (env.id(), source.harness());
+        if !self.scans_running.insert(scan_key.clone()) {
+            return;
+        }
         self.scanning += 1;
         let library = self.library.clone();
         let cache = self.cache_dir.join("remote");
@@ -790,8 +1006,16 @@ impl Shell {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.scanning -= 1;
-                if let Err(error) = result {
-                    this.scan_errors.push(error);
+                this.scans_running.remove(&scan_key);
+                match result {
+                    Err(error) => {
+                        let retry = Retry::after(this.scan_failures.get(&scan_key).map(|(_, retry)| retry));
+                        log::info!("scan failed, again in {:?}: {error}", retry.delay);
+                        this.scan_failures.insert(scan_key, (error, retry));
+                    }
+                    Ok(()) => {
+                        this.scan_failures.remove(&scan_key);
+                    }
                 }
                 this.reload(cx);
             })
@@ -863,8 +1087,9 @@ impl Shell {
         let cache = self.cache_dir.join("remote");
         let generation = self.load_generation;
         let follower = open.follower.clone();
+        let dropped = self.dropped_prompt(&summary.key);
         let task = cx.background_spawn(async move {
-            let (transcript, offset, turn) = if summary.key.harness == HarnessKind::Claude {
+            let (mut transcript, offset, turn) = if summary.key.harness == HarnessKind::Claude {
                 // Read on from where the last refresh stopped; the first one reads it all.
                 let mut follower = follower.lock().map_err(|_| "reader poisoned".to_owned())?;
                 let path = &summary.source.path;
@@ -882,6 +1107,9 @@ impl Shell {
                 let source = history::source_for(&summary.key.harness).ok_or_else(|| "no reader".to_owned())?;
                 (source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?, 0, None)
             };
+            if let Some(prompt) = &dropped {
+                transcript.hide_failed_turn(prompt);
+            }
             let items = display::items(&transcript);
             let breakdown = ContextBreakdown::of(&transcript);
             let changes = transcript.changes();
@@ -913,15 +1141,16 @@ impl Shell {
                 }
                 let Some(open) = &mut this.open else { return };
                 let (old, new) = (open.items.len(), items.len());
-                let following = open.list.is_scrolled_to_end().unwrap_or(true);
+                // The list follows the end by itself while the reader is there.
                 if new >= old && old > 0 {
                     // The last item may have grown (a reply that went on); everything after is new.
-                    open.list.splice(old - 1..old, new - old + 1);
+                    splice_in_place(&open.list, old - 1..old, new - old + 1);
                 } else {
-                    open.list.reset(new);
-                }
-                if following && new > 0 {
-                    open.list.scroll_to_end();
+                    let top = open.list.logical_scroll_top();
+                    open.list.reset_with_uniform_height(new, ROW_HEIGHT_GUESS);
+                    if !open.list.is_following_tail() {
+                        open.list.scroll_to(top);
+                    }
                 }
                 open.items = Arc::new(items);
                 open.model = transcript.model.clone();
@@ -933,6 +1162,7 @@ impl Shell {
                 open.breakdown.take_memory(open.memory_tokens);
                 open.changes = changes;
                 open.tasks = tasks;
+                open.failed = transcript.failed_turn.clone();
                 cx.notify();
             })
             .ok();
@@ -1149,25 +1379,75 @@ impl Shell {
                     cx.background_spawn(async move {
                         // A file too big to read whole in the background keeps its title,
                         // prompt and folder in the index; opening it indexes its text.
-                        let body = if summary.source.size > INDEX_MAX_BYTES {
-                            String::new()
+                        let transcript = if summary.source.size > INDEX_MAX_BYTES {
+                            None
                         } else {
-                            history::source_for(&summary.key.harness)
-                                .and_then(|source| source.load(&*env, &summary, &cache).ok())
-                                .map(|transcript| transcript.search_text_ends(INDEX_TEXT_BYTES))
-                                .unwrap_or_default()
+                            history::source_for(&summary.key.harness).and_then(|source| source.load(&*env, &summary, &cache).ok())
                         };
+                        let body = transcript.as_ref().map(|transcript| transcript.search_text_ends(INDEX_TEXT_BYTES)).unwrap_or_default();
                         if let Ok(lib) = lib.lock() {
                             let _ = lib.index_session(&summary, &body);
+                            if let Some(transcript) = &transcript {
+                                let _ = lib.set_started(&summary.key, &transcript.started_sessions());
+                            }
                         }
                     })
                     .await;
                     cx.background_executor().timer(std::time::Duration::from_millis(30)).await;
                 }
             }
-            this.update(cx, |this, _| this.indexing = false).ok();
+            // The sessions read may have started others: the tree hangs those under them.
+            this.update(cx, |this, cx| {
+                this.indexing = false;
+                let started = this.lib().started().unwrap_or_default();
+                this.started = started;
+                this.rebuild_rows();
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
+    }
+
+    /// Looks for an IDE with the folder of the open session, if it is a Claude Code session
+    /// on this computer: Arro, VS Code and the JetBrains plugin leave a lock file for it.
+    fn look_for_ide(&mut self, cx: &mut Context<Self>) {
+        let folder = self.open.as_ref().and_then(|open| {
+            let summary = &open.summary;
+            (summary.key.env.is_local() && summary.key.harness == HarnessKind::Claude).then(|| summary.cwd.clone()).flatten()
+        });
+        let Some(folder) = folder else {
+            if self.ide.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        if self.looking_for_ide {
+            return;
+        }
+        self.looking_for_ide = true;
+        let task = cx.background_spawn({
+            let folder = folder.clone();
+            async move { live::ide_for(&folder) }
+        });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            this.update(cx, |this, cx| {
+                this.looking_for_ide = false;
+                let found = found.map(|link| (folder, link));
+                if this.ide != found {
+                    this.ide = found;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The IDE of `folder`, when the last look found one there.
+    fn ide_of(&self, folder: &str) -> Option<live::IdeLink> {
+        self.ide.as_ref().filter(|(found, _)| found == folder).map(|(_, link)| link.clone())
     }
 
     /// The open session of an SSH host, looked at every other poll (a round trip each
@@ -1345,9 +1625,7 @@ impl Shell {
             return;
         }
         self.selected = Some(key.clone());
-        if self.live.as_ref().is_some_and(|live| live.finished) {
-            self.live = None;
-        }
+        self.runs.retain(|run| !run.finished);
         let (Some(summary), Some(env)) = (self.summary(&key).cloned(), self.env_for(&key.env)) else {
             cx.notify();
             return;
@@ -1359,9 +1637,14 @@ impl Shell {
         self.extensions = None;
         let cache = self.cache_dir.join("remote");
         let library = self.library.clone();
+        let dropped = self.dropped_prompt(&summary.key);
         let task = cx.background_spawn(async move {
             let source = history::source_for(&summary.key.harness).ok_or_else(|| "no reader for this harness".to_owned())?;
-            let transcript = source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?;
+            let mut transcript = source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?;
+            // A prompt the user dropped is left out until the next turn resumes before it.
+            if let Some(prompt) = &dropped {
+                transcript.hide_failed_turn(prompt);
+            }
             let items = display::items(&transcript);
             let mut breakdown = ContextBreakdown::of(&transcript);
             let memory_tokens = history::memory_tokens(&*env, &summary);
@@ -1371,6 +1654,7 @@ impl Shell {
             let git = summary.cwd.as_deref().and_then(|cwd| env.git_info(cwd));
             if let Ok(library) = library.lock() {
                 let _ = library.index_session(&summary, &transcript.search_text_ends(INDEX_TEXT_BYTES));
+                let _ = library.set_started(&summary.key, &transcript.started_sessions());
             }
             Ok::<_, String>((summary, Loaded { transcript, items, breakdown, memory_tokens, changes, tasks, git }))
         });
@@ -1382,10 +1666,28 @@ impl Shell {
                 }
                 this.loading = false;
                 match result {
-                    Ok((summary, loaded)) => {
-                        let list = ListState::new(loaded.items.len(), ListAlignment::Top, px(1200.));
-                        if !loaded.items.is_empty() {
-                            list.scroll_to(ListOffset { item_ix: loaded.items.len() - 1, offset_in_item: px(0.) });
+                    Ok((summary, mut loaded)) => {
+                        this.load_retry = None;
+                        this.ide = None;
+                        // A turn the window still runs in this session shows after the history
+                        // it began on; the history on disk already has part of it.
+                        let running = this.runs.iter().find(|run| !run.key.id.is_empty() && run.key == summary.key);
+                        let live_items = running.map_or(0, |run| run.items.len());
+                        if let Some(run) = running {
+                            loaded.items.truncate(run.base_items);
+                        }
+                        this.switch_composer(Some(&summary.key));
+                        let list = conversation_list(loaded.items.len() + live_items);
+                        // The same session read again after a turn of the window keeps the
+                        // place the reader was at; a session opened anew shows its last item.
+                        let before = this.open.as_ref().filter(|open| open.summary.key == summary.key).map(|open| &open.list);
+                        match before {
+                            Some(before) if before.is_following_tail() => {}
+                            Some(before) => list.scroll_to(before.logical_scroll_top()),
+                            None if !loaded.items.is_empty() => {
+                                list.scroll_to(ListOffset { item_ix: loaded.items.len() - 1, offset_in_item: px(0.) })
+                            }
+                            None => {}
                         }
                         this.open_runs.clear();
                         this.open_calls.clear();
@@ -1408,11 +1710,22 @@ impl Shell {
                             memory_tokens: loaded.memory_tokens,
                             exact: None,
                             exact_busy: false,
+                            failed: loaded.transcript.failed_turn.clone(),
+                            run: None,
                         });
+                        this.look_for_ide(cx);
+                        this.look_at_plan(false, cx);
                     }
                     Err(error) => {
                         this.open = None;
                         this.load_error = Some(error);
+                        // Loaded again later by itself; the same session's failures space
+                        // the tries out.
+                        let key = this.selected.clone();
+                        if let Some(key) = key {
+                            let before = this.load_retry.as_ref().filter(|(failed, _)| *failed == key).map(|(_, retry)| retry);
+                            this.load_retry = Some((key, Retry::after(before)));
+                        }
                     }
                 }
                 cx.notify();
@@ -1438,6 +1751,7 @@ impl Shell {
                     pinned: false,
                     updated_ms: 0,
                     children: Vec::new(),
+                    start: None,
                 }
                 .collapse_id();
                 if !self.collapsed.remove(&id) {
@@ -1457,17 +1771,95 @@ impl Shell {
         cx.notify();
     }
 
-    fn cycle_sort(&mut self, cx: &mut Context<Self>) {
-        let index = SortOrder::ALL.iter().position(|s| *s == self.sort).unwrap_or(0);
-        self.set_sort(SortOrder::ALL[(index + 1) % SortOrder::ALL.len()], cx);
+    /// A button of the sessions pane's footer that opens its list.
+    fn footer_button(&self, menu: FooterMenu, label: &str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = *cx.global::<Theme>();
+        let (id, tip) = match menu {
+            FooterMenu::Sort => ("sort", t("menu.sort")),
+            FooterMenu::Group => ("group", t("menu.group")),
+        };
+        let open = self.footer_menu == Some(menu);
+        // A long choice is cut short with an ellipsis; the arrow stays.
+        let full = format!("{tip}: {label}");
+        div()
+            .id(id)
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .h(px(24.))
+            .px(px(8.))
+            .min_w_0()
+            .when(menu == FooterMenu::Sort, |this| this.flex_none())
+            .overflow_hidden()
+            .rounded(px(6.))
+            .text_size(px(12.))
+            .text_color(theme.text_secondary)
+            .hover(|style| style.bg(theme.hover))
+            .when(open, |this| this.bg(theme.hover))
+            .child(div().min_w_0().truncate().child(label.to_owned()))
+            .child(div().flex_none().text_size(px(10.)).child("▾"))
+            .tooltip(move |_, cx| tooltip(full.clone(), None, cx))
+            .child(self.footer_anchors[menu as usize].canvas())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.footer_menu = if this.footer_menu == Some(menu) { None } else { Some(menu) };
+                cx.notify();
+            }))
     }
 
-    fn cycle_grouping(&mut self, cx: &mut Context<Self>) {
-        let index = Grouping::ALL.iter().position(|g| *g == self.grouping).unwrap_or(0);
-        self.grouping = Grouping::ALL[(index + 1) % Grouping::ALL.len()];
-        let _ = self.lib().set_setting("grouping", self.grouping.id());
-        self.rebuild_rows();
-        cx.notify();
+    /// The open list of the footer, above its button.
+    fn render_footer_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let menu = self.footer_menu?;
+        let bounds = self.footer_anchors[menu as usize].bounds()?;
+        let rows: Vec<(String, bool)> = match menu {
+            FooterMenu::Sort => SortOrder::ALL.iter().map(|sort| (t(&format!("sort.{}", sort.id())).to_owned(), *sort == self.sort)).collect(),
+            FooterMenu::Group => {
+                Grouping::ALL.iter().map(|grouping| (t(&format!("group.{}", grouping.id())).to_owned(), *grouping == self.grouping)).collect()
+            }
+        };
+        let title = match menu {
+            FooterMenu::Sort => t("menu.sort"),
+            FooterMenu::Group => t("menu.group"),
+        };
+        let list = div()
+            .id("footer-menu")
+            .min_w(bounds.size.width.max(px(200.)))
+            .p(px(4.))
+            .rounded(px(9.))
+            .bg(theme.popup_bg)
+            .border_1()
+            .border_color(theme.popup_border)
+            .shadow(popup_shadow(&theme))
+            .text_size(px(12.5))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.footer_menu = None;
+                cx.notify();
+            }))
+            .child(div().px(px(10.)).pt(px(4.)).pb(px(6.)).text_size(px(11.)).text_color(theme.text_muted).child(title.to_owned()))
+            .children(rows.into_iter().enumerate().map(|(ix, (label, chosen))| {
+                div()
+                    .id(("footer-menu-row", ix))
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .when(chosen, |this| this.bg(theme.selection).text_color(theme.text))
+                    .when(!chosen, |this| this.text_color(theme.text_secondary).hover(|style| style.bg(theme.selection_hover)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.footer_menu = None;
+                        match menu {
+                            FooterMenu::Sort => this.set_sort(SortOrder::ALL[ix], cx),
+                            FooterMenu::Group => this.set_grouping(Grouping::ALL[ix], cx),
+                        }
+                    }))
+            }));
+        // The footer sits at the bottom: the list opens upwards.
+        let at = point(bounds.left(), bounds.top() - px(4.));
+        Some(deferred(anchored().anchor(Anchor::BottomLeft).position(at).snap_to_window_with_margin(px(8.)).child(list)).with_priority(2).into_any_element())
     }
 
     fn new_folder(&mut self, cx: &mut Context<Self>, window: &mut Window) {
@@ -1588,6 +1980,28 @@ impl Shell {
         if stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.shift && stroke.key == "`" {
             self.toggle_terminal(window, cx);
             cx.stop_propagation();
+            return;
+        }
+        // Ctrl+B hides the left pane or shows it, Ctrl+Alt+B the right one. The terminal
+        // keeps Ctrl+B for its programs.
+        if stroke.modifiers.control && !stroke.modifiers.shift && stroke.key == "b" && !self.terminal_focused(window, cx) {
+            self.toggle_pane(if stroke.modifiers.alt { Side::Right } else { Side::Left }, cx);
+            cx.stop_propagation();
+            return;
+        }
+        // Ctrl+C copies what is selected in the conversation. The composer keeps the
+        // focus while the reader selects: its own selection, if any, goes first. Other
+        // fields and the terminal copy their own text.
+        let primary = stroke.modifiers.control || stroke.modifiers.platform;
+        let here = (self.composer_focus.is_focused(window) && !self.composer.has_selection()) || self.focus.is_focused(window);
+        if primary
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.shift
+            && stroke.key == "c"
+            && here
+            && self.copy_selection(cx)
+        {
+            cx.stop_propagation();
         }
     }
 
@@ -1612,6 +2026,7 @@ impl Shell {
             return;
         }
         if primary && (stroke.key == "k" || stroke.key == "f") {
+            self.show_pane(Side::Left, cx);
             self.search_focus.focus(window, cx);
             cx.notify();
         }
@@ -1620,6 +2035,19 @@ impl Shell {
     /// Moves a dragged session or folder onto a row: into a folder, before a session, or
     /// out to the top level over a group.
     fn drop_on(&mut self, item: &DragItem, target: &Row, cx: &mut Context<Self>) {
+        // A pinned session stays on top wherever it is filed: dragged out of the pinned
+        // group, it is unpinned so it shows where it was dropped.
+        let into_pinned = match &target.kind {
+            TreeNodeKind::Group(id) => id == library::PINNED_GROUP,
+            TreeNodeKind::Session(other) => self.placements.get(other).is_some_and(|p| p.pinned),
+            _ => false,
+        };
+        if let DragItem::Session(key, _) = item
+            && !into_pinned
+            && self.placements.get(key).is_some_and(|p| p.pinned)
+        {
+            let _ = self.lib().set_pinned(key, false);
+        }
         match (item, &target.kind) {
             (DragItem::Session(key, _), TreeNodeKind::Folder(folder)) => {
                 let position = now_ms() as f64 * -1.0; // On top of the folder in manual order.
@@ -1739,20 +2167,25 @@ impl Shell {
         .detach();
     }
 
-    /// The session whose live turn is running now.
-    fn running_key(&self) -> Option<SessionKey> {
-        let live = self.live.as_ref().filter(|live| !live.finished)?;
-        let open = self.open.as_ref()?;
-        let id = live.session.clone().unwrap_or_else(|| open.summary.key.id.clone());
-        Some(SessionKey { id, ..open.summary.key.clone() })
+    /// Whether the window runs a turn of this session now.
+    fn runs_turn_of(&self, key: &SessionKey) -> bool {
+        self.runs.iter().any(|run| !run.finished && !run.key.id.is_empty() && run.key == *key)
     }
 
+    /// Pins a session to the group on top, or puts it back where it was. A pinned session
+    /// is shown: its group opens and the list goes to it.
     fn toggle_pin(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
         let pinned = self.placements.get(key).is_some_and(|p| p.pinned);
         let _ = self.lib().set_pinned(key, !pinned);
         let placements = self.lib().placements().unwrap_or_default();
         self.placements = placements;
+        if !pinned && self.collapsed.remove(&format!("g:{}", library::PINNED_GROUP)) {
+            self.save_collapsed();
+        }
         self.rebuild_rows();
+        if let Some(ix) = self.rows.iter().position(|row| row.kind == TreeNodeKind::Session(key.clone())) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
@@ -1798,6 +2231,17 @@ impl Shell {
     }
 
     fn resize_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resizing_terminal {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.end_resize(cx);
+                return;
+            }
+            let height = f32::from(window.viewport_size().height);
+            let wanted = height - f32::from(event.position.y) - EDGE;
+            self.terminal_height = wanted.clamp(TERMINAL_RANGE.0, (height - 220.).max(TERMINAL_RANGE.0));
+            cx.notify();
+            return;
+        }
         let Some(side) = self.resizing else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             // The button came up outside the window.
@@ -1814,10 +2258,71 @@ impl Shell {
     }
 
     fn end_resize(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.resizing_terminal) {
+            let _ = self.lib().set_setting("layout.terminal", &format!("{:.0}", self.terminal_height));
+            cx.notify();
+        }
         if self.resizing.take().is_some() {
             self.save_layout();
             cx.notify();
         }
+    }
+
+    /// Hides a side pane or shows it again; the choice outlives the window.
+    fn toggle_pane(&mut self, side: Side, cx: &mut Context<Self>) {
+        let (hidden, key) = match side {
+            Side::Left => (&mut self.left_hidden, "layout.left_hidden"),
+            Side::Right => (&mut self.right_hidden, "layout.right_hidden"),
+        };
+        *hidden = !*hidden;
+        let value = if *hidden { "1" } else { "0" };
+        let _ = self.lib().set_setting(key, value);
+        cx.notify();
+    }
+
+    /// Shows a hidden side pane, for what needs it: the search, the theme editor.
+    fn show_pane(&mut self, side: Side, cx: &mut Context<Self>) {
+        let hidden = match side {
+            Side::Left => self.left_hidden,
+            Side::Right => self.right_hidden,
+        };
+        if hidden {
+            self.toggle_pane(side, cx);
+        }
+    }
+
+    /// The button in a pane's header that folds the pane into its stripe.
+    fn hide_pane_button(&self, side: Side, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = *cx.global::<Theme>();
+        let (id, keys) = match side {
+            Side::Left => ("hide-left", "Ctrl+B"),
+            Side::Right => ("hide-right", "Ctrl+Alt+B"),
+        };
+        icon_button(id, "general/hide", t("panel.hide"), Some(keys.into()), &theme).on_click(cx.listener(
+            move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_pane(side, cx);
+            },
+        ))
+    }
+
+    /// A folded pane: a narrow stripe at the edge of the window with the button that
+    /// unfolds it, as the tool window stripes of an IDE.
+    fn render_stripe(&self, side: Side, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = *cx.global::<Theme>();
+        let (id, name, label, keys) = match side {
+            Side::Left => ("show-left", "own/aiSessions", t("panel.left"), "Ctrl+B"),
+            Side::Right => ("show-right", "own/panelRight", t("panel.right"), "Ctrl+Alt+B"),
+        };
+        island(&theme)
+            .flex_none()
+            .h_full()
+            .w(px(STRIPE_WIDTH))
+            .items_center()
+            .pt(px(6.))
+            .child(stripe_button(id, name, label.into(), Some(keys.into()), false, &theme).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| this.toggle_pane(side, cx),
+            )))
     }
 
     fn save_layout(&self) {
@@ -1830,26 +2335,6 @@ impl Shell {
             self.status = Some(format!("{}: {error}", t("error")));
             cx.notify();
         }
-    }
-
-    fn launch_new(&mut self, harness: HarnessKind, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_menu = false;
-        if can_run_live(&harness) {
-            self.start_draft(harness, window, cx);
-            return;
-        }
-        let (env, cwd) = match &self.open {
-            Some(open) => (self.env_for(&open.summary.key.env), open.summary.cwd.clone()),
-            None => (self.envs.first().cloned(), None),
-        };
-        let Some(env) = env else { return };
-        let (program, args) = launch::harness_command(&harness, None);
-        let line = launch::terminal_line(&*env, cwd.as_deref(), Some((&program, &args)));
-        if !self.show_in_terminal(line, harness.label().to_owned(), window, cx) {
-            let result = launch::open_terminal(&*env, cwd.as_deref(), Some((&program, &args)));
-            self.report(result, cx);
-        }
-        cx.notify();
     }
 
     // Left pane ------------------------------------------------------------------------
@@ -1935,10 +2420,7 @@ impl Shell {
                     .items_center()
                     .gap(px(2.))
                     .child(icon_button("new-session", "general/add", t("new_session"), None, &theme).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.new_menu = !this.new_menu;
-                            cx.notify();
-                        },
+                        |this, _: &ClickEvent, window, cx| this.open_new_session(window, cx),
                     )))
                     .child(icon_button("new-folder", "general/newFolder", t("new_folder"), None, &theme).on_click(
                         cx.listener(|this, _: &ClickEvent, window, cx| this.new_folder(cx, window)),
@@ -1948,36 +2430,9 @@ impl Shell {
                     ))
                     .child(icon_button("rescan", "general/refresh", t("refresh"), None, &theme).on_click(cx.listener(
                         |this, _: &ClickEvent, _, cx| this.rescan(cx),
-                    ))),
+                    )))
+                    .child(self.hide_pane_button(Side::Left, cx)),
             );
-
-        let new_menu = self.new_menu.then(|| {
-            let harnesses = [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek];
-            div()
-                .mx(px(10.))
-                .mb(px(8.))
-                .p(px(4.))
-                .rounded(px(10.))
-                .bg(theme.popup_bg)
-                .border_1()
-                .border_color(theme.popup_border)
-                .children(harnesses.into_iter().map(|harness| {
-                    let color = harness_color(&harness);
-                    let label = harness.label().to_owned();
-                    div()
-                        .id(SharedString::from(format!("new-{}", harness.id())))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .h(px(30.))
-                        .px(px(10.))
-                        .rounded(px(6.))
-                        .hover(|style| style.bg(theme.selection_hover))
-                        .child(div().size(px(8.)).rounded_full().bg(color))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.launch_new(harness.clone(), window, cx)))
-                }))
-        });
 
         let ssh_form = self.render_ssh_form(window, cx);
         let rows = self.rows.len();
@@ -2010,34 +2465,35 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(2.))
-                    .child(chip("sort", t(&format!("sort.{}", self.sort.id())), &theme).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.cycle_sort(cx),
+                    .min_w_0()
+                    .child(icon_button("settings", "general/settings", t("settings"), Some("Ctrl+,".into()), &theme).flex_none().on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| match this.settings {
+                            Some(_) => this.close_settings(cx),
+                            None => this.open_settings(settings_view::SettingsPage::General, window, cx),
+                        },
                     )))
-                    .child(chip("group", t(&format!("group.{}", self.grouping.id())), &theme).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.cycle_grouping(cx),
-                    ))),
+                    .child(self.footer_button(FooterMenu::Sort, t(&format!("sort.{}", self.sort.id())), cx))
+                    .child(self.footer_button(FooterMenu::Group, t(&format!("group.{}", self.grouping.id())), cx)),
             )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(2.))
                     .children(self.render_update_chip(&theme, cx))
                     .child(chip("ssh", "SSH +", &theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| this.toggle_ssh_form(window, cx),
-                    )))
-                    .child(icon_button("settings", "general/settings", t("settings"), Some("Ctrl+,".into()), &theme).on_click(cx.listener(
-                        |this, _: &ClickEvent, window, cx| match this.settings {
-                            Some(_) => this.close_settings(cx),
-                            None => this.open_settings(settings_view::SettingsPage::General, window, cx),
-                        },
                     ))),
             );
+        let footer_menu = self.render_footer_menu(cx);
 
         let status_line = if self.scanning > 0 {
             Some(format!("{}  {count} {}", t("scanning"), t("sessions_count")))
-        } else if !self.scan_errors.is_empty() {
-            Some(self.scan_errors.join("\n"))
+        } else if !self.scan_failures.is_empty() {
+            let mut errors: Vec<&str> = self.scan_failures.values().map(|(error, _)| error.as_str()).collect();
+            errors.sort_unstable();
+            Some(format!("{}\n{}", errors.join("\n"), t("retry.soon")))
         } else {
             self.status.clone()
         };
@@ -2050,7 +2506,6 @@ impl Shell {
             .child(div().px(px(10.)).pb(px(8.)).child(search_box))
             .children(rank_bar)
             .children(ranker_menu)
-            .children(new_menu)
             .children(ssh_form)
             .child(
                 div()
@@ -2071,6 +2526,7 @@ impl Shell {
                     .child(line)
             }))
             .child(footer)
+            .children(footer_menu)
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2116,14 +2572,42 @@ impl Shell {
                 div().text_color(theme.text_muted).text_size(px(11.)).child(row.count.to_string()).into_any_element(),
                 Some(DragItem::Folder(*id, row.label.clone())),
             ),
-            TreeNodeKind::Group(_) => (
-                div().into_any_element(),
-                div().text_color(theme.text_muted).text_size(px(11.)).child(row.count.to_string()).into_any_element(),
-                None,
-            ),
+            TreeNodeKind::Group(_) => {
+                // A project row starts a new session in its folder.
+                let new_session = row.start.clone().map(|start| {
+                    let tip = t("tree.new_session").replace("{harness}", start.harness.label());
+                    div()
+                        .id(("new-in-project", ix))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(18.))
+                        .rounded(px(4.))
+                        .text_size(px(14.))
+                        .text_color(theme.text_muted)
+                        .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                        .child("+")
+                        .tooltip(move |_, cx| tooltip(tip.clone(), None, cx))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.start_draft_at(start.clone(), window, cx);
+                        }))
+                });
+                (
+                    div().into_any_element(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .children(new_session)
+                        .child(div().text_color(theme.text_muted).text_size(px(11.)).child(row.count.to_string()))
+                        .into_any_element(),
+                    None,
+                )
+            }
             TreeNodeKind::More(..) => (div().into_any_element(), div().into_any_element(), None),
             TreeNodeKind::Session(key) => {
-                let running = self.running_key().as_ref() == Some(key);
+                let running = self.runs_turn_of(key);
                 let pinned = row.pinned;
                 let pin_key = key.clone();
                 let pin = div()
@@ -2244,17 +2728,42 @@ impl Shell {
 
     // Centre pane ----------------------------------------------------------------------
 
-    fn render_center(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The conversation, and the terminal panel under it when it is shown.
+    fn render_center(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let pane = self.render_conversation_pane(window, cx).into_any_element();
+        let Some(panel) = self.render_terminal_panel(cx) else { return pane };
+        let edge = div()
+            .id("terminal-edge")
+            .flex_none()
+            .h(px(EDGE))
+            .cursor_row_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.resizing_terminal = true;
+                    cx.stop_propagation();
+                }),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(div().flex().flex_1().min_h_0().child(pane))
+            .child(edge)
+            .child(panel)
+            .into_any_element()
+    }
+
+    fn render_conversation_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = *cx.global::<Theme>();
         let pane = island(&theme).flex_1().min_w_0().h_full().bg(theme.editor_bg);
-        if let Some(view) = self.shown_terminal() {
-            return pane.child(self.render_terminal(view, cx));
-        }
         let Some(open) = &self.open else {
             let message = if self.loading {
                 t("loading").to_owned()
             } else if let Some(error) = &self.load_error {
-                format!("{}: {error}", t("error"))
+                format!("{}: {error}\n{}", t("error"), t("retry.soon"))
             } else {
                 t("no_session").to_owned()
             };
@@ -2300,7 +2809,9 @@ impl Shell {
                         chip("tools-toggle", if self.show_tools { t("tools.hide") } else { t("tools.show") }, &theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.show_tools = !this.show_tools;
+                                // What the reader opens grows down from where it is, not up from the end.
                                 if let Some(open) = &this.open {
+                                    open.list.pause_following_tail();
                                     open.list.remeasure();
                                 }
                                 cx.notify();
@@ -2312,33 +2823,13 @@ impl Shell {
                     .child(icon_button("terminal", "toolwindows/terminal", t("open_terminal"), Some("Ctrl+`".into()), &theme).on_click(
                         cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_terminal(window, cx)),
                     ))
-                    .child(
-                        div()
-                            .id("resume")
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .h(px(28.))
-                            .px(px(12.))
-                            .rounded(px(7.))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .font_weight(FontWeight::MEDIUM)
-                            .hover(|style| style.opacity(0.9))
-                            .child(t("resume"))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.resume_in_terminal(window, cx))),
-                    ),
+                    .child(icon_button("resume", "run/run", t("resume"), None, &theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.resume_in_terminal(window, cx),
+                    ))),
             );
         let list = list(open.list.clone(), cx.processor(|this, ix: usize, window, cx| this.render_item(ix, window, cx)))
             .size_full();
-        // Scrolling up while a turn runs stops following its end; back at the end, it follows again.
-        let list = div().size_full().child(list).on_scroll(cx.listener(|this, event: &ScrollEvent, _, _| {
-            if let Some(live) = &mut this.live
-                && event.delta.pixel_delta(px(16.)).y > px(0.)
-            {
-                live.follow = false;
-            }
-        }));
+        let list = scrollable("conversation-scroll", &open.list, list, &theme, window, cx).size_full();
         let extensions = self.extensions_open.then(|| self.render_extensions(cx));
         let preview = self.render_commit_view(cx).or_else(|| self.render_diff(cx)).or_else(|| self.render_preview(window, cx));
         let composer = self.render_composer(window, cx);
@@ -2556,6 +3047,7 @@ impl Shell {
                                     this.open_thinking.insert((ix, pi));
                                 }
                                 if let Some(open) = &this.open {
+                                    open.list.pause_following_tail();
                                     open.list.remeasure_items(ix..ix + 1);
                                 }
                                 cx.notify();
@@ -2598,6 +3090,7 @@ impl Shell {
                             this.open_runs.insert((ix, pi));
                         }
                         if let Some(open) = &this.open {
+                            open.list.pause_following_tail();
                             open.list.remeasure_items(ix..ix + 1);
                         }
                         cx.notify();
@@ -2642,6 +3135,7 @@ impl Shell {
                     this.open_calls.insert((ix, pi, ci));
                 }
                 if let Some(open) = &this.open {
+                    open.list.pause_following_tail();
                     open.list.remeasure_items(ix..ix + 1);
                 }
                 cx.notify();
@@ -2674,7 +3168,18 @@ impl Shell {
             return pane.child(editor);
         }
         let Some(open) = &self.open else {
-            return pane.child(div().p(px(16.)).text_color(theme.text_muted).child(t("info")));
+            return pane.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pl(px(16.))
+                    .pr(px(8.))
+                    .pt(px(8.))
+                    .text_color(theme.text_muted)
+                    .child(t("info"))
+                    .child(self.hide_pane_button(Side::Right, cx)),
+            );
         };
         let summary = &open.summary;
         let env_label = self.env_for(&summary.key.env).map_or_else(|| summary.key.env.0.clone(), |env| {
@@ -2756,7 +3261,7 @@ impl Shell {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.exact_context(cx)))
         });
         let exact_note = exact.map(|_| div().text_size(px(11.)).text_color(theme.text_muted).child(t("context.by_claude")));
-        let context = section(t("context"), &theme)
+        let context = section_body()
             .child(
                 div()
                     .flex()
@@ -2797,10 +3302,12 @@ impl Shell {
             .child(bar)
             .child(legend)
             .children(exact_note);
+        let context = self.fold("context", t("context"), None, context, cx);
 
         let cost = self.render_cost(cx);
+        let plan = self.render_plan(cx);
         let usage = open.usage;
-        let spend = section(t("tokens"), &theme).child(
+        let spend = section_body().child(
             div()
                 .flex()
                 .flex_wrap()
@@ -2811,23 +3318,49 @@ impl Shell {
                 .child(stat("cache w", usage.cache_write, &theme))
                 ,
         );
+        let spend = self.fold("tokens", t("tokens"), None, spend, cx);
 
         let cwd = summary.cwd.clone().unwrap_or_default();
-        let outputs = section(t("outputs"), &theme).child(if open.changes.is_empty() {
+        let outputs = if open.changes.is_empty() {
             div().text_size(px(12.)).text_color(theme.text_muted).child(t("no_outputs")).into_any_element()
         } else {
             change_tree::render(&open.changes, &cwd, &self.opened_change_folders, &theme, cx).into_any_element()
-        });
+        };
+        let outputs = self.fold("outputs", t("outputs"), None, outputs, cx);
 
-        let live_tasks = self.render_live_tasks(cx);
-        let tasks = section(t("tasks"), &theme).children(live_tasks).child(if open.tasks.is_empty() {
+        let collapsed = self.folded.contains("tasks");
+        let shown = match &self.tasks_shown {
+            Some((key, shown)) if *key == summary.key => *shown,
+            _ => TASKS_SHOWN,
+        };
+        let hidden = open.tasks.len().saturating_sub(shown);
+        let live_tasks = if collapsed { None } else { self.render_live_tasks(cx) };
+        let count = (!open.tasks.is_empty())
+            .then(|| div().text_size(px(11.)).text_color(theme.text_muted).child(open.tasks.len().to_string()).into_any_element());
+        let more = (!collapsed && hidden > 0).then(|| {
+            let key = summary.key.clone();
+            div()
+                .id("tasks-more")
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(theme.accent)
+                .hover(|style| style.underline())
+                .child(t("tree.show_more").replace("{n}", &hidden.min(TASKS_MORE).to_string()))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.tasks_shown = Some((key.clone(), shown + TASKS_MORE));
+                    cx.notify();
+                }))
+        });
+        let tasks = section_body().children(live_tasks).child(if open.tasks.is_empty() {
             div().text_size(px(12.)).text_color(theme.text_muted).child(t("no_tasks")).into_any_element()
         } else {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .children(open.tasks.iter().rev().take(200).map(|task| {
+                .children(open.tasks.iter().rev().take(shown).map(|task| {
                     let color = match task.status {
                         TaskStatus::Running => theme.accent,
                         TaskStatus::Done => theme.success,
@@ -2848,8 +3381,10 @@ impl Shell {
                         )
                         .child(div().truncate().font_family(MONO).text_size(px(11.5)).child(task.title.clone()))
                 }))
+                .children(more)
                 .into_any_element()
         });
+        let tasks = self.fold("tasks", t("tasks"), count, tasks, cx);
 
         let notes = self.render_notes(cx);
         let tabs = self.render_right_tabs(cx);
@@ -2864,26 +3399,27 @@ impl Shell {
             }
             files_view::RightTab::Session => {}
         }
-        pane.flex().flex_col().child(tabs).child(
-            div()
-                .id("info")
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .overflow_y_scroll()
-                .track_scroll(&self.info_scroll)
-                .p(px(16.))
-                .flex()
-                .flex_col()
-                .gap(px(20.))
-                .child(facts)
-                .child(context)
-                .child(cost)
-                .child(spend)
-                .child(outputs)
-                .child(tasks)
-                .children(notes),
-        )
+        let info = div()
+            .id("info")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.info_scroll)
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(20.))
+            .child(facts)
+            .child(context)
+            .children(plan)
+            .child(cost)
+            .child(spend)
+            .child(outputs)
+            .child(tasks)
+            .children(notes);
+        pane.flex()
+            .flex_col()
+            .child(tabs)
+            .child(div().flex_1().min_h_0().w_full().child(scrollable("info-scroll", &self.info_scroll, info, &theme, window, cx).size_full()))
     }
 }
 
@@ -2948,14 +3484,60 @@ fn switch(on: bool, enabled: bool, theme: &Theme) -> impl IntoElement {
         .child(div().size(px(12.)).rounded_full().bg(hex(0xFFFFFF)))
 }
 
-fn section(title: &str, theme: &Theme) -> Div {
-    div().flex().flex_col().gap(px(10.)).child(
-        div()
+/// The commands and agents the right pane lists at first, newest first, and how many more
+/// each "show more" adds.
+const TASKS_SHOWN: usize = 10;
+const TASKS_MORE: usize = 50;
+
+/// The lists of the sessions pane's footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FooterMenu {
+    Sort = 0,
+    Group = 1,
+}
+
+/// The sections of the right pane that fold.
+const FOLDING: [&str; 7] = ["context", "plan", "cost", "tokens", "outputs", "tasks", "notes"];
+
+impl Shell {
+    /// A section of the right pane whose title folds it: the title with a chevron and
+    /// `extra` beside it, and `body` under it while it is open.
+    fn fold(&self, id: &'static str, title: &str, extra: Option<AnyElement>, body: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.global::<Theme>();
+        let folded = self.folded.contains(id);
+        let head = div()
+            .id(SharedString::from(format!("fold-{id}")))
+            .flex()
+            .items_center()
+            .gap(px(4.))
             .text_size(px(11.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text_muted)
-            .child(title.to_uppercase()),
-    )
+            .hover(|style| style.text_color(theme.text_secondary))
+            .child(icon_sized(if folded { "general/chevronRight" } else { "general/chevronDown" }, 12., &theme))
+            .child(title.to_uppercase())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !this.folded.remove(id) {
+                    this.folded.insert(id);
+                }
+                let ids: Vec<&str> = FOLDING.iter().copied().filter(|known| this.folded.contains(known)).collect();
+                let _ = this.lib().set_setting("layout.folded", &ids.join(","));
+                let _ = this.lib().set_setting("layout.tasks_collapsed", "0");
+                cx.notify();
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(div().flex().items_center().justify_between().child(head).children(extra))
+            .when(!folded, |this| this.child(body))
+            .into_any_element()
+    }
+}
+
+/// The body of a section: its parts one under another.
+fn section_body() -> Div {
+    div().flex().flex_col().gap(px(10.))
 }
 
 fn fact(label: &str, value: String, theme: &Theme) -> impl IntoElement {
@@ -3138,6 +3720,11 @@ impl Shell {
         let Some(open) = &self.open else { return };
         let Some(env) = self.env_for(&open.summary.key.env) else { return };
         let summary = open.summary.clone();
+        if self.turn_drop(&summary.key).is_some() {
+            self.status = Some(t("drop.terminal").to_owned());
+            cx.notify();
+            return;
+        }
         let title = format!("{} · {}", summary.key.harness.label(), summary.display_title());
         if !self.show_in_terminal(launch::resume_line(&*env, &summary), title, window, cx) {
             let result = launch::resume_in_terminal(&*env, &summary);
@@ -3194,14 +3781,15 @@ impl Shell {
             .map(|(bi, block)| {
                 let len = block_text(block)?.len();
                 let range = self.selection.as_ref().and_then(|selection| selection.range_in((base, bi), len));
-                let styled = match block {
+                let (styled, links) = match block {
                     MdBlock::Paragraph(rich) | MdBlock::Heading(_, rich) | MdBlock::Quote(rich) | MdBlock::Item { text: rich, .. } => {
-                        rich_text(rich, &theme, range)
+                        let links = rich.links.iter().filter(|(_, url)| crate::markdown::opens_in_browser(url)).cloned().collect();
+                        (rich_text(rich, &theme, range), links)
                     }
-                    MdBlock::Code { language, text } => code_block_text(language, text, &theme, range),
+                    MdBlock::Code { language, text } => (code_block_text(language, text, &theme, range), Vec::new()),
                     MdBlock::Rule => return None,
                 };
-                Some(self.selectable((base, bi), styled, cx))
+                Some(self.selectable((base, bi), styled, links, cx))
             })
             .collect();
         markdown_blocks(blocks, &theme, buttons, texts)
@@ -3287,9 +3875,11 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         self.drawn_text.borrow_mut().clear();
-        let left = self.render_left(window, cx);
+        let left = (!self.left_hidden).then(|| self.render_left(window, cx));
         let center = self.render_center(window, cx);
-        let right = self.render_right(window, cx);
+        let right = (!self.right_hidden).then(|| self.render_right(window, cx));
+        let left_stripe = self.left_hidden.then(|| self.render_stripe(Side::Left, cx));
+        let right_stripe = self.right_hidden.then(|| self.render_stripe(Side::Right, cx));
         if let Some((key, call)) = self.attention.take()
             && !window.is_window_active()
         {
@@ -3304,6 +3894,8 @@ impl Render for Shell {
         let titlebar = self.render_titlebar(window, cx);
         let resize_border = self.render_resize_border(window);
         let settings = self.settings.map(|page| self.render_settings(page, window, cx));
+        let new_session = self.render_new_session(window, cx);
+        let quit_ask = self.render_quit_ask(cx);
         div()
             .id("shell")
             .track_focus(&self.focus)
@@ -3313,6 +3905,7 @@ impl Render for Shell {
             .on_mouse_move(cx.listener(Self::selection_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_resize(cx)))
             .when(self.resizing.is_some(), |this| this.cursor_col_resize())
+            .when(self.resizing_terminal, |this| this.cursor_row_resize())
             .relative()
             .size_full()
             .flex()
@@ -3322,25 +3915,30 @@ impl Render for Shell {
             .font_family("Inter")
             .text_size(px(13.))
             .child(titlebar)
-            .child(match settings {
-                Some(page) => page,
-                None => div()
+            .child(
+                div()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .px(px(EDGE))
                     .pb(px(EDGE))
-                    .child(left)
-                    .child(left_handle)
+                    .children(left)
+                    .children(left_stripe)
+                    .when(!self.left_hidden, |this| this.child(left_handle))
+                    .when(self.left_hidden, |this| this.child(div().flex_none().w(px(EDGE))))
                     .child(center)
-                    .child(right_handle)
-                    .child(right)
-                    .into_any_element(),
-            })
+                    .when(!self.right_hidden, |this| this.child(right_handle))
+                    .when(self.right_hidden, |this| this.child(div().flex_none().w(px(EDGE))))
+                    .children(right)
+                    .children(right_stripe),
+            )
+            .children(settings)
             .children(resize_border)
             .children(viewer)
             .children(context_menu)
             .children(selection_bubble)
+            .children(new_session)
+            .children(quit_ask)
     }
 }
 
@@ -3456,6 +4054,19 @@ fn parse_stats(out: &str) -> HashMap<String, (u64, i64)> {
 
 #[cfg(test)]
 mod pinned_tests {
+    #[test]
+    fn failures_are_tried_again_ever_later_up_to_five_minutes() {
+        let mut retry = super::Retry::after(None);
+        assert_eq!(retry.delay.as_secs(), 10);
+        assert!(!retry.due(), "not at once");
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            retry = super::Retry::after(Some(&retry));
+            delays.push(retry.delay.as_secs());
+        }
+        assert_eq!(delays, [20, 40, 80, 160, 300, 300, 300]);
+    }
+
     #[test]
     fn stat_lines_give_size_and_time() {
         let stats = super::parse_stats("120 1795000000 /home/u/.claude/projects/a b.jsonl\nbad line\n");

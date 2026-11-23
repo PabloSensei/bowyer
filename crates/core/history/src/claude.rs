@@ -5,7 +5,7 @@
 //! the end of the file. Files grow to hundreds of megabytes, so a scan reads the head and
 //! the tail only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -84,20 +84,17 @@ impl Facts {
         }
         let cwd = value.get("cwd").and_then(Value::as_str);
         let branch = value.get("gitBranch").and_then(Value::as_str).filter(|b| !b.is_empty());
+        // The session belongs to the folder it began in, as Claude Code files it: a `cd` of
+        // its shell changes the `cwd` of the later lines, never the project.
+        if self.cwd.is_none() {
+            self.cwd = cwd.map(str::to_owned);
+        }
         if from_tail {
-            if let Some(cwd) = cwd {
-                self.cwd = Some(cwd.to_owned());
-            }
             if let Some(branch) = branch {
                 self.branch = Some(branch.to_owned());
             }
-        } else {
-            if self.cwd.is_none() {
-                self.cwd = cwd.map(str::to_owned);
-            }
-            if self.branch.is_none() {
-                self.branch = branch.map(str::to_owned);
-            }
+        } else if self.branch.is_none() {
+            self.branch = branch.map(str::to_owned);
         }
         if let Some(ms) = value.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms) {
             self.first_ms = Some(self.first_ms.map_or(ms, |first| first.min(ms)));
@@ -325,6 +322,46 @@ pub struct ClaudeParser {
     call_order: Vec<String>,
     /// The size of the context after the last compaction, and when it happened.
     post_compact: Option<(i64, u64)>,
+    /// The last prompt and what came of it, to tell a turn the model never answered.
+    last_prompt: Option<PromptTurn>,
+}
+
+/// A prompt, the lines that hang under it, and whether the model answered any of them.
+#[derive(Default, Clone)]
+struct PromptTurn {
+    prompt: String,
+    kept: String,
+    start: usize,
+    lines: HashSet<String>,
+    errors: usize,
+    answered: bool,
+}
+
+impl PromptTurn {
+    fn failed(&self) -> bool {
+        self.errors > 0 && !self.answered
+    }
+}
+
+/// A prompt the user typed: a user line with text or a picture, not a tool result, a note of
+/// the harness or a slash command.
+fn is_prompt(value: &Value) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("user")
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    match value.pointer("/message/content") {
+        Some(Value::String(text)) => command_notice(text).is_none() && !text.trim().is_empty(),
+        Some(Value::Array(items)) => {
+            let kind = |item: &Value| item.get("type").and_then(Value::as_str).map(str::to_owned);
+            !items.iter().any(|item| kind(item).as_deref() == Some("tool_result"))
+                && items.iter().any(|item| matches!(kind(item).as_deref(), Some("text") | Some("image")))
+        }
+        _ => false,
+    }
 }
 
 impl ClaudeParser {
@@ -333,6 +370,7 @@ impl ClaudeParser {
     }
 
     pub fn feed(&mut self, value: &Value) {
+    self.follow_prompt(value);
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     let timestamp_ms = value
         .get("timestamp")
@@ -512,12 +550,52 @@ impl ClaudeParser {
     }
     }
 
+    /// Keeps track of the last prompt: the lines under it, whether the model answered, and a
+    /// prompt that left it behind. Claude Code resumed before a failed prompt
+    /// (`--resume-session-at`) writes the next prompt under the line before it, so the failed
+    /// turn stays in the file on a branch no one follows: its entries go.
+    fn follow_prompt(&mut self, value: &Value) {
+        let Some(uuid) = value.get("uuid").and_then(Value::as_str).filter(|uuid| !uuid.is_empty()) else { return };
+        let parent = value.get("parentUuid").and_then(Value::as_str).unwrap_or("");
+        let prompt = is_prompt(value);
+        if let Some(turn) = &mut self.last_prompt {
+            if turn.lines.contains(parent) {
+                turn.lines.insert(uuid.to_owned());
+                match value.get("type").and_then(Value::as_str) {
+                    Some("assistant") if value.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) => turn.errors += 1,
+                    Some("assistant") => turn.answered = true,
+                    // A tool result means the model had called a tool.
+                    Some("user") if !prompt && value.get("isMeta").and_then(Value::as_bool) != Some(true) => turn.answered = true,
+                    _ => {}
+                }
+            } else if prompt && !parent.is_empty() && parent == turn.kept && turn.failed() {
+                let start = turn.start;
+                self.transcript.entries.truncate(start);
+                self.calls.retain(|_, (entry, _)| *entry < start);
+            }
+        }
+        if prompt {
+            self.last_prompt = (!parent.is_empty()).then(|| PromptTurn {
+                prompt: uuid.to_owned(),
+                kept: parent.to_owned(),
+                start: self.transcript.entries.len(),
+                lines: HashSet::from([uuid.to_owned()]),
+                ..Default::default()
+            });
+        }
+    }
+
     /// The transcript so far, with every model call counted.
     pub fn snapshot(&self) -> Transcript {
         self.clone().finish()
     }
 
     pub fn finish(mut self) -> Transcript {
+        self.transcript.failed_turn = self
+            .last_prompt
+            .as_ref()
+            .filter(|turn| turn.failed())
+            .map(|turn| model::FailedTurn { prompt: turn.prompt.clone(), kept: turn.kept.clone(), start: turn.start });
         for id in std::mem::take(&mut self.call_order) {
             if let Some((model, usage, timestamp_ms)) = self.calls_by_message.remove(&id) {
                 self.transcript.add_call(model.as_deref().filter(|m| !m.starts_with('<')), usage, timestamp_ms);
@@ -747,6 +825,89 @@ mod tests {
         assert_eq!(transcript.changes()[0].added, 2);
     }
 
+    /// A session whose second prompt only got an API error, as Claude Code writes it (made-up
+    /// ids and text, the shape of the lines of a real one).
+    const FAILED: &str = r#"{"parentUuid":null,"type":"user","message":{"role":"user","content":"Say one"},"uuid":"p1","timestamp":"2026-11-01T10:00:00.000Z"}
+{"parentUuid":"p1","type":"attachment","attachment":{},"uuid":"t1","timestamp":"2026-11-01T10:00:00.100Z"}
+{"parentUuid":"t1","type":"assistant","message":{"id":"m1","model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"One"}],"usage":{"input_tokens":3,"output_tokens":1}},"uuid":"a1","timestamp":"2026-11-01T10:00:01.000Z"}
+{"parentUuid":"a1","type":"attachment","attachment":{},"uuid":"t2","timestamp":"2026-11-01T10:00:01.100Z"}
+{"type":"last-prompt","leafUuid":"t2"}
+{"type":"queue-operation","operation":"enqueue"}
+{"parentUuid":"t2","type":"user","message":{"role":"user","content":[{"type":"text","text":"Meant for another session"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]},"uuid":"p2","timestamp":"2026-11-01T10:01:00.000Z"}
+{"parentUuid":"p2","type":"attachment","attachment":{},"uuid":"t3","timestamp":"2026-11-01T10:01:00.100Z"}
+{"type":"api-request","id":"r"}
+{"parentUuid":"t3","type":"assistant","message":{"id":"e1","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: 400 no such model"}]},"isApiErrorMessage":true,"uuid":"a2","timestamp":"2026-11-01T10:01:01.000Z"}
+{"type":"last-prompt","leafUuid":"a2"}
+"#;
+
+    #[test]
+    fn a_prompt_that_only_got_errors_is_a_failed_turn() {
+        let mut transcript = parse_transcript(FAILED);
+        let failed = transcript.failed_turn.clone().expect("a failed turn");
+        assert_eq!((failed.prompt.as_str(), failed.kept.as_str(), failed.start), ("p2", "t2", 2));
+        assert_eq!(transcript.entries.len(), 4, "prompt, answer, prompt, error");
+        assert!(transcript.hide_failed_turn("p2"));
+        assert_eq!(transcript.entries.len(), 2);
+        assert!(!parse_transcript(FAILED).hide_failed_turn("p1"), "only the failed prompt goes");
+
+        // An answer after it, or a tool call, makes it a turn like any other.
+        let answered = FAILED.to_owned()
+            + r#"{"parentUuid":"a2","type":"assistant","message":{"id":"m2","model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"Two"}]},"uuid":"a3"}"#
+            + "\n";
+        assert_eq!(parse_transcript(&answered).failed_turn, None);
+        let first = SESSION.lines().take(1).collect::<String>();
+        assert_eq!(parse_transcript(&first).failed_turn, None, "a first prompt without a line before it cannot be dropped");
+    }
+
+    #[test]
+    fn a_turn_resumed_before_the_failed_prompt_leaves_it_out() {
+        // What Claude Code writes after `--resume-session-at t2 --resume-drops-turn p2`: the
+        // failed turn stays in the file, the next prompt hangs under the line before it.
+        let resumed = FAILED.to_owned()
+            + r#"{"parentUuid":"t2","type":"user","message":{"role":"user","content":"Say two"},"uuid":"p3","timestamp":"2026-11-01T10:02:00.000Z"}"#
+            + "\n"
+            + r#"{"parentUuid":"p3","type":"assistant","message":{"id":"m3","model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"Two"}],"usage":{"input_tokens":3,"output_tokens":1}},"uuid":"a4","timestamp":"2026-11-01T10:02:01.000Z"}"#
+            + "\n";
+        let transcript = parse_transcript(&resumed);
+        let texts: Vec<String> = transcript
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Say one", "One", "Say two", "Two"]);
+        assert_eq!(transcript.failed_turn, None);
+        assert_eq!(transcript.total_usage.output, 2, "both answers count");
+    }
+
+    /// The failed turn of a real history file, and what the reader shows of it:
+    /// `BOWYER_CLAUDE_FILE=path cargo test -p history failed_turn_of_a_real_file -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads a history file of this computer"]
+    fn failed_turn_of_a_real_file() {
+        let path = std::env::var("BOWYER_CLAUDE_FILE").expect("BOWYER_CLAUDE_FILE");
+        let transcript = parse_transcript(&std::fs::read_to_string(path).unwrap());
+        println!("failed turn: {:?}", transcript.failed_turn);
+        for entry in &transcript.entries {
+            for block in &entry.blocks {
+                if let Block::Text { text } = block {
+                    println!("{:?}: {}", entry.role, text.lines().next().unwrap_or(""));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_usage_by_day_counts_each_call_as_the_session_does() {
+        let transcript = parse_transcript(SESSION);
+        assert_eq!(transcript.usage_since(0), transcript.usage_by_model, "a split message counts once here too");
+        let next_day = crate::parse_rfc3339_ms("2026-11-02T00:00:00Z").unwrap();
+        assert!(transcript.usage_since(next_day).is_empty());
+    }
+
     #[test]
     fn a_follower_reads_on_as_the_file_grows() {
         let dir = TempDir::new("claude_follow");
@@ -858,7 +1019,10 @@ Task 0.16: previews"), "Task 0.16: previews");
         let dir = TempDir::new("claude_scan");
         let projects = dir.path().join(".claude/projects/-work-app");
         std::fs::create_dir_all(&projects).unwrap();
-        std::fs::write(projects.join("s1.jsonl"), SESSION).unwrap();
+        // The shell went into a subfolder late in the session: it stays in its project.
+        let moved = SESSION.replace(r#""gitBranch":"fix/parser"}"#, r#""gitBranch":"fix/parser","cwd":"/work/app/src/main/java"}"#);
+        assert_ne!(moved, SESSION);
+        std::fs::write(projects.join("s1.jsonl"), moved).unwrap();
         std::fs::write(projects.join("empty.jsonl"), "{\"type\":\"queue-operation\"}\n").unwrap();
         let env = LocalEnvironment::with_home(dir.path());
         let sessions = ClaudeSource.scan(&env, &(), dir.path()).unwrap();

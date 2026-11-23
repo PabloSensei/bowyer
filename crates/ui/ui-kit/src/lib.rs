@@ -47,6 +47,7 @@ pub use scrollbars::*;
 pub use test_bounds::*;
 pub use text_field::{
     TextField, text_field_children, text_field_children_named, text_field_lines,
+    text_field_wrapped, index_at as text_index_at,
     text_field_lines_named,
 };
 pub use widgets::*;

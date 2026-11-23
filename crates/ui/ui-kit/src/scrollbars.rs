@@ -3,8 +3,8 @@
 //! scrolls and fades out a second after the last movement. It is not drawn when the
 //! content fits, and it is drawn over the content, so the layout does not change.
 //!
-//! `scrollable(id, handle, content, theme, window, cx)` wraps a scrolled `div` or a
-//! `uniform_list` and gives it both bars. The handle carries the offset and the sizes;
+//! `scrollable(id, handle, content, theme, window, cx)` wraps a scrolled `div`, a
+//! `uniform_list` or a `list` and gives it both bars. The handle carries the offset and the sizes;
 //! the bars only read and set it, so the wrapper works with any scrolled element.
 
 use std::sync::Arc;
@@ -22,20 +22,82 @@ const HIDE_DELAY: Duration = Duration::from_millis(1000);
 const FADE: Duration = Duration::from_millis(120);
 
 /// The scroll state a bar reads and moves. A `div` tracks a [`ScrollHandle`], a
-/// uniform list a [`UniformListScrollHandle`]; both keep the same inner handle.
+/// uniform list a [`UniformListScrollHandle`]; both keep the same inner handle. A list
+/// of rows of different heights keeps its own state in a [`ListState`].
 #[derive(Clone, Debug)]
 pub enum ScrollAreaHandle {
     Item(ScrollHandle),
     List(UniformListScrollHandle),
+    Rows(ListState),
 }
 
 impl ScrollAreaHandle {
-    /// The handle that carries the offset in both cases.
-    pub fn handle(&self) -> ScrollHandle {
+    /// The handle that carries the offset of a `div` or a uniform list.
+    fn handle(&self) -> Option<ScrollHandle> {
         match self {
-            Self::Item(handle) => handle.clone(),
-            Self::List(handle) => handle.0.borrow().base_handle.clone(),
+            Self::Item(handle) => Some(handle.clone()),
+            Self::List(handle) => Some(handle.0.borrow().base_handle.clone()),
+            Self::Rows(_) => None,
         }
+    }
+
+    /// The visible area in window coordinates.
+    fn bounds(&self) -> Bounds<Pixels> {
+        match (self, self.handle()) {
+            (Self::Rows(list), _) => list.viewport_bounds(),
+            (_, Some(handle)) => handle.bounds(),
+            _ => Bounds::default(),
+        }
+    }
+
+    /// How far the content scrolls on each axis.
+    fn max_offset(&self) -> Point<Pixels> {
+        match (self, self.handle()) {
+            (Self::Rows(list), _) => list.max_offset_for_scrollbar(),
+            (_, Some(handle)) => handle.max_offset(),
+            _ => Point::default(),
+        }
+    }
+
+    /// The scroll offset, negative as GPUI keeps it.
+    fn offset(&self) -> Point<Pixels> {
+        match (self, self.handle()) {
+            (Self::Rows(list), _) => list.scroll_px_offset_for_scrollbar(),
+            (_, Some(handle)) => handle.offset(),
+            _ => Point::default(),
+        }
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        match (self, self.handle()) {
+            (Self::Rows(list), _) => list.set_offset_from_scrollbar(offset),
+            (_, Some(handle)) => handle.set_offset(offset),
+            _ => {}
+        }
+    }
+
+    /// A list of rows keeps the height it reports still while its thumb is held, so
+    /// rows measured during the drag do not move the thumb away from the pointer.
+    fn drag(&self, started: bool) {
+        if let Self::Rows(list) = self {
+            if started {
+                list.scrollbar_drag_started();
+            } else {
+                list.scrollbar_drag_ended();
+            }
+        }
+    }
+}
+
+impl From<ListState> for ScrollAreaHandle {
+    fn from(list: ListState) -> Self {
+        Self::Rows(list)
+    }
+}
+
+impl From<&ListState> for ScrollAreaHandle {
+    fn from(list: &ListState) -> Self {
+        Self::Rows(list.clone())
     }
 }
 
@@ -107,10 +169,9 @@ pub fn page_offset(offset: f32, viewport: f32, max_scroll: f32, below: bool) -> 
 /// Moves the handle of `source` on one axis. Scroll offsets are positive here; the
 /// handle keeps them negative, as GPUI does.
 pub fn set_scroll(source: &ScrollAreaHandle, vertical: bool, offset: f32) {
-    let handle = source.handle();
-    let current = handle.offset();
+    let current = source.offset();
     let offset = px(offset.max(0.));
-    handle.set_offset(if vertical {
+    source.set_offset(if vertical {
         point(current.x, -offset)
     } else {
         point(-offset, current.y)
@@ -211,10 +272,9 @@ impl ScrollBars {
 
     /// The viewport and the scroll extent of one axis, and the current offset.
     fn axis(&self, vertical: bool) -> (f32, f32, f32) {
-        let handle = self.source.handle();
-        let bounds = handle.bounds();
-        let max = handle.max_offset();
-        let offset = handle.offset();
+        let bounds = self.source.bounds();
+        let max = self.source.max_offset();
+        let offset = self.source.offset();
         if vertical {
             (
                 f32::from(bounds.size.height),
@@ -253,6 +313,7 @@ impl ScrollBars {
                 vertical,
                 grip: at - thumb.start,
             });
+            self.source.drag(true);
         } else {
             let offset = page_offset(offset, viewport, max_scroll, at > thumb.start);
             set_scroll(&self.source, vertical, offset);
@@ -262,7 +323,7 @@ impl ScrollBars {
 
     /// The window coordinate of the start of the track.
     fn track_origin(&self, vertical: bool) -> f32 {
-        let bounds = self.source.handle().bounds();
+        let bounds = self.source.bounds();
         let origin = if vertical {
             bounds.top() + px(SCROLLBAR_INSET)
         } else {
@@ -292,6 +353,7 @@ impl ScrollBars {
 
     fn release(&mut self, _: bool, cx: &mut Context<Self>) {
         if self.dragging.take().is_some() {
+            self.source.drag(false);
             self.touch(cx);
         }
     }
@@ -328,11 +390,6 @@ impl ScrollBars {
                     this.press(true, event.position, cx)
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if event.dragging() {
-                    this.drag_to(event.position, cx)
-                }
-            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.release(true, cx)),
@@ -403,11 +460,6 @@ impl ScrollBars {
                     this.press(false, event.position, cx)
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if event.dragging() {
-                    this.drag_to(event.position, cx)
-                }
-            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.release(false, cx)),
@@ -462,6 +514,23 @@ impl Render for ScrollBars {
         let theme = self.theme;
         let vertical = self.vertical(opacity, width, &theme, cx);
         let horizontal = self.horizontal(opacity, width, &theme, cx);
+        // A held thumb follows the pointer anywhere in the window, not only over its
+        // narrow strip.
+        let drag = self.dragging.is_some().then(|| {
+            let bars = cx.entity().downgrade();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble && event.dragging() {
+                            bars.update(cx, |bars, cx| bars.drag_to(event.position, cx)).ok();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+        });
         div()
             .absolute()
             .top_0()
@@ -469,6 +538,7 @@ impl Render for ScrollBars {
             .size_full()
             .children(vertical)
             .children(horizontal)
+            .children(drag)
             .into_any_element()
     }
 }
@@ -494,6 +564,9 @@ pub fn scrollable(
         let name = name.clone();
         move |_, _| ScrollBars::new(source, theme, name)
     });
+    // The same place can show another list (another session): the bars read the
+    // state given now, not the one they were made with.
+    bars.update(cx, |bars, _| bars.source = source);
     let scroll = bars.clone();
     div()
         .id(id)

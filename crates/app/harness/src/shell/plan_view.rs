@@ -1,0 +1,338 @@
+//! The plan of the open session's account, in the right pane: the five-hour and weekly
+//! windows of a subscription, or what an API account spent this month, summed from the
+//! history of this machine (or host) at API prices.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use live::usage::{Plan, WindowKind};
+use model::{EnvId, HarnessKind, SessionKey, Usage, pricing};
+use ui_kit::prelude::*;
+use ui_kit::*;
+
+use super::{Shell, now_ms};
+use crate::i18n::t;
+
+/// How old a plan or a month's sum may get before the window looks again.
+const STALE_MS: i64 = 5 * 60_000;
+/// How soon after the last look a finished turn or a click may look again.
+const AGAIN_MS: i64 = 20_000;
+
+/// The plan of one account: the harness on one machine.
+#[derive(Default)]
+pub(super) struct PlanState {
+    pub(super) at_ms: i64,
+    pub(super) plan: Option<Plan>,
+    pub(super) busy: bool,
+}
+
+/// This month's spending of one harness on one machine.
+#[derive(Default)]
+pub(super) struct MonthState {
+    pub(super) at_ms: i64,
+    pub(super) busy: bool,
+    pub(super) sum: Option<MonthSum>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MonthSum {
+    pub(super) usd: f64,
+    pub(super) complete: bool,
+    pub(super) sessions: usize,
+}
+
+/// The tokens of this month per session, with the stamp of the history they came from:
+/// another look reads only the sessions that changed.
+pub(super) type MonthCache = Arc<Mutex<HashMap<SessionKey, (i64, i64, Vec<(String, Usage)>)>>>;
+
+type Account = (EnvId, HarnessKind);
+
+impl Shell {
+    fn open_account(&self) -> Option<Account> {
+        let key = &self.open.as_ref()?.summary.key;
+        Some((key.env.clone(), key.harness.clone()))
+    }
+
+    /// Looks at the open session's plan and month when they are old; `soon` (a finished
+    /// turn, a click) looks sooner.
+    pub(super) fn look_at_plan(&mut self, soon: bool, cx: &mut Context<Self>) {
+        if self.right_hidden || self.right_tab != super::files_view::RightTab::Session {
+            return;
+        }
+        let Some(account) = self.open_account() else { return };
+        let wait = if soon { AGAIN_MS } else { STALE_MS };
+        let now = now_ms();
+        if account.1 == HarnessKind::Claude {
+            let state = self.plans.entry(account.clone()).or_default();
+            if !state.busy && now - state.at_ms >= wait {
+                state.busy = true;
+                self.probe_plan(account.clone(), cx);
+            }
+        }
+        let api = match account.1 {
+            HarnessKind::DeepSeek => true,
+            HarnessKind::Claude => matches!(self.plans.get(&account).and_then(|state| state.plan.as_ref()), Some(Plan::Api)),
+            _ => false,
+        };
+        if api {
+            let state = self.months.entry(account.clone()).or_default();
+            if !state.busy && now - state.at_ms >= wait {
+                state.busy = true;
+                self.count_month(account, cx);
+            }
+        }
+    }
+
+    fn probe_plan(&mut self, account: Account, cx: &mut Context<Self>) {
+        let Some(env) = self.env_for(&account.0) else {
+            self.plans.remove(&account);
+            return;
+        };
+        let local = account.0.is_local();
+        let task = cx.background_spawn(async move {
+            // An empty folder: no project settings, no hooks of a project.
+            let folder = if local {
+                let folder = std::env::temp_dir().join("bowyer-usage");
+                let _ = std::fs::create_dir_all(&folder);
+                folder.to_string_lossy().into_owned()
+            } else {
+                "/tmp".to_owned()
+            };
+            let request = live::usage::claude_request();
+            let (program, args) = live::usage::claude_command(local);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match env.run_with_input(&program, &args, Some(&folder), request.as_bytes()) {
+                Ok(output) => live::usage::parse_claude(&output),
+                Err(error) => Plan::Unknown(model::shorten(&error.to_string(), 200)),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let plan = task.await;
+            this.update(cx, |this, cx| {
+                let api = plan == Plan::Api;
+                let state = this.plans.entry(account).or_default();
+                state.busy = false;
+                state.at_ms = now_ms();
+                state.plan = Some(plan);
+                if api {
+                    this.look_at_plan(false, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn count_month(&mut self, account: Account, cx: &mut Context<Self>) {
+        let Some(env) = self.env_for(&account.0) else {
+            self.months.remove(&account);
+            return;
+        };
+        let start = model::month_start_utc_ms(now_ms());
+        let sessions: Vec<_> = self
+            .summaries
+            .iter()
+            .filter(|summary| summary.key.env == account.0 && summary.key.harness == account.1 && summary.updated_ms >= start)
+            .cloned()
+            .collect();
+        let cache = self.month_cache.clone();
+        let remote = self.cache_dir.join("remote");
+        let harness = account.1.clone();
+        let task = cx.background_spawn(async move {
+            let source = history::source_for(&harness)?;
+            let mut buckets: Vec<(String, Usage)> = Vec::new();
+            let mut counted = 0;
+            for summary in &sessions {
+                let stamp = summary.updated_ms;
+                let known = cache.lock().ok().and_then(|cache| {
+                    cache.get(&summary.key).filter(|(month, at, _)| *month == start && *at == stamp).map(|(_, _, usage)| usage.clone())
+                });
+                let usage = match known {
+                    Some(usage) => usage,
+                    None => {
+                        let Ok(transcript) = source.load(&*env, summary, &remote) else { continue };
+                        let usage = transcript.usage_since(start);
+                        if let Ok(mut cache) = cache.lock() {
+                            cache.insert(summary.key.clone(), (start, stamp, usage.clone()));
+                        }
+                        usage
+                    }
+                };
+                if !usage.is_empty() {
+                    counted += 1;
+                }
+                for (bucket, tokens) in usage {
+                    match buckets.iter_mut().find(|(name, _)| *name == bucket) {
+                        Some((_, sum)) => sum.add(&tokens),
+                        None => buckets.push((bucket, tokens)),
+                    }
+                }
+            }
+            let (usd, complete) = pricing::session_cost(&buckets);
+            Some(MonthSum { usd, complete, sessions: counted })
+        });
+        cx.spawn(async move |this, cx| {
+            let sum = task.await;
+            this.update(cx, |this, cx| {
+                let state = this.months.entry(account).or_default();
+                state.busy = false;
+                state.at_ms = now_ms();
+                state.sum = sum.or(state.sum);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The plan section of the right pane, for the harnesses that have one.
+    pub(super) fn render_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let account = self.open_account()?;
+        let plan = self.plans.get(&account);
+        let month = self.months.get(&account);
+        let body: AnyElement = match account.1 {
+            HarnessKind::Claude => match plan.and_then(|state| state.plan.as_ref()) {
+                None => muted(t("loading"), &theme),
+                Some(Plan::Unknown(error)) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(muted(t("plan.unknown"), &theme))
+                    .child(div().text_size(px(11.)).text_color(theme.text_muted).child(error.clone()))
+                    .into_any_element(),
+                Some(Plan::Api) => month_view(month, &theme),
+                Some(Plan::Limits { name, windows, extra }) => {
+                    let now = now_ms();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .children(name.as_ref().map(|name| muted(t("plan.subscription").replace("{name}", &capitalized(name)), &theme)))
+                        .children(windows.iter().map(|window| {
+                            let label = match (window.kind, &window.model) {
+                                (WindowKind::FiveHours, _) => t("plan.five_hours").to_owned(),
+                                (WindowKind::Week, None) => t("plan.week").to_owned(),
+                                (WindowKind::Week, Some(model)) => format!("{} · {model}", t("plan.week")),
+                            };
+                            let resets = window.resets_ms.filter(|at| *at > now).map(|at| t("plan.resets").replace("{t}", &until(at - now)));
+                            meter(label, window.percent, resets, &theme)
+                        }))
+                        .children(extra.as_ref().map(|spend| {
+                            let used = money(spend.used, &spend.currency);
+                            let text = match spend.limit {
+                                Some(limit) => format!("{used} / {}", money(limit, &spend.currency)),
+                                None => used,
+                            };
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_size(px(12.))
+                                .child(div().text_color(theme.text_muted).child(t("plan.extra")))
+                                .child(text)
+                        }))
+                        .into_any_element()
+                }
+            },
+            HarnessKind::DeepSeek => month_view(month, &theme),
+            _ => return None,
+        };
+        let refresh = div()
+            .id("plan-refresh")
+            .px(px(4.))
+            .rounded(px(4.))
+            .text_size(px(12.))
+            .text_color(theme.text_muted)
+            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+            .child("↻")
+            .tooltip(|_, cx| tooltip(t("plan.refresh"), None, cx))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.look_at_plan(true, cx)));
+        Some(self.fold("plan", t("plan.title"), Some(refresh.into_any_element()), body, cx))
+    }
+}
+
+fn muted(text: impl Into<SharedString>, theme: &Theme) -> AnyElement {
+    div().text_size(px(12.)).text_color(theme.text_muted).child(text.into()).into_any_element()
+}
+
+/// A window of the plan: its name, the share used and when it starts again.
+fn meter(label: String, percent: f64, resets: Option<String>, theme: &Theme) -> impl IntoElement {
+    let color = match percent {
+        p if p >= 90.0 => theme.error,
+        p if p >= 70.0 => theme.warning_mark,
+        _ => theme.accent,
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_size(px(12.))
+                .child(label)
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{:.0}%", percent))),
+        )
+        .child(
+            div()
+                .h(px(6.))
+                .w_full()
+                .rounded(px(3.))
+                .overflow_hidden()
+                .bg(theme.hover)
+                .child(div().h_full().w(relative((percent / 100.0).clamp(0.0, 1.0) as f32)).bg(color)),
+        )
+        .children(resets.map(|text| div().text_size(px(11.)).text_color(theme.text_muted).child(text)))
+}
+
+fn month_view(month: Option<&MonthState>, theme: &Theme) -> AnyElement {
+    match month.and_then(|state| state.sum) {
+        None => muted(t("plan.counting"), theme),
+        Some(sum) => {
+            let mut note = t("plan.month_note").replace("{n}", &sum.sessions.to_string());
+            if !sum.complete {
+                note = format!("{note} · {}", t("plan.partial"));
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(muted(t("plan.api"), theme))
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .gap(px(8.))
+                        .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(money(sum.usd, "USD")))
+                        .child(div().pb(px(3.)).text_size(px(12.)).text_color(theme.text_muted).child(t("plan.month"))),
+                )
+                .child(div().text_size(px(11.)).text_color(theme.text_muted).child(note))
+                .into_any_element()
+        }
+    }
+}
+
+fn money(amount: f64, currency: &str) -> String {
+    match currency {
+        "USD" => format!("${amount:.2}"),
+        "EUR" => format!("€{amount:.2}"),
+        other => format!("{amount:.2} {other}"),
+    }
+}
+
+fn capitalized(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// "45 min", "2 h 10 min", "3 d 4 h".
+fn until(ms: i64) -> String {
+    let minutes = (ms + 59_999) / 60_000;
+    match minutes {
+        m if m < 60 => format!("{m} {}", t("unit.min")),
+        m if m < 60 * 24 => format!("{} {} {} {}", m / 60, t("unit.h"), m % 60, t("unit.min")),
+        m => format!("{} {} {} {}", m / (60 * 24), t("unit.d"), m % (60 * 24) / 60, t("unit.h")),
+    }
+}

@@ -21,7 +21,7 @@ mod ssh;
 pub use git::{GitInfo, git_info_local, parse_head};
 pub use local::LocalEnvironment;
 pub use ssh::{
-    ASKPASS_HOST, HostKeys, SshEnvironment, SshHost, askpass_answer, changed_host_key_files, changed_key_is_own, host_takes_no_password, is_unknown_host_key, read_ssh_config, set_askpass, set_known_hosts,
+    ASKPASS_HOST, HostKeys, SshEnvironment, SshHost, askpass_answer, changed_host_key_files, changed_key_is_own, host_takes_no_password, is_unknown_host_key, key_has_passphrase, read_ssh_config, refused_sign_in, set_askpass, set_known_hosts,
     shell_quote,
 };
 

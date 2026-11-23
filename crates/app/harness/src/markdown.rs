@@ -14,10 +14,59 @@ pub enum Inline {
     Strike,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Rich {
     pub text: String,
     pub spans: Vec<(Range<usize>, Inline)>,
+    /// Where the links of the text go: Markdown links and bare `http(s)://` addresses.
+    pub links: Vec<(Range<usize>, String)>,
+}
+
+impl Rich {
+    /// The address of the link at byte `offset` of the text, if it is one a browser opens.
+    #[cfg(test)]
+    pub fn link_at(&self, offset: usize) -> Option<&str> {
+        self.links.iter().find(|(range, _)| range.start <= offset && offset < range.end).map(|(_, url)| url.as_str()).filter(|url| opens_in_browser(url))
+    }
+}
+
+/// Only web addresses open from the window: a link the model wrote never starts a program
+/// or opens a file.
+pub fn opens_in_browser(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// The bare web addresses of `text`: from `http(s)://` to the next space, without the
+/// punctuation that ends a sentence or a closing bracket that has no opening one in it.
+fn bare_urls(text: &str) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = ["https://", "http://"].iter().filter_map(|scheme| text[from..].find(scheme)).min() {
+        let start = from + at;
+        let rest = &text[start..];
+        let mut end = start + rest.find(|c: char| c.is_whitespace() || "<>\"'`«»".contains(c)).unwrap_or(rest.len());
+        loop {
+            let url = &text[start..end];
+            let Some(last) = url.chars().last() else { break };
+            let unbalanced = match last {
+                ')' => url.matches(')').count() > url.matches('(').count(),
+                ']' => url.matches(']').count() > url.matches('[').count(),
+                '.' | ',' | ';' | ':' | '!' | '?' => true,
+                _ => false,
+            };
+            if !unbalanced {
+                break;
+            }
+            end -= last.len_utf8();
+        }
+        let scheme_end = start + if rest.starts_with("https://") { 8 } else { 7 };
+        if end > scheme_end {
+            found.push(start..end);
+        }
+        from = end.max(scheme_end);
+    }
+    found
 }
 
 impl Rich {
@@ -57,6 +106,9 @@ struct Builder {
     blocks: Vec<MdBlock>,
     text: String,
     spans: Vec<(Range<usize>, Inline)>,
+    links: Vec<(Range<usize>, String)>,
+    /// The addresses of the Markdown links open now, innermost last.
+    link_urls: Vec<(usize, String)>,
     open: Vec<(usize, Inline)>,
     /// Lists: the next number of each ordered list, `None` for bullets.
     lists: Vec<Option<u64>>,
@@ -70,13 +122,29 @@ impl Builder {
     fn rich(&mut self) -> Rich {
         let text = std::mem::take(&mut self.text);
         let spans = std::mem::take(&mut self.spans);
-        Rich { text: text.trim_end().to_owned(), spans: spans.into_iter().filter(|(r, _)| r.start < r.end).collect() }
+        let links = std::mem::take(&mut self.links);
+        let text = text.trim_end().to_owned();
+        let fits = |r: &Range<usize>| r.start < r.end && r.end <= text.len();
+        let mut spans: Vec<(Range<usize>, Inline)> = spans.into_iter().filter(|(r, _)| fits(r)).collect();
+        let mut links: Vec<(Range<usize>, String)> = links.into_iter().filter(|(r, _)| fits(r)).collect();
+        // A bare address is a link too, outside code and Markdown links. Found in the whole
+        // text: the parser cuts an address at `_` or `*`.
+        let overlaps = |a: &Range<usize>, b: &Range<usize>| a.start < b.end && b.start < a.end;
+        for range in bare_urls(&text) {
+            let taken = links.iter().any(|(r, _)| overlaps(r, &range)) || spans.iter().any(|(r, kind)| *kind == Inline::Code && overlaps(r, &range));
+            if !taken {
+                spans.push((range.clone(), Inline::Link));
+                links.push((range.clone(), text[range].to_owned()));
+            }
+        }
+        Rich { spans, links, text }
     }
 
     fn flush(&mut self) {
         if self.text.trim().is_empty() {
             self.text.clear();
             self.spans.clear();
+            self.links.clear();
             return;
         }
         let rich = self.rich();
@@ -164,7 +232,10 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 Tag::Emphasis => b.start_inline(Inline::Italic),
                 Tag::Strong => b.start_inline(Inline::Bold),
                 Tag::Strikethrough => b.start_inline(Inline::Strike),
-                Tag::Link { .. } => b.start_inline(Inline::Link),
+                Tag::Link { dest_url, .. } => {
+                    b.link_urls.push((b.text.len(), dest_url.to_string()));
+                    b.start_inline(Inline::Link);
+                }
                 Tag::TableCell => {
                     if !b.text.is_empty() && !b.text.ends_with('\n') {
                         b.text.push_str("  │  ");
@@ -190,7 +261,12 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 TagEnd::Emphasis => b.end_inline(Inline::Italic),
                 TagEnd::Strong => b.end_inline(Inline::Bold),
                 TagEnd::Strikethrough => b.end_inline(Inline::Strike),
-                TagEnd::Link => b.end_inline(Inline::Link),
+                TagEnd::Link => {
+                    b.end_inline(Inline::Link);
+                    if let Some((start, url)) = b.link_urls.pop() {
+                        b.links.push((start..b.text.len(), url));
+                    }
+                }
                 TagEnd::TableRow | TagEnd::TableHead => b.flush(),
                 _ => {}
             },
@@ -275,9 +351,38 @@ mod tests {
     }
 
     #[test]
+    fn links_know_where_they_go() {
+        let blocks = parse(
+            "1. **Kiepe** (main): https://allegro.pl/listing?string=kiepe%20studio%20degażówki\n\
+             2. See [Kiepe on Ceneo](https://www.ceneo.pl/123), or (https://example.com/a_(b)).\n\
+             3. Plain http://example.org. Not a link: `https://in.code` and ftp://x.y\n",
+        );
+        let link = |block: &MdBlock| match block {
+            MdBlock::Item { text, .. } => text.links.iter().map(|(r, url)| (text.text[r.clone()].to_owned(), url.clone())).collect::<Vec<_>>(),
+            _ => panic!("an item"),
+        };
+        let first = "https://allegro.pl/listing?string=kiepe%20studio%20degażówki";
+        assert_eq!(link(&blocks[0]), [(first.to_owned(), first.to_owned())]);
+        assert_eq!(
+            link(&blocks[1]),
+            [("Kiepe on Ceneo".to_owned(), "https://www.ceneo.pl/123".to_owned()), ("https://example.com/a_(b)".to_owned(), "https://example.com/a_(b)".to_owned())],
+            "a closing bracket of the sentence stays out, the address's own stays in"
+        );
+        assert_eq!(link(&blocks[2]), [("http://example.org".to_owned(), "http://example.org".to_owned())], "no full stop, nothing in code");
+        let MdBlock::Item { text, .. } = &blocks[1] else { unreachable!() };
+        let at = text.text.find("Ceneo").unwrap();
+        assert_eq!(text.link_at(at), Some("https://www.ceneo.pl/123"));
+        assert_eq!(text.link_at(0), None);
+        assert!(text.spans.iter().any(|(r, kind)| *kind == Inline::Link && &text.text[r.clone()] == "Kiepe on Ceneo"));
+        // Only web addresses open.
+        let rich = Rich { text: "x".into(), links: vec![(0..1, "file:///C:/Windows/notepad.exe".into())], ..Default::default() };
+        assert_eq!(rich.link_at(0), None);
+    }
+
+    #[test]
     fn lists_headings_and_code() {
         let blocks = parse("## Plan\n\n1. first\n2. second\n   - nested\n\n```rust\nfn main() {}\n```\n");
-        assert_eq!(blocks[0], MdBlock::Heading(2, Rich { text: "Plan".into(), spans: vec![] }));
+        assert_eq!(blocks[0], MdBlock::Heading(2, Rich { text: "Plan".into(), ..Default::default() }));
         assert!(matches!(&blocks[1], MdBlock::Item { marker, depth: 0, .. } if marker == "1."));
         assert!(matches!(&blocks[2], MdBlock::Item { marker, .. } if marker == "2."));
         assert!(matches!(&blocks[3], MdBlock::Item { marker, depth: 1, .. } if marker == "•"));

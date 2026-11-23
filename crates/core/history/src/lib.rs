@@ -17,6 +17,7 @@ mod dsh;
 mod memory_files;
 mod opencode;
 mod time;
+mod trash;
 
 pub use claude::{ClaudeFollower, ClaudeParser, ClaudeSource, turn_of_tail};
 pub use codex::{CodexSource, codex_turn_of_tail};
@@ -24,6 +25,7 @@ pub use dsh::DshSource;
 pub use memory_files::{memory_file_paths, memory_tokens};
 pub use opencode::OpenCodeSource;
 pub use time::parse_rfc3339_ms;
+pub use trash::{TRASH_DIR, move_to_trash, session_files};
 
 /// Summaries already known, by the path of their source, so a scan reads only what changed.
 pub trait KnownSummaries {

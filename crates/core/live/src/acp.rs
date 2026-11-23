@@ -418,9 +418,12 @@ mod tests {
             cwd: "/w/app".into(),
             prompt: "Run echo".into(),
             model: Some("opencode-go/deepseek-v4.1-flash".into()),
+            effort: None,
             permission,
             ssh: None,
             attachments: vec![Attachment { path: "/w/app/notes.txt".into(), image: None }],
+            ide: None,
+            drop_turn: None,
         }
     }
 

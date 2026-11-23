@@ -13,7 +13,32 @@ pub struct TextField {
     caret: usize,
     /// The other end of the selection; equal to `caret` when nothing is selected.
     anchor: usize,
+    /// The states before the edits, the latest last, for Ctrl+Z; and the ones undone, for
+    /// Ctrl+Y.
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The kind of the last edit: typing and deleting in a row undo together.
+    last_edit: Option<EditKind>,
 }
+
+/// The text, caret and anchor of a field at one moment.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    text: String,
+    caret: usize,
+    anchor: usize,
+}
+
+/// Edits that run together into one step of undo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Deleting,
+    Other,
+}
+
+/// How many steps of undo a field keeps.
+const UNDO_STEPS: usize = 200;
 
 impl TextField {
     pub fn from_text(text: impl Into<String>) -> Self {
@@ -23,7 +48,97 @@ impl TextField {
             text,
             caret,
             anchor: caret,
+            ..Default::default()
         }
+    }
+
+    /// Keeps the state before an edit of `kind`. A run of typing (up to a space or a new
+    /// line) or of deleting is one step.
+    fn record(&mut self, kind: EditKind) {
+        let joins = kind != EditKind::Other && self.last_edit == Some(kind) && !self.has_selection();
+        self.last_edit = Some(kind);
+        self.redo.clear();
+        if joins {
+            return;
+        }
+        self.undo.push(Snapshot {
+            text: self.text.clone(),
+            caret: self.caret,
+            anchor: self.anchor,
+        });
+        if self.undo.len() > UNDO_STEPS {
+            self.undo.remove(0);
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
+        let now = Snapshot {
+            text: std::mem::replace(&mut self.text, snapshot.text),
+            caret: self.caret,
+            anchor: self.anchor,
+        };
+        self.caret = snapshot.caret.min(self.text.len());
+        self.anchor = snapshot.anchor.min(self.text.len());
+        self.last_edit = None;
+        now
+    }
+
+    /// Takes back the last edit; false when there is none.
+    pub fn undo(&mut self) -> bool {
+        let Some(before) = self.undo.pop() else {
+            return false;
+        };
+        let now = self.restore(before);
+        self.redo.push(now);
+        true
+    }
+
+    /// Makes the last undone edit again; false when there is none.
+    pub fn redo(&mut self) -> bool {
+        let Some(after) = self.redo.pop() else {
+            return false;
+        };
+        let now = self.restore(after);
+        self.undo.push(now);
+        true
+    }
+
+    /// Moves the caret and keeps the anchor: a drag of the mouse, or Shift+click.
+    pub fn select_to(&mut self, caret: usize) {
+        self.caret = self.boundary(caret);
+        self.last_edit = None;
+    }
+
+    /// Selects the word around `at`, or the one character there when it is no word.
+    pub fn select_word_at(&mut self, at: usize) {
+        let at = self.boundary(at);
+        let char_at = |at: usize| self.text[at..].chars().next();
+        let char_before = |at: usize| self.text[..at].chars().next_back();
+        let in_word = char_at(at).is_some_and(Self::word_char) || char_before(at).is_some_and(Self::word_char);
+        if !in_word {
+            self.anchor = at;
+            self.caret = self.next_boundary(at);
+            return;
+        }
+        let mut start = at;
+        while let Some(character) = char_before(start).filter(|c| Self::word_char(*c)) {
+            start -= character.len_utf8();
+        }
+        let mut end = at;
+        while let Some(character) = char_at(end).filter(|c| Self::word_char(*c)) {
+            end += character.len_utf8();
+        }
+        self.anchor = start;
+        self.caret = end;
+        self.last_edit = None;
+    }
+
+    /// Selects the line around `at`.
+    pub fn select_line_at(&mut self, at: usize) {
+        let at = self.boundary(at);
+        self.anchor = self.line_start(at);
+        self.caret = self.line_end(at);
+        self.last_edit = None;
     }
 
     pub fn caret(&self) -> usize {
@@ -34,6 +149,7 @@ impl TextField {
         let caret = self.boundary(caret);
         self.caret = caret;
         self.anchor = caret;
+        self.last_edit = None;
     }
 
     pub fn selection(&self) -> Range<usize> {
@@ -54,7 +170,23 @@ impl TextField {
     }
 
     /// Replaces the selection, or puts `text` at the caret, and leaves the caret after it.
+    /// One step of undo.
     pub fn insert_text(&mut self, text: &str) {
+        self.record(EditKind::Other);
+        self.insert(text);
+    }
+
+    /// Typed text: a run of it is one step of undo, up to a space or a new line.
+    fn type_text(&mut self, text: &str) {
+        let breaks = text.chars().any(char::is_whitespace);
+        self.record(if breaks { EditKind::Other } else { EditKind::Typing });
+        self.insert(text);
+        if breaks {
+            self.last_edit = None;
+        }
+    }
+
+    fn insert(&mut self, text: &str) {
         let range = self.selection();
         self.text.replace_range(range.clone(), text);
         self.caret = range.start + text.len();
@@ -63,6 +195,10 @@ impl TextField {
 
     /// Removes the selection, or one character before the caret.
     pub fn backspace(&mut self, word: bool) {
+        if self.caret == 0 && !self.has_selection() {
+            return;
+        }
+        self.record(if word || self.has_selection() { EditKind::Other } else { EditKind::Deleting });
         if self.delete_selection() {
             return;
         }
@@ -78,6 +214,10 @@ impl TextField {
 
     /// Removes the selection, or one character after the caret.
     pub fn delete(&mut self, word: bool) {
+        if self.caret == self.text.len() && !self.has_selection() {
+            return;
+        }
+        self.record(if word || self.has_selection() { EditKind::Other } else { EditKind::Deleting });
         if self.delete_selection() {
             return;
         }
@@ -171,6 +311,7 @@ impl TextField {
             self.anchor = to;
         }
         self.caret = to;
+        self.last_edit = None;
     }
 
     fn move_left(&mut self, word: bool, shift: bool) {
@@ -239,8 +380,14 @@ impl TextField {
                 self.vertical(1, shift);
             }
             "a" if primary && !modifiers.alt => self.select_all(),
+            "z" if primary && !modifiers.alt && !shift => {
+                self.undo();
+            }
+            "z" | "y" if primary && !modifiers.alt => {
+                self.redo();
+            }
             "enter" if multiline && !primary && !modifiers.alt => {
-                self.insert_text("\n");
+                self.type_text("\n");
             }
             _ => {
                 if primary || modifiers.alt {
@@ -253,7 +400,7 @@ impl TextField {
                 if text.is_empty() || text.chars().any(char::is_control) && !multiline {
                     return false;
                 }
-                self.insert_text(&text);
+                self.type_text(&text);
             }
         }
         true
@@ -267,6 +414,7 @@ impl TextField {
             text: "•".repeat(self.text.chars().count()),
             caret: dots(self.caret),
             anchor: dots(self.anchor),
+            ..Default::default()
         }
     }
 
@@ -484,6 +632,73 @@ fn lines_children(
     }
 }
 
+/// The text of a field of many lines, wrapped to the width it gets (and again whenever
+/// that width changes), with the selection and the caret drawn where the text laid out.
+/// `line_height` is the height of a line and of the caret. The layout it returns turns a
+/// point of the window into a byte of the text once the element is drawn (see
+/// [`index_at`]), for placing the caret and selecting with the mouse.
+pub fn text_field_wrapped(
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    line_height: f32,
+    show_caret: bool,
+) -> (AnyElement, TextLayout) {
+    let selection = field.selection();
+    let highlights = if selection.is_empty() {
+        Vec::new()
+    } else {
+        vec![(
+            selection,
+            HighlightStyle {
+                color: Some(selected_color),
+                background_color: Some(selection_color),
+                ..Default::default()
+            },
+        )]
+    };
+    let styled = StyledText::new(field.text.clone()).with_highlights(highlights);
+    let layout = styled.layout().clone();
+    let returned = layout.clone();
+    let caret_at = field.caret;
+    let element = div()
+        .relative()
+        .w_full()
+        .min_w_0()
+        .line_height(px(line_height))
+        .text_color(text_color)
+        .child(styled)
+        .when(show_caret, |this| {
+            // Painted after the text, which has its layout by then.
+            this.child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let at = layout.position_for_index(caret_at).unwrap_or(bounds.origin);
+                        window.paint_quad(fill(
+                            Bounds::new(at, size(px(1.5), px(line_height))),
+                            caret_color,
+                        ));
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+        })
+        .into_any_element();
+    (element, returned)
+}
+
+/// The byte of a drawn [`text_field_wrapped`] nearest to `position`: the caret a click
+/// there leaves.
+pub fn index_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
+    layout.index_for_position(position).unwrap_or_else(|index| index)
+}
+
 /// The parts of the field that lie on one line. The caret is placed only when it belongs
 /// to this line, and the fallback at the end keeps it on an empty line.
 #[allow(clippy::too_many_arguments)]
@@ -655,6 +870,52 @@ mod tests {
         assert_eq!(field.selected_text(), "one");
         assert!(field.key(&press("end", None, shift()), false));
         assert_eq!(field.selected_text(), "one two");
+    }
+
+    #[test]
+    fn ctrl_z_takes_back_a_word_at_a_time_and_ctrl_y_makes_it_again() {
+        let mut field = TextField::from_text("");
+        let typed = |field: &mut TextField, text: &str| {
+            for character in text.chars() {
+                let key = character.to_string();
+                assert!(field.key(&press(&key, Some(&key), Modifiers::default()), true));
+            }
+        };
+        typed(&mut field, "hello world");
+        assert!(field.key(&press("backspace", None, Modifiers::default()), true));
+        assert!(field.key(&press("backspace", None, Modifiers::default()), true));
+        assert_eq!(field.text, "hello wor");
+        assert!(field.key(&press("z", Some("z"), control()), true));
+        assert_eq!(field.text, "hello world", "the two deletions are one step");
+        assert!(field.key(&press("z", Some("z"), control()), true));
+        assert_eq!(field.text, "hello ", "the typing of a word is one step");
+        assert!(field.key(&press("z", Some("z"), control()), true));
+        assert_eq!(field.text, "hello");
+        assert!(field.key(&press("y", Some("y"), control()), true));
+        assert_eq!(field.text, "hello ");
+        assert!(field.key(&press("z", Some("Z"), control_shift()), true));
+        assert_eq!(field.text, "hello world");
+        assert_eq!(field.caret(), field.text.len());
+        // A new edit drops what was undone.
+        assert!(field.key(&press("z", Some("z"), control()), true));
+        typed(&mut field, "x");
+        assert!(!field.redo());
+        while field.undo() {}
+        assert_eq!(field.text, "");
+    }
+
+    #[test]
+    fn a_double_click_selects_a_word_and_a_drag_moves_the_end() {
+        let mut field = TextField::from_text("say héllo_wörld, now\nnext line");
+        field.select_word_at(7);
+        assert_eq!(field.selected_text(), "héllo_wörld");
+        field.select_word_at(field.text.find(", ").unwrap() + 1);
+        assert_eq!(field.selected_text(), " ", "outside a word, the character");
+        field.set_caret(0);
+        field.select_to(3);
+        assert_eq!(field.selected_text(), "say");
+        field.select_line_at(field.text.len() - 1);
+        assert_eq!(field.selected_text(), "next line");
     }
 
     #[test]

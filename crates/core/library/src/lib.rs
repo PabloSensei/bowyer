@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 mod tree;
 
-pub use tree::{Grouping, PINNED_GROUP, SortOrder, TreeNode, TreeNodeKind, build_tree, flatten_visible};
+pub use tree::{Grouping, PINNED_GROUP, SessionStart, SortOrder, TreeNode, TreeNodeKind, build_tree, flatten_visible, link_started, project_root};
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
 
@@ -99,11 +99,50 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE environments ADD COLUMN identity TEXT;",
     // Which version of a session file the text in the index comes from.
     "CREATE TABLE indexed (session_key TEXT PRIMARY KEY, stamp TEXT NOT NULL);",
+    // Claude Code sessions took the folder of their last line, where a `cd` of the agent's
+    // shell may have left them; they are read again for the folder they began in.
+    "DELETE FROM summaries WHERE harness = 'claude';",
+    // A short account of each session for the memory server: problem, fix, commits,
+    // tickets, files. `stamp` names the version of the session file it was made from;
+    // `by_model` says a model wrote the problem, fix and search words.
+    r#"
+    CREATE TABLE digests (session_key TEXT PRIMARY KEY, stamp TEXT NOT NULL, text TEXT NOT NULL, by_model INTEGER NOT NULL DEFAULT 0);
+    CREATE VIRTUAL TABLE digest_search USING fts5(session_key UNINDEXED, text, tokenize = 'unicode61 remove_diacritics 2');
+    "#,
+    // The titles of the sessions a session started in separate sessions, to hang them under
+    // it. Claude Code sessions are indexed again so the ones from before are found.
+    r#"
+    CREATE TABLE started (parent TEXT NOT NULL, title TEXT NOT NULL, PRIMARY KEY (parent, title));
+    DELETE FROM indexed WHERE session_key LIKE '%|claude|%';
+    "#,
 ];
 
 /// The version of a session's source the index holds the text of.
-fn stamp_of(summary: &SessionSummary) -> String {
+pub fn stamp_of(summary: &SessionSummary) -> String {
     format!("{}:{}", summary.source.size, summary.source.modified_ms)
+}
+
+/// Words that carry meaning in a question: no short words, no common English ones.
+pub fn meaningful_words(query: &str) -> Vec<String> {
+    const COMMON: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "what", "when", "where", "which", "who", "how", "why", "did", "does",
+        "was", "were", "are", "you", "we", "our", "us", "there", "then", "than", "from", "into", "about", "have", "had",
+        "has", "not", "but", "can", "could", "should", "would", "remember", "recent", "session", "sessions", "earlier",
+        "before", "last", "time", "some", "similar", "problem", "issue", "solved", "fixed", "fix",
+    ];
+    let mut words: Vec<String> = Vec::new();
+    for word in query.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_lowercase) {
+        if word.chars().count() >= 3 && !COMMON.contains(&word.as_str()) && !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// An FTS query that matches any of the meaningful words, as prefixes.
+fn any_words(query: &str) -> Option<String> {
+    let words = meaningful_words(query);
+    (!words.is_empty()).then(|| words.iter().map(|word| format!("\"{word}\"*")).collect::<Vec<_>>().join(" OR "))
 }
 
 /// An SSH host the user added.
@@ -191,6 +230,8 @@ impl Library {
             transaction.execute("DELETE FROM summaries WHERE session_key = ?1", [key])?;
             transaction.execute("DELETE FROM search WHERE session_key = ?1", [key])?;
             transaction.execute("DELETE FROM indexed WHERE session_key = ?1", [key])?;
+            transaction.execute("DELETE FROM digests WHERE session_key = ?1", [key])?;
+            transaction.execute("DELETE FROM digest_search WHERE session_key = ?1", [key])?;
         }
         transaction.commit()?;
         Ok(changed)
@@ -228,6 +269,23 @@ impl Library {
             params![summary.key.encode(), stamp_of(summary)],
         )?;
         Ok(())
+    }
+
+    /// Keeps the titles of the sessions `parent` started, in place of the ones kept before.
+    pub fn set_started(&self, parent: &SessionKey, titles: &[String]) -> Result<()> {
+        let key = parent.encode();
+        self.connection.execute("DELETE FROM started WHERE parent = ?1", [&key])?;
+        for title in titles {
+            self.connection.execute("INSERT OR IGNORE INTO started (parent, title) VALUES (?1, ?2)", params![key, title])?;
+        }
+        Ok(())
+    }
+
+    /// Every session that started others, with the title of each one it started.
+    pub fn started(&self) -> Result<Vec<(SessionKey, String)>> {
+        let mut statement = self.connection.prepare("SELECT parent, title FROM started")?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.flatten().filter_map(|(parent, title)| Some((SessionKey::decode(&parent)?, title))).collect())
     }
 
     /// Sessions of `env` whose text the index lacks or holds from an older version of the
@@ -274,6 +332,58 @@ impl Library {
             .flatten()
             .filter_map(|(key, title, snippet)| Some(SearchHit { key: SessionKey::decode(&key)?, title, snippet }))
             .collect())
+    }
+
+    /// Sessions whose title, prompt, folder or text hold any of the words, the ones that
+    /// hold more of them and rarer ones first. For questions in a sentence, where
+    /// [`Library::search`] needs every word.
+    pub fn search_any(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let Some(words) = any_words(query) else { return Ok(Vec::new()) };
+        let mut statement = self.connection.prepare(
+            "SELECT session_key, title, snippet(search, -1, '[', ']', '…', 12)
+             FROM search WHERE search MATCH ?1 ORDER BY bm25(search, 0.0, 8.0, 3.0, 2.0, 1.0) LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![words, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        Ok(rows
+            .flatten()
+            .filter_map(|(key, title, snippet)| Some(SearchHit { key: SessionKey::decode(&key)?, title, snippet }))
+            .collect())
+    }
+
+    // Digests ----------------------------------------------------------------------------
+
+    /// Keeps the digest of a session, made from the version of its file `stamp` names.
+    pub fn set_digest(&self, key: &SessionKey, stamp: &str, text: &str, by_model: bool) -> Result<()> {
+        let key = key.encode();
+        self.connection.execute(
+            "INSERT OR REPLACE INTO digests (session_key, stamp, text, by_model) VALUES (?1, ?2, ?3, ?4)",
+            params![key, stamp, text, by_model],
+        )?;
+        self.connection.execute("DELETE FROM digest_search WHERE session_key = ?1", [&key])?;
+        self.connection.execute("INSERT INTO digest_search (session_key, text) VALUES (?1, ?2)", params![key, text])?;
+        Ok(())
+    }
+
+    /// The digest of a session: the stamp it was made from, its text, whether a model wrote it.
+    pub fn digest(&self, key: &SessionKey) -> Option<(String, String, bool)> {
+        self.connection
+            .query_row("SELECT stamp, text, by_model FROM digests WHERE session_key = ?1", [key.encode()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Sessions whose digest holds any of the words, best first.
+    pub fn search_digests(&self, query: &str, limit: usize) -> Result<Vec<SessionKey>> {
+        let Some(words) = any_words(query) else { return Ok(Vec::new()) };
+        let mut statement =
+            self.connection.prepare("SELECT session_key FROM digest_search WHERE digest_search MATCH ?1 ORDER BY bm25(digest_search) LIMIT ?2")?;
+        let rows = statement.query_map(params![words, limit as i64], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().filter_map(|key| SessionKey::decode(&key)).collect())
     }
 
     // Folders and placements --------------------------------------------------------------
@@ -580,5 +690,43 @@ mod tests {
         library.add_note(None, Some("/w/other"), "other", 2).unwrap();
         assert_eq!(library.notes(Some("/w/app")).unwrap().len(), 1);
         assert_eq!(library.notes(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn digests_are_kept_found_by_any_word_and_go_with_their_session() {
+        let mut library = Library::in_memory().unwrap();
+        let session = summary("a", "Double charge", "/w", 10);
+        library.store_scan("local", "claude", &[session.clone(), summary("b", "Docs", "/w", 11)]).unwrap();
+        assert!(library.digest(&session.key).is_none());
+        library.set_digest(&session.key, "1:10", "Problem: customers charged twice. Commits: a3f9c21", false).unwrap();
+        library.set_digest(&session.key, "2:10", "Problem: customers charged twice on timeouts. Commits: a3f9c21", true).unwrap();
+        assert_eq!(library.digest(&session.key).unwrap(), ("2:10".into(), "Problem: customers charged twice on timeouts. Commits: a3f9c21".into(), true));
+        let found = library.search_digests("were people charged two times?", 10).unwrap();
+        assert_eq!(found, vec![session.key.clone()], "any word, and only once per session");
+        assert!(library.search_digests("how did we", 10).unwrap().is_empty(), "no meaningful words");
+        library.store_scan("local", "claude", &[summary("b", "Docs", "/w", 11)]).unwrap();
+        assert!(library.digest(&session.key).is_none());
+        assert!(library.search_digests("charged", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn any_word_search_ranks_sessions_that_hold_more_words_first() {
+        let mut library = Library::in_memory().unwrap();
+        library
+            .store_scan("local", "claude", &[summary("a", "Refund webhook", "/w", 1), summary("b", "Refund webhook retries twice", "/w", 2)])
+            .unwrap();
+        assert!(library.search("how do refund retries work", 10).unwrap().is_empty(), "every word");
+        let hits = library.search_any("how do refund retries work", 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.key.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(meaningful_words("Remember the session where we fixed the refund?"), ["refund"]);
+    }
+
+    #[test]
+    fn the_sessions_a_session_started_are_kept_by_title() {
+        let library = Library::in_memory().unwrap();
+        let parent = SessionKey { env: model::EnvId::local(), harness: model::HarnessKind::Claude, id: "p".into() };
+        library.set_started(&parent, &["Measure".to_owned(), "Fix".to_owned()]).unwrap();
+        library.set_started(&parent, &["Measure".to_owned()]).unwrap();
+        assert_eq!(library.started().unwrap(), vec![(parent, "Measure".to_owned())], "the newest list replaces the one before");
     }
 }

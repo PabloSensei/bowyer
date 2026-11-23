@@ -1,0 +1,240 @@
+//! The plan limits of a Claude Code account: the five-hour and weekly windows a subscription
+//! has, or that the account pays by API key. Claude Code answers a `get_usage` control
+//! request on stream-json input without a model call; standard input closing ends it.
+
+use serde_json::{Value, json};
+
+/// Claude Code's arguments for the request. `--setting-sources project` in an empty folder
+/// runs none of the user's hooks; the login stays (`--bare` would drop it).
+pub const CLAUDE_ARGS: [&str; 10] = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "project",
+];
+
+/// The program and arguments that ask: on this computer the program found on PATH (an npm
+/// shim runs its script with node), on a host a login shell, whose PATH has the harness.
+pub fn claude_command(local: bool) -> (String, Vec<String>) {
+    let args = CLAUDE_ARGS.iter().map(|arg| (*arg).to_owned());
+    if local {
+        let (program, prefix) = crate::resolve_program("claude").unwrap_or_else(|| ("claude".into(), Vec::new()));
+        (program.to_string_lossy().into_owned(), prefix.into_iter().chain(args).collect())
+    } else {
+        // The arguments are plain words: no quoting needed inside the login shell.
+        let line = std::iter::once("claude".to_owned()).chain(args).collect::<Vec<_>>().join(" ");
+        ("sh".into(), vec!["-c".into(), "exec \"${SHELL:-sh}\" -lc \"$1\"".into(), "sh".into(), line])
+    }
+}
+
+/// The line to send on standard input.
+pub fn claude_request() -> String {
+    json!({"type": "control_request", "request_id": "bowyer-usage", "request": {"subtype": "get_usage", "skip_behaviors": true}})
+        .to_string()
+        + "\n"
+}
+
+/// What an account's plan is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Plan {
+    /// A subscription with its windows; `name` is the plan ("max", "pro").
+    Limits { name: Option<String>, windows: Vec<Window>, extra: Option<Spend> },
+    /// Plan limits do not apply: an API key or a cloud provider.
+    Api,
+    /// The harness did not say: an older version, no login, an error.
+    Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowKind {
+    FiveHours,
+    Week,
+}
+
+/// One window of a plan's limit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Window {
+    pub kind: WindowKind,
+    /// The model a weekly window holds to alone, as the server names it.
+    pub model: Option<String>,
+    /// The share used, 0-100.
+    pub percent: f64,
+    pub resets_ms: Option<i64>,
+}
+
+/// Money spent past the plan's limits this month.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spend {
+    pub used: f64,
+    pub limit: Option<f64>,
+    pub currency: String,
+}
+
+/// Reads Claude Code's output for [`claude_request`].
+pub fn parse_claude(output: &str) -> Plan {
+    let response = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("control_response"))
+        .and_then(|event| event.get("response").cloned());
+    let Some(response) = response else {
+        return Plan::Unknown(model::shorten(output.trim(), 200));
+    };
+    if response.get("subtype").and_then(Value::as_str) != Some("success") {
+        let error = response.get("error").and_then(Value::as_str).unwrap_or("error");
+        return Plan::Unknown(error.to_owned());
+    }
+    let body = response.get("response").cloned().unwrap_or(Value::Null);
+    if body.get("rate_limits_available").and_then(Value::as_bool) == Some(false) {
+        // Without limits and without a subscription the account pays by API; a subscriber
+        // can lack them too (a login without the profile scope).
+        return match body.get("subscription_type") {
+            None | Some(Value::Null) => Plan::Api,
+            Some(_) => Plan::Unknown("rate limits unavailable".into()),
+        };
+    }
+    let Some(limits) = body.get("rate_limits").filter(|limits| limits.is_object()) else {
+        return Plan::Unknown("no rate limits".into());
+    };
+    let name = body.get("subscription_type").and_then(Value::as_str).map(str::to_owned);
+    let mut windows = rows(limits);
+    if windows.is_empty() {
+        windows = named_windows(limits);
+    }
+    Plan::Limits { name, windows, extra: spend(limits) }
+}
+
+/// The rows of `limits[]`, classified by their kind.
+fn rows(limits: &Value) -> Vec<Window> {
+    let Some(rows) = limits.get("limits").and_then(Value::as_array) else { return Vec::new() };
+    rows.iter()
+        .filter_map(|row| {
+            let (kind, model) = match row.get("kind").and_then(Value::as_str)? {
+                "session" => (WindowKind::FiveHours, None),
+                "weekly_all" => (WindowKind::Week, None),
+                "weekly_scoped" => {
+                    let model = row.pointer("/scope/model/display_name").and_then(Value::as_str)?;
+                    (WindowKind::Week, Some(model.to_owned()))
+                }
+                _ => return None,
+            };
+            Some(Window { kind, model, percent: row.get("percent").and_then(Value::as_f64)?, resets_ms: resets(row) })
+        })
+        .collect()
+}
+
+/// The windows by name, for answers without `limits[]`.
+fn named_windows(limits: &Value) -> Vec<Window> {
+    [("five_hour", WindowKind::FiveHours), ("seven_day", WindowKind::Week)]
+        .into_iter()
+        .filter_map(|(name, kind)| {
+            let window = limits.get(name)?;
+            Some(Window { kind, model: None, percent: window.get("utilization").and_then(Value::as_f64)?, resets_ms: resets(window) })
+        })
+        .collect()
+}
+
+fn resets(window: &Value) -> Option<i64> {
+    window.get("resets_at").and_then(Value::as_str).and_then(history::parse_rfc3339_ms)
+}
+
+/// Spending past the limits, when the account has it on.
+fn spend(limits: &Value) -> Option<Spend> {
+    let spend = limits.get("spend")?;
+    if spend.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let money = |value: &Value| -> Option<(f64, String)> {
+        let minor = value.get("amount_minor").and_then(Value::as_f64)?;
+        let exponent = value.get("exponent").and_then(Value::as_i64).unwrap_or(2) as i32;
+        let currency = value.get("currency").and_then(Value::as_str).unwrap_or("USD").to_owned();
+        Some((minor / 10f64.powi(exponent), currency))
+    };
+    let (used, currency) = money(spend.get("used")?)?;
+    let limit = spend.get("limit").and_then(money).map(|(limit, _)| limit);
+    Some(Spend { used, limit, currency })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(body: Value) -> String {
+        let events = [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "control_response", "response": {"subtype": "success", "request_id": "bowyer-usage", "response": body}}),
+        ];
+        events.iter().map(|event| format!("{event}\n")).collect()
+    }
+
+    #[test]
+    fn a_subscription_reads_as_its_windows() {
+        let output = answer(json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {"utilization": 9, "resets_at": "2030-01-01T05:00:00.000000+00:00"},
+                "seven_day": {"utilization": 40, "resets_at": "2030-01-07T00:00:00+00:00"},
+                "limits": [
+                    {"kind": "session", "group": "session", "percent": 12, "resets_at": "2030-01-01T05:00:00.123456+00:00"},
+                    {"kind": "weekly_all", "group": "weekly", "percent": 41, "resets_at": "2030-01-07T00:00:00Z"},
+                    {"kind": "weekly_scoped", "group": "weekly", "percent": 5, "resets_at": null, "scope": {"model": {"display_name": "Bigmodel"}}},
+                    {"kind": "something_new", "percent": 1}
+                ],
+                "spend": {"enabled": true, "used": {"amount_minor": 1234, "currency": "USD", "exponent": 2}, "limit": {"amount_minor": 5000, "currency": "USD", "exponent": 2}}
+            }
+        }));
+        let Plan::Limits { name, windows, extra } = parse_claude(&output) else { panic!("limits") };
+        assert_eq!(name.as_deref(), Some("pro"));
+        assert_eq!(windows.len(), 3, "the rows win over the named windows; unknown kinds stay out");
+        assert_eq!((windows[0].kind, windows[0].percent), (WindowKind::FiveHours, 12.0));
+        assert_eq!(windows[0].resets_ms, history::parse_rfc3339_ms("2030-01-01T05:00:00.123Z"));
+        assert_eq!((windows[2].kind, windows[2].model.as_deref()), (WindowKind::Week, Some("Bigmodel")));
+        assert_eq!(windows[2].resets_ms, None);
+        assert_eq!(extra, Some(Spend { used: 12.34, limit: Some(50.0), currency: "USD".into() }));
+    }
+
+    #[test]
+    fn an_answer_without_rows_uses_the_named_windows() {
+        let output = answer(json!({
+            "rate_limits_available": true,
+            "rate_limits": {"five_hour": {"utilization": 3, "resets_at": "2030-01-01T05:00:00+00:00"}, "seven_day": null}
+        }));
+        let Plan::Limits { windows, extra, .. } = parse_claude(&output) else { panic!("limits") };
+        assert_eq!(windows, vec![Window { kind: WindowKind::FiveHours, model: None, percent: 3.0, resets_ms: history::parse_rfc3339_ms("2030-01-01T05:00:00Z") }]);
+        assert_eq!(extra, None);
+    }
+
+    #[test]
+    fn an_api_key_and_failures_read_apart() {
+        let api = answer(json!({"subscription_type": null, "rate_limits_available": false, "rate_limits": null}));
+        assert_eq!(parse_claude(&api), Plan::Api);
+        let scopeless = answer(json!({"subscription_type": "max", "rate_limits_available": false, "rate_limits": null}));
+        assert!(matches!(parse_claude(&scopeless), Plan::Unknown(_)), "a subscriber without limits is no API account");
+        let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"bowyer-usage","error":"Unsupported control request subtype: get_usage"}}"#;
+        assert_eq!(parse_claude(refused), Plan::Unknown("Unsupported control request subtype: get_usage".into()));
+        assert!(matches!(parse_claude("Not logged in"), Plan::Unknown(text) if text == "Not logged in"));
+    }
+
+    /// Asks the Claude Code of this computer, signed in to a subscription. No model call:
+    /// `cargo test -p live usage -- --ignored`.
+    #[test]
+    #[ignore = "needs Claude Code signed in to a subscription"]
+    fn the_claude_code_here_tells_its_windows() {
+        use envs::Environment;
+        let (program, args) = claude_command(true);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let folder = std::env::temp_dir();
+        let output = envs::LocalEnvironment::new().run_with_input(&program, &args, folder.to_str(), claude_request().as_bytes()).unwrap();
+        let Plan::Limits { windows, .. } = parse_claude(&output) else { panic!("{output}") };
+        assert!(windows.iter().any(|w| w.kind == WindowKind::FiveHours), "{windows:?}");
+        assert!(windows.iter().any(|w| w.kind == WindowKind::Week && w.model.is_none()), "{windows:?}");
+        assert!(output.contains("\"total_cost_usd\":0"), "no model call");
+    }
+}

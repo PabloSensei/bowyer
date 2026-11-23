@@ -142,6 +142,20 @@ pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
     crate::secret::load(host)
 }
 
+/// Whether the private key at `key` has a passphrase: `ssh-keygen` (next to `ssh`) cannot
+/// open it with an empty one. Such a key signs in only when someone answers its passphrase,
+/// which `BatchMode` never asks. Nothing is written; a key that cannot be read at all is
+/// not called locked.
+pub fn key_has_passphrase(ssh: &Path, key: &Path) -> bool {
+    let mut keygen = Command::new(ssh.with_file_name("ssh-keygen"));
+    keygen.args(["-y", "-P", "", "-f"]).arg(key).stdin(Stdio::null());
+    hide_console(&mut keygen);
+    match keygen.output() {
+        Ok(output) => !output.status.success() && String::from_utf8_lossy(&output.stderr).to_lowercase().contains("passphrase"),
+        Err(_) => false,
+    }
+}
+
 /// Whether `error` says the host's key is not known (rather than changed, which is never
 /// offered to trust).
 pub fn is_unknown_host_key(error: &str) -> bool {
@@ -924,6 +938,26 @@ mod tests {
         assert!(is_unknown_host_key("No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\r\nHost key verification failed."));
         assert!(!is_unknown_host_key("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed."));
         assert!(!is_unknown_host_key("Permission denied (password)."));
+    }
+
+    #[test]
+    fn a_key_with_a_passphrase_is_told_from_an_open_one() {
+        let dir = std::env::temp_dir().join(format!("bowyer-keys-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, passphrase: &str| {
+            let key = dir.join(name);
+            let made = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", passphrase, "-C", "bowyer-test", "-f"]).arg(&key).output();
+            made.is_ok_and(|output| output.status.success()).then_some(key)
+        };
+        let (Some(open), Some(locked)) = (make("open", ""), make("locked", "test phrase")) else {
+            let _ = fs::remove_dir_all(&dir);
+            eprintln!("skipped: no ssh-keygen here");
+            return;
+        };
+        let ssh = Path::new("ssh");
+        let answers = [key_has_passphrase(ssh, &open), key_has_passphrase(ssh, &locked), key_has_passphrase(ssh, &dir.join("missing"))];
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(answers, [false, true, false]);
     }
 
     #[test]

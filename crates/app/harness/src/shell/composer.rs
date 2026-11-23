@@ -296,6 +296,10 @@ pub(crate) fn fit(width: u32, height: u32, max_width: f32, max_height: f32) -> (
     (w * scale, h * scale)
 }
 
+/// The size of an attached picture in the composer: low, so it sits above the text.
+const THUMB_WIDTH: f32 = 64.;
+const THUMB_HEIGHT: f32 = 40.;
+
 impl Shell {
     pub(super) fn attach_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
@@ -522,7 +526,7 @@ impl Shell {
             Command::New => self.start_draft(summary.key.harness.clone(), window, cx),
             Command::Model => {
                 self.cycle_model(&summary.key.harness, cx);
-                let model = self.model_choice(&summary.key.harness).unwrap_or(t("model.default"));
+                let model = self.model_choice(&summary.key.harness).unwrap_or_else(|| t("model.default").to_owned());
                 self.status = Some(format!("{}: {model}", t("cmd.model")));
             }
             Command::Permission => {
@@ -555,6 +559,7 @@ impl Shell {
         Some(
             div()
                 .flex()
+                .flex_none()
                 .flex_wrap()
                 .gap(px(6.))
                 .children(self.attachments.iter().enumerate().map(|(ix, attached)| {
@@ -590,11 +595,19 @@ impl Shell {
                             div()
                                 .id(("attached", ix))
                                 .relative()
-                                .size(px(56.))
+                                .flex_none()
+                                .w(px(THUMB_WIDTH))
+                                .h(px(THUMB_HEIGHT))
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(theme.border)
-                                .child(img(shown).size_full().rounded(px(7.)).object_fit(ObjectFit::Cover))
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .rounded(px(7.))
+                                        .child(img(shown).size_full().object_fit(ObjectFit::Cover)),
+                                )
                                 .child(remove)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.viewer = picture_of(&media, bytes.to_vec()).or_else(|| Some((image.clone(), 800, 600)));
@@ -605,6 +618,7 @@ impl Shell {
                         None => div()
                             .id(("attached", ix))
                             .relative()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap(px(6.))

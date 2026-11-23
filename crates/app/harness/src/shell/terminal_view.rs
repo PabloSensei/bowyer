@@ -14,7 +14,7 @@ use terminal::{SpawnSpec, TerminalSession};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{Shell, chip};
+use super::Shell;
 use super::term_grid::{self, CellMetrics, GridPanel, GridView, Position, Selection};
 use crate::i18n::t;
 use crate::launch;
@@ -228,7 +228,14 @@ impl Shell {
     /// Shows `line` in the terminal of the window, in place of the one there was. False when
     /// it could not start: the caller opens an external terminal instead.
     pub(super) fn show_in_terminal(&mut self, line: Option<launch::TerminalLine>, title: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(line) = line else { return false };
+        let Some(mut line) = line else { return false };
+        // Claude Code started in a terminal of a folder an IDE has open works with that IDE,
+        // as in the IDE's own terminal.
+        if let Some(cwd) = line.cwd.as_ref().and_then(|cwd| cwd.to_str())
+            && let Some(ide) = self.ide_of(cwd)
+        {
+            line.env.extend(ide.environment().into_iter().map(|(key, value)| (key.to_owned(), value)));
+        }
         let spec = TermSpec { command_line: line.line, cwd: line.cwd, env: line.env, title };
         let session = match start(&spec) {
             Ok(session) => session,
@@ -237,12 +244,10 @@ impl Shell {
                 return false;
             }
         };
-        if let Some(old) = self.terminal.take() {
-            old.read(cx).terminate();
-        }
         let view = cx.new(|cx| TermView::new(session, spec, cx));
         view.read(cx).focus_handle().focus(window, cx);
-        self.terminal = Some(view);
+        self.terminals.push(view);
+        self.active_terminal = self.terminals.len() - 1;
         self.terminal_shown = true;
         cx.notify();
         true
@@ -262,66 +267,137 @@ impl Shell {
         }
     }
 
-    /// Ctrl+` and the terminal button: back to the terminal there is, away from it, or a new
-    /// shell when there is none or its program ended.
+    /// Ctrl+` and the terminal button: shows the terminal panel or hides it; with no
+    /// terminal there, a shell in the folder of the open session.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let alive = self.terminal.as_ref().is_some_and(|view| !view.read(cx).is_closed());
-        if !alive {
+        if self.terminals.is_empty() {
             self.open_shell_terminal(window, cx);
             return;
         }
         self.terminal_shown = !self.terminal_shown;
         if self.terminal_shown {
-            if let Some(view) = &self.terminal {
-                view.read(cx).focus_handle().focus(window, cx);
-            }
+            self.focus_terminal(window, cx);
         } else {
             self.focus.focus(window, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn close_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.terminal.take() {
-            view.read(cx).terminate();
+    fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.terminals.get(self.active_terminal) {
+            view.read(cx).focus_handle().focus(window, cx);
         }
-        self.terminal_shown = false;
-        self.focus.focus(window, cx);
+    }
+
+    fn select_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.terminals.len() {
+            self.active_terminal = ix;
+            self.focus_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Closes one tab and ends its shell; the panel goes with the last one.
+    pub(super) fn close_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.terminals.len() {
+            return;
+        }
+        let view = self.terminals.remove(ix);
+        view.read(cx).terminate();
+        if self.active_terminal > ix || self.active_terminal >= self.terminals.len() {
+            self.active_terminal = self.active_terminal.saturating_sub(1);
+        }
+        if self.terminals.is_empty() {
+            self.terminal_shown = false;
+            self.focus.focus(window, cx);
+        } else {
+            self.focus_terminal(window, cx);
+        }
         cx.notify();
     }
 
-    /// The terminal when it is the one shown in the centre.
-    pub(super) fn shown_terminal(&self) -> Option<Entity<TermView>> {
-        self.terminal.clone().filter(|_| self.terminal_shown)
+    /// Whether a terminal has the keyboard: its programs get the keys the window would take.
+    pub(super) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
+        self.terminals.iter().any(|view| view.read(cx).focus_handle().is_focused(window))
     }
 
-    /// The terminal with its header: what runs, back to the conversation, close.
-    pub(super) fn render_terminal(&self, view: Entity<TermView>, cx: &mut Context<Self>) -> AnyElement {
+    /// The terminal panel under the conversation: a tab per terminal, a new shell, hide.
+    pub(super) fn render_terminal_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.terminal_shown || self.terminals.is_empty() {
+            return None;
+        }
         let theme = *cx.global::<Theme>();
-        let title = view.read(cx).title().to_owned();
-        let header = div()
+        let active = self.active_terminal.min(self.terminals.len() - 1);
+        let tabs = self.terminals.iter().enumerate().map(|(ix, view)| {
+            let term = view.read(cx);
+            let (title, ended) = (term.title().to_owned(), term.is_closed());
+            let selected = ix == active;
+            div()
+                .id(("terminal-tab", ix))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.))
+                .h(px(26.))
+                .pl(px(10.))
+                .pr(px(4.))
+                .rounded(px(6.))
+                .text_size(px(12.5))
+                .text_color(if selected { theme.text } else { theme.text_secondary })
+                .when(selected, |this| this.bg(theme.selection_inactive))
+                .when(!selected, |this| this.hover(|style| style.bg(theme.hover)))
+                .when(ended, |this| this.text_color(theme.text_muted))
+                .child(div().max_w(px(220.)).truncate().child(title))
+                .child(
+                    div()
+                        .id(("terminal-tab-close", ix))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(18.))
+                        .rounded(px(4.))
+                        .text_color(theme.text_muted)
+                        .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                        .child("×")
+                        .tooltip(|_, cx| tooltip(t("terminal.close"), None, cx))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.close_terminal(ix, window, cx);
+                        })),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.select_terminal(ix, window, cx)))
+        });
+        let strip = div()
+            .id("terminal-tabs")
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(8.))
-            .h(px(40.))
-            .px(px(12.))
+            .gap(px(4.))
+            .h(px(36.))
+            .px(px(8.))
             .border_b_1()
             .border_color(theme.border)
             .child(icon("toolwindows/terminal", &theme))
-            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(title))
-            .when(self.open.is_some(), |this| {
-                this.child(
-                    chip("terminal-back", t("terminal.back"), &theme)
-                        .tooltip(|_, cx| tooltip(t("terminal.back"), Some("Ctrl+`".into()), cx))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_terminal(window, cx))),
-                )
-            })
+            .child(div().id("terminal-tab-row").flex().items_center().gap(px(4.)).min_w_0().overflow_x_scroll().children(tabs))
             .child(
-                icon_button("terminal-close", "general/close", t("terminal.close"), None, &theme)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_terminal(window, cx))),
+                icon_button("terminal-new", "general/add", t("terminal.new"), None, &theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_shell_terminal(window, cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                icon_button("terminal-hide", "general/hide", t("terminal.hide"), Some("Ctrl+`".into()), &theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_terminal(window, cx))),
             );
-        div().flex().flex_col().size_full().child(header).child(div().flex_1().min_h_0().child(view)).into_any_element()
+        let view = self.terminals[active].clone();
+        Some(
+            island(&theme)
+                .flex_none()
+                .h(px(self.terminal_height))
+                .bg(theme.editor_bg)
+                .child(strip)
+                .child(div().flex_1().min_h_0().child(view))
+                .into_any_element(),
+        )
     }
 }
 

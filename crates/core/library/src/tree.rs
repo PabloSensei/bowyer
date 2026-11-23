@@ -42,14 +42,24 @@ impl SortOrder {
 pub enum Grouping {
     None,
     /// By working folder.
+    Project,
+    Environment,
+    Harness,
+    /// By environment, inside it by harness, inside that by project.
     #[default]
+    Nested,
+}
+
+/// One level of automatic groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
     Project,
     Environment,
     Harness,
 }
 
 impl Grouping {
-    pub const ALL: [Grouping; 4] = [Self::None, Self::Project, Self::Environment, Self::Harness];
+    pub const ALL: [Grouping; 5] = [Self::None, Self::Project, Self::Environment, Self::Harness, Self::Nested];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -57,6 +67,18 @@ impl Grouping {
             Self::Project => "project",
             Self::Environment => "environment",
             Self::Harness => "harness",
+            Self::Nested => "nested",
+        }
+    }
+
+    /// The levels of groups, outermost first.
+    fn levels(self) -> &'static [Level] {
+        match self {
+            Self::None => &[],
+            Self::Project => &[Level::Project],
+            Self::Environment => &[Level::Environment],
+            Self::Harness => &[Level::Harness],
+            Self::Nested => &[Level::Environment, Level::Harness, Level::Project],
         }
     }
 
@@ -90,6 +112,17 @@ pub struct TreeNode {
     /// The newest session inside, for sorting groups.
     pub updated_ms: i64,
     pub children: Vec<TreeNode>,
+    /// Where a new session of a project group starts: its environment, its folder and the
+    /// harness of its newest session (the group's own under a harness group).
+    pub start: Option<SessionStart>,
+}
+
+/// The place of a new session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionStart {
+    pub env: model::EnvId,
+    pub harness: model::HarnessKind,
+    pub cwd: String,
 }
 
 impl TreeNode {
@@ -187,6 +220,7 @@ fn cut_long_lists(nodes: &mut [TreeNode], show_all: &HashSet<String>) {
                 pinned: false,
                 updated_ms: 0,
                 children: Vec::new(),
+                start: None,
             });
         }
     }
@@ -204,6 +238,7 @@ fn session_node(summary: &SessionSummary, placement: Option<&Placement>, collaps
         pinned: placement.is_some_and(|p| p.pinned),
         updated_ms: summary.updated_ms,
         children: Vec::new(),
+        start: None,
     };
     node.collapsed = !collapsed.contains(&node.collapse_id());
     node
@@ -235,6 +270,35 @@ fn sort_sessions(nodes: &mut [TreeNode], order: SortOrder, summaries: &HashMap<&
             SortOrder::Title => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
         })
     });
+}
+
+/// Sessions started in separate sessions by another, with the parent they hang under: the
+/// session on the same host that started one with this title, the newest one begun before
+/// it. `started` lists each session that started others with the titles it gave.
+pub fn link_started(summaries: &[SessionSummary], started: &[(SessionKey, String)]) -> Vec<SessionSummary> {
+    let by_key: HashMap<&SessionKey, &SessionSummary> = summaries.iter().map(|s| (&s.key, s)).collect();
+    let mut parents: HashMap<(&str, &str), Vec<&SessionSummary>> = HashMap::new();
+    for (parent, title) in started {
+        if let Some(parent) = by_key.get(parent) {
+            parents.entry((parent.key.env.0.as_str(), title.trim())).or_default().push(parent);
+        }
+    }
+    summaries
+        .iter()
+        .map(|summary| {
+            let mut summary = summary.clone();
+            if summary.parent.is_none()
+                && let Some(candidates) = parents.get(&(summary.key.env.0.as_str(), summary.title.trim()))
+                && let Some(parent) = candidates
+                    .iter()
+                    .filter(|parent| parent.key != summary.key && parent.key.harness == summary.key.harness && parent.created_ms <= summary.created_ms)
+                    .max_by_key(|parent| parent.created_ms)
+            {
+                summary.parent = Some(parent.key.id.clone());
+            }
+            summary
+        })
+        .collect()
 }
 
 /// The id of the group of pinned sessions, always first.
@@ -275,6 +339,11 @@ pub fn build_tree(
     let mut children: HashMap<SessionKey, Vec<&SessionSummary>> = HashMap::new();
     let mut roots: Vec<&SessionSummary> = Vec::new();
     for summary in &visible {
+        // A pinned session is in the group on top, wherever it was: unpinned, it goes back.
+        if placements.get(&summary.key).is_some_and(|p| p.pinned) {
+            roots.push(summary);
+            continue;
+        }
         match &summary.parent {
             Some(parent) if ids.contains(&(&summary.key.env, &summary.key.harness, parent.as_str())) => {
                 let parent = SessionKey { env: summary.key.env.clone(), harness: summary.key.harness.clone(), id: parent.clone() };
@@ -303,10 +372,12 @@ pub fn build_tree(
     let mut pinned: Vec<TreeNode> = Vec::new();
     for summary in roots {
         let placement = placements.get(&summary.key);
+        if placement.is_some_and(|p| p.pinned) {
+            pinned.push(make(summary));
+            continue;
+        }
         match placement.and_then(|p| p.folder).filter(|id| folder_ids.contains(id)) {
             Some(folder) => in_folder.entry(folder).or_default().push(make(summary)),
-            // A pinned session outside the user's folders goes to the group on top.
-            None if placement.is_some_and(|p| p.pinned) => pinned.push(make(summary)),
             None => unfiled.push(summary),
         }
     }
@@ -335,6 +406,7 @@ pub fn build_tree(
                     pinned: false,
                     updated_ms,
                     children: kids,
+                    start: None,
                 }
             })
             .collect()
@@ -351,57 +423,87 @@ pub fn build_tree(
             pinned: false,
             updated_ms: pinned.iter().map(|s| s.updated_ms).max().unwrap_or(0),
             children: pinned,
+            start: None,
         };
         node.collapsed = collapsed.contains(&node.collapse_id());
         tree.push(node);
     }
     tree.extend(folder_nodes(None, folders, &mut in_folder, &sort));
 
-    let loose: Vec<TreeNode> = if grouping == Grouping::None {
-        let mut loose: Vec<TreeNode> = unfiled.iter().map(|s| make(s)).collect();
-        sort(&mut loose);
-        loose
-    } else {
-        let mut groups: HashMap<String, (String, Option<String>, Vec<TreeNode>)> = HashMap::new();
-        for summary in unfiled {
-            let (id, label, detail) = match grouping {
-                Grouping::Project => {
-                    // A worktree belongs to its repository's group.
-                    let cwd = summary.cwd.clone().unwrap_or_default();
-                    let root = project_root(&cwd).0.to_owned();
-                    let label = if root.is_empty() { "No folder".to_owned() } else { project_label(&root) };
-                    (format!("{}|{}", summary.key.env, folder_key(&root)), label, Some(root).filter(|c| !c.is_empty()))
-                }
-                Grouping::Environment => (summary.key.env.0.clone(), summary.key.env.0.clone(), None),
-                Grouping::Harness => (summary.key.harness.id().to_owned(), summary.key.harness.label().to_owned(), None),
-                Grouping::None => unreachable!(),
-            };
-            groups.entry(id).or_insert_with(|| (label, detail, Vec::new())).2.push(make(summary));
+    /// The group of `summary` at `level` inside the group `parent`: its id, label and detail.
+    /// A group of the outermost level keeps the id it had before levels nested, so the
+    /// groups the user closed stay closed.
+    fn group_of(summary: &SessionSummary, level: Level, parent: Option<&str>) -> (String, String, Option<String>) {
+        let (id, label, detail) = match level {
+            Level::Project => {
+                // A worktree belongs to its repository's group.
+                let cwd = summary.cwd.clone().unwrap_or_default();
+                let root = project_root(&cwd).0.to_owned();
+                let label = if root.is_empty() { "No folder".to_owned() } else { project_label(&root) };
+                (format!("{}|{}", summary.key.env, folder_key(&root)), label, Some(root).filter(|c| !c.is_empty()))
+            }
+            // The window names the local environment in the user's language.
+            Level::Environment => (summary.key.env.0.clone(), summary.key.env.ssh_host().unwrap_or(&summary.key.env.0).to_owned(), None),
+            Level::Harness => (summary.key.harness.id().to_owned(), summary.key.harness.label().to_owned(), None),
+        };
+        let id = match parent {
+            Some(parent) => format!("{parent}>{id}"),
+            None => id,
+        };
+        (id, label, detail)
+    }
+    fn group_nodes(
+        sessions: Vec<&SessionSummary>,
+        levels: &[Level],
+        parent: Option<&str>,
+        order: SortOrder,
+        collapsed: &HashSet<String>,
+        make: &dyn Fn(&SessionSummary) -> TreeNode,
+        sort: &dyn Fn(&mut Vec<TreeNode>),
+    ) -> Vec<TreeNode> {
+        let Some((&level, inner)) = levels.split_first() else {
+            let mut nodes: Vec<TreeNode> = sessions.into_iter().map(make).collect();
+            sort(&mut nodes);
+            return nodes;
+        };
+        let mut groups: HashMap<String, (String, Option<String>, Vec<&SessionSummary>)> = HashMap::new();
+        for summary in sessions {
+            let (id, label, detail) = group_of(summary, level, parent);
+            groups.entry(id).or_insert_with(|| (label, detail, Vec::new())).2.push(summary);
         }
-        let mut group_nodes: Vec<TreeNode> = groups
+        let mut nodes: Vec<TreeNode> = groups
             .into_iter()
-            .map(|(id, (label, detail, mut sessions))| {
-                sort(&mut sessions);
+            .map(|(id, (label, detail, sessions))| {
+                // A project with a folder starts sessions there, in the harness used last.
+                let start = match (level, &detail) {
+                    (Level::Project, Some(cwd)) => sessions
+                        .iter()
+                        .max_by_key(|s| s.updated_ms)
+                        .map(|newest| SessionStart { env: newest.key.env.clone(), harness: newest.key.harness.clone(), cwd: cwd.clone() }),
+                    _ => None,
+                };
+                let children = group_nodes(sessions, inner, Some(&id), order, collapsed, make, sort);
                 let mut node = TreeNode {
                     kind: TreeNodeKind::Group(id),
                     label,
                     detail,
                     collapsed: false,
                     pinned: false,
-                    updated_ms: sessions.iter().map(|s| s.updated_ms).max().unwrap_or(0),
-                    children: sessions,
+                    updated_ms: children.iter().map(|s| s.updated_ms).max().unwrap_or(0),
+                    children,
+                    start,
                 };
                 node.collapsed = collapsed.contains(&node.collapse_id());
                 node
             })
             .collect();
-        group_nodes.sort_by(|a, b| match order {
+        nodes.sort_by(|a, b| match order {
             SortOrder::Title => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
             _ => b.updated_ms.cmp(&a.updated_ms),
         });
-        group_nodes
-    };
-    tree.extend(loose);
+        nodes
+    }
+    tree.extend(group_nodes(unfiled, grouping.levels(), None, order, collapsed, &make, &sort));
     cut_long_lists(&mut tree, show_all);
     tree
 }
@@ -442,6 +544,47 @@ mod tests {
         assert_eq!(labels, vec!["Important", "api", "web"]);
         assert_eq!(tree[1].children[0].label, "New api work");
         assert_eq!(tree[0].session_count(), 1);
+    }
+
+    #[test]
+    fn nested_groups_go_environment_harness_project() {
+        let mut remote = summary("r", "On the VM", "/srv/api", 9);
+        remote.key.env = model::EnvId::ssh("vm");
+        let mut other_harness = summary("o", "OpenCode work", "/w/api", 4);
+        other_harness.key.harness = model::HarnessKind::OpenCode;
+        let summaries = vec![summary("a", "Api", "/w/api", 3), summary("b", "Web", "/w/web", 5), other_harness, remote];
+        let tree = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Nested, &HashSet::new(), &HashSet::new());
+        let labels = |nodes: &[TreeNode]| nodes.iter().map(|n| n.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&tree), ["vm", "local"], "environments, the newest first");
+        let local = &tree[1];
+        assert_eq!(local.kind, TreeNodeKind::Group("local".into()), "the outer id is the one of the environment grouping");
+        let harnesses = &local.children;
+        assert_eq!(harnesses.len(), 2);
+        let claude = harnesses.iter().find(|h| h.children.len() == 2).expect("two projects of one harness");
+        assert_eq!(labels(&claude.children), ["web", "api"]);
+        assert_eq!(claude.children[0].children[0].label, "Web");
+        assert_eq!(local.session_count(), 3);
+        // A project starts new sessions in its folder, with its environment and harness.
+        let start = claude.children[0].start.clone().expect("a project has a start");
+        assert_eq!((start.env.0.as_str(), start.cwd.as_str()), ("local", "/w/web"));
+        assert_eq!(start.harness, summaries[1].key.harness);
+        let opencode = harnesses.iter().find(|h| h.children.len() == 1).unwrap();
+        assert_eq!(opencode.children[0].start.as_ref().map(|s| s.harness.clone()), Some(model::HarnessKind::OpenCode));
+        assert!(local.start.is_none() && claude.start.is_none(), "only projects start sessions");
+        assert_eq!(tree[0].children[0].children[0].start.as_ref().map(|s| s.env.0.as_str()), Some("ssh:vm"));
+        // Every group has an id of its own: the same project under two harnesses too.
+        let mut ids = HashSet::new();
+        for (_, node) in flatten_visible(&tree) {
+            if let TreeNodeKind::Group(id) = &node.kind {
+                assert!(ids.insert(id.clone()), "{id} twice");
+            }
+        }
+        assert_eq!(ids.len(), 2 + 3 + 4);
+        // Closing a harness group hides its projects.
+        let closed: HashSet<String> = [claude.collapse_id()].into();
+        let tree = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Nested, &closed, &HashSet::new());
+        // 2 + 3 + 4 groups and 4 sessions, less its 2 projects and their 2 sessions.
+        assert_eq!(flatten_visible(&tree).len(), 2 + 3 + 4 + 4 - 2 - 2);
     }
 
     #[test]
@@ -519,6 +662,12 @@ mod tests {
         let tree = build_tree(&summaries, &folders, &placements, SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
         assert_eq!(tree[0].label, "Kept");
         assert_eq!(tree[0].children[0].label, "T-0001");
+        // Pinned in a folder, it is on top; unpinned, it is back in the folder.
+        placements.insert(summaries[2].key.clone(), Placement { folder: Some(7), pinned: true, ..Default::default() });
+        let tree = build_tree(&summaries, &folders, &placements, SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
+        assert_eq!(tree[0].kind, TreeNodeKind::Group(PINNED_GROUP.into()));
+        assert_eq!(tree[0].children[0].label, "T-0001");
+        assert!(tree[1].children.is_empty(), "the folder keeps no copy");
     }
 
     #[test]
@@ -535,5 +684,25 @@ mod tests {
         // Twelve rows are shown whole: a "Show 2 more" row would save nothing.
         let tree = build_tree(&summaries[..12], &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
         assert_eq!(tree[0].children.len(), 12);
+    }
+
+    #[test]
+    fn a_session_started_from_another_hangs_under_it() {
+        let parent = summary("p", "Rust harness", "/w/h", 10);
+        let mut child = summary("c", "Measure the memory", "/w/h", 20);
+        child.created_ms = 20;
+        let mut early = summary("e", "Measure the memory", "/w/h", 5);
+        early.created_ms = 5;
+        let other = summary("o", "Something else", "/w/h", 30);
+        let mut parent = parent;
+        parent.created_ms = 10;
+        let started = vec![(parent.key.clone(), "Measure the memory".to_owned())];
+        let linked = link_started(&[parent.clone(), child, early, other], &started);
+        assert_eq!(linked[1].parent.as_deref(), Some("p"));
+        assert_eq!(linked[2].parent, None, "begun before its namesake's parent");
+        assert_eq!(linked[3].parent, None);
+        let tree = build_tree(&linked, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
+        let parent_node = tree[0].children.iter().find(|n| n.label == "Rust harness").unwrap();
+        assert_eq!(parent_node.children[0].label, "Measure the memory");
     }
 }

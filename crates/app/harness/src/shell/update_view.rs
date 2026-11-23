@@ -131,7 +131,11 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => cx.quit(),
+                Ok(()) => {
+                    if this.may_quit(cx) {
+                        cx.quit();
+                    }
+                }
                 Err(error) => {
                     log::warn!("update install: {error}");
                     this.updates.installing = false;

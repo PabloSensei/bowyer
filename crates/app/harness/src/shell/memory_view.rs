@@ -9,7 +9,14 @@ use ui_kit::*;
 
 use super::{MONO, Shell, switch};
 use crate::i18n::t;
-use crate::launch;
+use crate::{launch, rerank};
+
+/// Sessions changed within this many days get a digest by a model.
+const DIGEST_DAYS: i64 = 30;
+/// At most this many in one run.
+const DIGEST_LIMIT: usize = 300;
+/// One run at a time.
+static DIGESTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The command that adds the memory server to a harness for every project, or `None` for
 /// a harness without one.
@@ -26,6 +33,82 @@ pub(super) fn connect_command(harness: &HarnessKind) -> Option<String> {
 }
 
 impl Shell {
+    /// The model chosen for search writes a digest of each recent session of this
+    /// computer that lacks one: problem, cause, fix and words to find it by. One session at
+    /// a time in the background, with the count in the status line.
+    pub(super) fn build_digests(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        if DIGESTING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let due = mcp::sessions_to_digest(&self.lib(), super::now_ms(), DIGEST_DAYS, DIGEST_LIMIT);
+        if due.is_empty() {
+            DIGESTING.store(false, Ordering::SeqCst);
+            self.status = Some(t("memory.digests_none").to_owned());
+            cx.notify();
+            return;
+        }
+        let total = due.len();
+        let library = self.library.clone();
+        let cache = self.cache_dir.join("remote");
+        let ranker = self.ranker.clone();
+        let label = ranker.label();
+        self.status = Some(format!("{} 0/{total}", t("memory.digesting")));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (mut done, mut failed, mut cost, mut last_error) = (0, 0, 0.0, None);
+            for summary in due {
+                let (library, cache, ranker) = (library.clone(), cache.clone(), ranker.clone());
+                let result = cx
+                    .background_spawn(async move {
+                        let env = envs::LocalEnvironment::new();
+                        let source = history::source_for(&summary.key.harness).ok_or("no reader for this harness")?;
+                        let transcript = source.load(&env, &summary, &cache).map_err(|e| e.to_string())?;
+                        let model = rerank::DigestModel::new(ranker);
+                        let answer = mcp::digest::Summarizer::summarize(&model, &mcp::digest::prompt(&summary, &transcript));
+                        let cost = model.cost.get();
+                        let answer = answer?;
+                        let replay = Replay(answer);
+                        let library = library.lock().map_err(|_| "the library is locked".to_owned())?;
+                        mcp::store_model_digest(&library, &summary, &transcript, &replay)?;
+                        Ok::<f64, String>(cost)
+                    })
+                    .await;
+                match result {
+                    Ok(spent) => {
+                        done += 1;
+                        cost += spent;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        last_error = Some(error);
+                    }
+                }
+                let progress = format!("{} {}/{total}", t("memory.digesting"), done + failed);
+                if this.update(cx, |this, cx| {
+                    this.status = Some(progress);
+                    cx.notify();
+                })
+                .is_err()
+                {
+                    break;
+                }
+            }
+            DIGESTING.store(false, Ordering::SeqCst);
+            let cost = if cost > 0.0 { format!(" · ${cost:.4}") } else { String::new() };
+            let mut status = format!("{} {done}/{total} ({label}{cost})", t("memory.digests_done"));
+            if let Some(error) = last_error {
+                status.push_str(&format!("; {} {failed}: {}", t("memory.digests_failed"), model::shorten(&error, 160)));
+            }
+            this.update(cx, |this, cx| {
+                this.status = Some(status);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn memory_enabled(&self) -> bool {
         self.lib().setting("memory.enabled").is_none_or(|value| value != "false")
     }
@@ -157,9 +240,7 @@ impl Shell {
         if notes.is_empty() {
             return None;
         }
-        Some(
-            super::section(t("memory.notes"), &theme)
-                .child(div().flex().flex_col().gap(px(4.)).children(notes.into_iter().take(30).map(|note| {
+        let body = div().flex().flex_col().gap(px(4.)).children(notes.into_iter().take(30).map(|note| {
                     let id = note.id;
                     div()
                         .id(("note", id as usize))
@@ -186,9 +267,18 @@ impl Shell {
                                     cx.notify();
                                 })),
                         )
-                })))
-                .into_any_element(),
-        )
+                }));
+        Some(self.fold("notes", t("memory.notes"), None, body, cx))
+    }
+}
+
+/// An answer the model already gave, handed to [`mcp::store_model_digest`] so that the
+/// library lock is held only while it stores, not while the model thinks.
+struct Replay(String);
+
+impl mcp::digest::Summarizer for Replay {
+    fn summarize(&self, _: &str) -> Result<String, String> {
+        Ok(self.0.clone())
     }
 }
 

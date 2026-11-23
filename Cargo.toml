@@ -4,7 +4,7 @@ members = ["crates/*/*", "tools/test-support"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -28,6 +28,7 @@ ruzstd = "0.9"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tiktoken-rs = { version = "0.12", default-features = false }
 gpui-kit = "=0.9.0"
 gpui_linux = { package = "gpui-pre-linux", version = "=0.3.11" }
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.11" }

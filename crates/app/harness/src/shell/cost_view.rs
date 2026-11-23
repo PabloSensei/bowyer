@@ -5,7 +5,7 @@ use model::pricing::{self, CacheState};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{MONO, Shell, now_ms, section};
+use super::{MONO, Shell, now_ms, section_body};
 use crate::i18n::t;
 
 fn money(usd: f64) -> String {
@@ -36,7 +36,7 @@ impl Shell {
         let mut reported = open.cost_usd;
         let mut last_call = open.last_call_ms;
         let mut context = open.breakdown.total;
-        let live_turn = self.live.as_ref().filter(|live| !live.finished).and_then(|live| live.turn.as_ref());
+        let live_turn = self.live().filter(|live| !live.finished).and_then(|live| live.turn.as_ref());
         if let Some(turn) = live_turn {
             for (bucket, usage) in &turn.usage_by_model {
                 match buckets.iter_mut().find(|(name, _)| name == bucket) {
@@ -136,9 +136,7 @@ impl Shell {
             self.repaint_after(std::time::Duration::from_secs(20), cx);
         }
 
-        section(t("cost.session"), &theme)
-            .child(headline)
-            .child(div().flex().flex_col().gap(px(6.)).children(rows))
-            .into_any_element()
+        let body = section_body().child(headline).child(div().flex().flex_col().gap(px(6.)).children(rows));
+        self.fold("cost", t("cost.session"), None, body, cx)
     }
 }

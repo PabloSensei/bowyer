@@ -26,11 +26,14 @@ use serde_json::{Value, json};
 
 mod acp;
 mod claude_ask;
+mod ide;
 mod kill;
 mod resolve;
+pub mod usage;
 
 pub use acp::{Answer, AskQuestion, PermissionAsk};
 
+pub use ide::{IdeLink, claude_config_home, find_ide, ide_for};
 pub use resolve::resolve_program;
 
 /// How a headless turn treats actions that would ask for permission.
@@ -66,11 +69,19 @@ pub struct TurnSpec {
     pub prompt: String,
     /// `haiku`, `opencode-go/deepseek-v4.1-flash`; `None` keeps the harness default.
     pub model: Option<String>,
+    /// How hard the model thinks: `low` … `max` for Claude Code, `minimal` … `high` for
+    /// Codex; `None` keeps the harness default. Other harnesses take none.
+    pub effort: Option<String>,
     pub permission: Permission,
     /// The host the turn runs on; `None` is this computer.
     pub ssh: Option<envs::SshEnvironment>,
     /// Pictures and files sent with the prompt.
     pub attachments: Vec<Attachment>,
+    /// The IDE that has the folder open, for Claude Code on this computer: see [`ide`].
+    pub ide: Option<IdeLink>,
+    /// A failed turn of the Claude Code session to leave out: the line the session goes on
+    /// from and the prompt dropped (`--resume-session-at`, `--resume-drops-turn`).
+    pub drop_turn: Option<(String, String)>,
 }
 
 /// A file sent with a prompt.
@@ -203,9 +214,16 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
             );
             if let Some(session) = &spec.session {
                 args.extend(["--resume".into(), session.clone()]);
+                // Claude Code checks that only the dropped turn goes, and refuses otherwise.
+                if let Some((kept, prompt)) = &spec.drop_turn {
+                    args.extend(["--resume-session-at".into(), kept.clone(), "--resume-drops-turn".into(), prompt.clone()]);
+                }
             }
             if let Some(model) = &spec.model {
                 args.extend(["--model".into(), model.clone()]);
+            }
+            if let Some(effort) = &spec.effort {
+                args.extend(["--effort".into(), effort.clone()]);
             }
             match spec.permission {
                 Permission::Settings => {}
@@ -236,6 +254,9 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
             args.extend(["--json", "--skip-git-repo-check"].map(String::from));
             if let Some(model) = &spec.model {
                 args.extend(["--model".into(), model.clone()]);
+            }
+            if let Some(effort) = &spec.effort {
+                args.extend(["-c".into(), format!("model_reasoning_effort={effort}")]);
             }
             match spec.permission {
                 Permission::Settings => {}
@@ -390,6 +411,11 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
             let (resolved, prefix) = resolve_program(&program).unwrap_or_else(|| (PathBuf::from(&program), Vec::new()));
             let mut command = Command::new(&resolved);
             command.args(&prefix).args(&args).current_dir(&spec.cwd);
+            if spec.harness == HarnessKind::Claude
+                && let Some(ide) = &spec.ide
+            {
+                command.envs(ide.environment());
+            }
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -856,9 +882,12 @@ mod tests {
             cwd: ".".into(),
             prompt: "say \"hi\" & exit".into(),
             model: Some("haiku".into()),
+            effort: None,
             permission: Permission::AcceptEdits,
             ssh: None,
             attachments: Vec::new(),
+            ide: None,
+            drop_turn: None,
         }
     }
 
@@ -1114,6 +1143,22 @@ mod tests {
         let (_, args) = command_line(&codex).unwrap();
         assert_eq!(&args[..4], ["exec", "--image", "/w/shot.png", "--json"], "a new session: before any flag, never next to the -");
         assert_eq!(args.last().unwrap(), "-");
+        codex.effort = Some("high".into());
+        let (_, args) = command_line(&codex).unwrap();
+        assert!(args.windows(2).any(|w| w == ["-c", "model_reasoning_effort=high"]), "{args:?}");
+    }
+
+    #[test]
+    fn claude_takes_the_effort_and_others_ignore_it() {
+        let mut claude = spec(HarnessKind::Claude);
+        let (_, args) = command_line(&claude).unwrap();
+        assert!(!args.contains(&"--effort".to_owned()), "no effort, the harness default");
+        claude.effort = Some("xhigh".into());
+        let (_, args) = command_line(&claude).unwrap();
+        assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]), "{args:?}");
+        let mut opencode = spec(HarnessKind::OpenCode);
+        opencode.effort = Some("high".into());
+        assert_eq!(command_line(&opencode).unwrap().1, ["acp"]);
     }
 
     #[test]
@@ -1127,6 +1172,17 @@ mod tests {
         assert_eq!(payload["message"]["content"], "say \"hi\" & exit");
         let (program, args) = command_line(&spec(HarnessKind::OpenCode)).unwrap();
         assert_eq!((program.as_str(), args), ("opencode", vec!["acp".to_owned()]), "OpenCode takes everything over ACP");
+    }
+
+    #[test]
+    fn a_dropped_turn_resumes_before_its_prompt() {
+        let mut dropping = spec(HarnessKind::Claude);
+        dropping.drop_turn = Some(("kept-line".into(), "failed-prompt".into()));
+        let (_, args) = command_line(&dropping).unwrap();
+        assert!(args.windows(6).any(|w| w == ["--resume", "abc", "--resume-session-at", "kept-line", "--resume-drops-turn", "failed-prompt"]));
+        dropping.session = None;
+        let (_, args) = command_line(&dropping).unwrap();
+        assert!(!args.iter().any(|arg| arg.starts_with("--resume")), "a new session has nothing to drop");
     }
 
     #[test]

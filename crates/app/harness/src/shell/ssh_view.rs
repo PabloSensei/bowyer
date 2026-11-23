@@ -30,6 +30,12 @@ pub(super) struct SshForm {
     pub unknown_keys: Option<HostKeys>,
     /// Whether those keys take the place of a changed key in Bowyer's own file.
     pub key_changed: bool,
+    /// The keys of `ways` that have a passphrase, found after the form opens: choosing one
+    /// asks for its passphrase, kept like a password.
+    pub locked_keys: Vec<PathBuf>,
+    /// Whether the list of ways is open, and the button it opens under.
+    pub ways_open: bool,
+    pub ways_anchor: MenuAnchor,
 }
 
 /// How a new host signs in.
@@ -44,9 +50,45 @@ pub(super) enum SignIn {
 }
 
 impl SshForm {
-    fn uses_password(&self) -> bool {
-        self.ways.get(self.way) == Some(&SignIn::Password)
+    /// The chosen way needs a secret typed: a password, or the passphrase of a locked key.
+    fn uses_secret(&self) -> bool {
+        match self.ways.get(self.way) {
+            Some(SignIn::Password) => true,
+            Some(SignIn::Key(key)) => self.locked_keys.contains(key),
+            _ => false,
+        }
     }
+
+    /// How a way reads in the chip and the list: a locked key says it asks a passphrase.
+    fn way_label(&self, way: &SignIn) -> String {
+        match way {
+            SignIn::Key(key) if self.locked_keys.contains(key) => format!("{}: {} · {}", t("ssh.key"), file_name(key), t("ssh.with_passphrase")),
+            SignIn::Key(key) => format!("{}: {}", t("ssh.key"), file_name(key)),
+            SignIn::Password => t("ssh.password_auth").to_owned(),
+            SignIn::Config => t("ssh.key_default").to_owned(),
+        }
+    }
+
+    /// Picks a way from the list.
+    fn choose(&mut self, way: usize) {
+        self.way = way.min(self.ways.len().saturating_sub(1));
+        self.ways_open = false;
+        self.in_password = self.uses_secret();
+        self.unknown_keys = None;
+        self.message = None;
+    }
+
+    /// The locked key the secret is the passphrase of.
+    fn locked_key(&self) -> Option<&PathBuf> {
+        match self.ways.get(self.way) {
+            Some(SignIn::Key(key)) if self.locked_keys.contains(key) => Some(key),
+            _ => None,
+        }
+    }
+}
+
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Private keys in `~/.ssh`: files with a `.pub` sibling.
@@ -75,7 +117,27 @@ impl Shell {
             if envs::secret::supported() {
                 ways.push(SignIn::Password);
             }
-            ways.extend(private_keys().into_iter().map(SignIn::Key));
+            let keys = private_keys();
+            ways.extend(keys.iter().cloned().map(SignIn::Key));
+            // Which keys have a passphrase, found in the background (`ssh-keygen` takes a
+            // moment per locked key); only with a store to keep the passphrase in.
+            if envs::secret::supported() && !keys.is_empty() {
+                let task = cx.background_spawn(async move {
+                    keys.into_iter().filter(|key| envs::key_has_passphrase(std::path::Path::new("ssh"), key)).collect::<Vec<_>>()
+                });
+                cx.spawn(async move |this, cx| {
+                    let locked = task.await;
+                    this.update(cx, |this, cx| {
+                        if let Some(form) = &mut this.ssh_form {
+                            form.locked_keys = locked;
+                            form.in_password = form.in_password && form.uses_secret();
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             self.ssh_form = Some(SshForm {
                 host: TextField::from_text(""),
                 password: TextField::from_text(""),
@@ -86,6 +148,9 @@ impl Shell {
                 message: None,
                 unknown_keys: None,
                 key_changed: false,
+                locked_keys: Vec::new(),
+                ways_open: false,
+                ways_anchor: MenuAnchor::new(),
             });
             self.ssh_focus.focus(window, cx);
         }
@@ -118,17 +183,20 @@ impl Shell {
     fn ssh_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "enter" => self.connect_ssh(cx),
-            "escape" => self.ssh_form = None,
+            "escape" => match &mut self.ssh_form {
+                Some(form) if form.ways_open => form.ways_open = false,
+                _ => self.ssh_form = None,
+            },
             "tab" => {
                 if let Some(form) = &mut self.ssh_form
-                    && form.uses_password()
+                    && form.uses_secret()
                 {
                     form.in_password = !form.in_password;
                 }
             }
             _ => {
                 let Some(form) = &mut self.ssh_form else { return };
-                if form.in_password && form.uses_password() {
+                if form.in_password && form.uses_secret() {
                     // A password never leaves its field through the clipboard.
                     let modifiers = event.keystroke.modifiers;
                     let copy = (modifiers.control || modifiers.platform) && matches!(event.keystroke.key.as_str(), "c" | "x");
@@ -151,10 +219,15 @@ impl Shell {
         if host.is_empty() || form.busy {
             return;
         }
-        let password = form.uses_password().then(|| form.password.text.clone());
+        let password = form.uses_secret().then(|| form.password.text.clone());
+        let locked_key = form.locked_key().map(|key| file_name(key));
         if password.as_deref() == Some("") {
             form.in_password = true;
-            form.message = Some((false, t("ssh.password_needed").to_owned()));
+            let needed = match &locked_key {
+                Some(key) => t("ssh.passphrase_needed").replace("{key}", key),
+                None => t("ssh.password_needed").to_owned(),
+            };
+            form.message = Some((false, needed));
             cx.notify();
             return;
         }
@@ -246,10 +319,20 @@ impl Shell {
                                     // would be cut before the file it names.
                                     let text = match envs::changed_host_key_files(&error).first() {
                                         Some(file) => t("ssh.changed_key_elsewhere").replace("{file}", file),
+                                        // A locked key the host turned away: a wrong
+                                        // passphrase, or a key the host does not know.
+                                        None if locked_key.is_some() && envs::refused_sign_in(&error).is_some() => t("ssh.passphrase_refused")
+                                            .replace("{host}", &host)
+                                            .replace("{key}", locked_key.as_deref().unwrap_or_default()),
                                         // The host's sshd lets no password in: no password
                                         // typed here would help.
                                         None if ssh.password && envs::host_takes_no_password(&error) => {
                                             t("ssh.password_off").replace("{host}", &host)
+                                        }
+                                        // A key from ssh config or the agent the host turned
+                                        // away: one with a passphrase cannot answer here.
+                                        None if !ssh.password && envs::host_takes_no_password(&error) => {
+                                            t("ssh.keys_refused").replace("{host}", &host)
                                         }
                                         None => model::shorten(&error, 240),
                                     };
@@ -267,18 +350,66 @@ impl Shell {
         cx.notify();
     }
 
+    /// The list of ways to sign in, under the button that opens it.
+    fn render_ways_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let form = self.ssh_form.as_ref().filter(|form| form.ways_open)?;
+        let bounds = form.ways_anchor.bounds()?;
+        let rows: Vec<(usize, String, bool)> = form.ways.iter().enumerate().map(|(ix, way)| (ix, form.way_label(way), ix == form.way)).collect();
+        let list = div()
+            .id("ssh-ways")
+            .min_w(bounds.size.width.max(px(200.)))
+            .max_w(px(420.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .p(px(4.))
+            .rounded(px(9.))
+            .bg(theme.popup_bg)
+            .border_1()
+            .border_color(theme.popup_border)
+            .shadow(popup_shadow(&theme))
+            .text_size(px(12.5))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if let Some(form) = &mut this.ssh_form {
+                    form.ways_open = false;
+                }
+                cx.notify();
+            }))
+            .children(rows.into_iter().map(|(ix, label, chosen)| {
+                div()
+                    .id(("ssh-way", ix))
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .truncate()
+                    .when(chosen, |this| this.bg(theme.selection).text_color(theme.text))
+                    .when(!chosen, |this| this.text_color(theme.text_secondary).hover(|style| style.bg(theme.selection_hover)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        if let Some(form) = &mut this.ssh_form {
+                            form.choose(ix);
+                        }
+                        this.ssh_focus.focus(window, cx);
+                        cx.notify();
+                    }))
+            }));
+        let at = point(bounds.left(), bounds.bottom() + px(4.));
+        Some(deferred(anchored().position(at).snap_to_window_with_margin(px(8.)).child(list)).with_priority(2).into_any_element())
+    }
+
     pub(super) fn render_ssh_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.global::<Theme>();
         let focused = self.ssh_focus.is_focused(window);
         let form = self.ssh_form.as_ref()?;
-        let uses_password = form.uses_password();
-        let key_label = match form.ways.get(form.way) {
-            Some(SignIn::Key(key)) => {
-                format!("{}: {}", t("ssh.key"), key.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
-            }
-            Some(SignIn::Password) => t("ssh.password_auth").to_owned(),
-            _ => t("ssh.key_default").to_owned(),
-        };
+        let uses_password = form.uses_secret();
+        let placeholder = if form.locked_key().is_some() { t("ssh.passphrase") } else { t("ssh.password") };
+        let key_label = form.ways.get(form.way).map(|way| form.way_label(way)).unwrap_or_default();
+        let anchor = form.ways_anchor.clone();
+        let ways_menu = self.render_ways_menu(cx);
+        let form = self.ssh_form.as_ref()?;
         let in_host = focused && !(uses_password && form.in_password);
         let in_password = focused && uses_password && form.in_password;
         let field = div()
@@ -330,7 +461,7 @@ impl Shell {
                 .bg(theme.editor_bg)
                 .border_1()
                 .border_color(if in_password { theme.accent } else { theme.border })
-                .when(masked.text.is_empty() && !in_password, |this| this.child(div().text_color(theme.text_muted).child(t("ssh.password"))))
+                .when(masked.text.is_empty() && !in_password, |this| this.child(div().text_color(theme.text_muted).child(placeholder)))
                 .when(!masked.text.is_empty() || in_password, |this| {
                     this.children(text_field_children(&masked, theme.text, theme.over_accent, theme.selection, theme.caret, 16., in_password))
                 })
@@ -343,10 +474,10 @@ impl Shell {
             .ssh_hosts
             .iter()
             .map(|ssh| {
-                let how = if ssh.password {
-                    Some(t("ssh.password_auth").to_owned())
-                } else {
-                    ssh.identity.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+                // A key with a passphrase is named by its key, the passphrase stays unsaid.
+                let how = match &ssh.identity {
+                    Some(key) => Some(file_name(key)),
+                    None => ssh.password.then(|| t("ssh.password_auth").to_owned()),
                 };
                 (ssh.host.clone(), how)
             })
@@ -406,16 +537,22 @@ impl Shell {
                         .items_center()
                         .justify_between()
                         .gap(px(6.))
-                        .child(chip("ssh-key", key_label, &theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            if let Some(form) = &mut this.ssh_form {
-                                form.way = (form.way + 1) % form.ways.len().max(1);
-                                form.in_password = form.uses_password();
-                                form.unknown_keys = None;
-                                form.message = None;
-                            }
-                            this.ssh_focus.focus(window, cx);
-                            cx.notify();
-                        })))
+                        .child(
+                            chip("ssh-key", format!("{key_label}  ▾"), &theme)
+                                .relative()
+                                .min_w_0()
+                                .border_1()
+                                .border_color(theme.border)
+                                .child(anchor.canvas())
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    if let Some(form) = &mut this.ssh_form {
+                                        form.ways_open = !form.ways_open;
+                                    }
+                                    this.ssh_focus.focus(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .children(ways_menu)
                         .child(
                             div()
                                 .id("ssh-connect")

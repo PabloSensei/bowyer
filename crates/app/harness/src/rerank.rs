@@ -9,6 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use envs::Environment;
 use serde_json::{Value, json};
 
 /// How many results go to the model.
@@ -57,6 +58,11 @@ pub fn read_answer(json: &str) -> Option<(String, Option<f64>)> {
 
 /// The arguments of the call: Haiku, no tools, no MCP servers, nothing saved.
 pub fn arguments() -> Vec<&'static str> {
+    arguments_with(SYSTEM)
+}
+
+/// The same call with another system prompt.
+pub fn arguments_with(system: &'static str) -> Vec<&'static str> {
     vec![
         "-p",
         "--model",
@@ -68,8 +74,38 @@ pub fn arguments() -> Vec<&'static str> {
         "",
         "--strict-mcp-config",
         "--system-prompt",
-        SYSTEM,
+        system,
     ]
+}
+
+/// The model chosen for search, writing digests of sessions for Bowyer's memory: Haiku
+/// through `claude -p` (no tools, no MCP servers, nothing saved), or a local model.
+pub struct DigestModel {
+    pub ranker: Ranker,
+    /// Dollars `claude -p` reported, summed.
+    pub cost: std::cell::Cell<f64>,
+}
+
+impl DigestModel {
+    pub fn new(ranker: Ranker) -> Self {
+        Self { ranker, cost: std::cell::Cell::new(0.0) }
+    }
+}
+
+impl mcp::digest::Summarizer for DigestModel {
+    fn summarize(&self, prompt: &str) -> Result<String, String> {
+        match &self.ranker {
+            Ranker::Haiku => {
+                let env = envs::LocalEnvironment::new();
+                let folder = std::env::temp_dir();
+                let out = env.run_with_input("claude", &arguments_with(mcp::digest::SYSTEM), folder.to_str(), prompt.as_bytes()).map_err(|e| e.to_string())?;
+                let (text, cost) = read_answer(&out).ok_or_else(|| model::shorten(out.trim(), 200))?;
+                self.cost.set(self.cost.get() + cost.unwrap_or(0.0));
+                Ok(text)
+            }
+            Ranker::Local(model) => ask_at_with(model, model.server.port(), mcp::digest::SYSTEM, prompt),
+        }
+    }
 }
 
 /// Who orders the results.
@@ -179,7 +215,11 @@ pub fn ask_local(model: &LocalModel, prompt: &str) -> Result<String, String> {
 }
 
 fn ask_at(model: &LocalModel, port: u16, prompt: &str) -> Result<String, String> {
-    let messages = json!([{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]);
+    ask_at_with(model, port, SYSTEM, prompt)
+}
+
+fn ask_at_with(model: &LocalModel, port: u16, system: &str, prompt: &str) -> Result<String, String> {
+    let messages = json!([{"role": "system", "content": system}, {"role": "user", "content": prompt}]);
     let (path, body) = match model.server {
         // Thinking off: the answer is a list of numbers.
         Server::Ollama => ("/api/chat", json!({"model": model.name, "messages": messages, "stream": false, "think": false, "options": {"temperature": 0}})),

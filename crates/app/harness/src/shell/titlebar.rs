@@ -114,10 +114,12 @@ impl Shell {
                 .child(
                     window_button("w-close", "windows/closeSmall", t("window.close"), WindowControlArea::Close, true, &theme)
                         .h(px(TITLEBAR_HEIGHT))
-                        .on_click(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
-                            crate::tray::close_window(window);
-                        }),
+                            if crate::tray::hides_on_close() || this.may_quit(cx) {
+                                crate::tray::close_window(window);
+                            }
+                        })),
                 )
         });
         div()

@@ -93,6 +93,7 @@ fn open_main_window(view: Entity<Shell>, cx: &mut App) -> Option<usize> {
     let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
     let found = std::rc::Rc::new(std::cell::Cell::new(None));
     let handle = found.clone();
+    let asked = view.clone();
     let opened = cx.open_window(shell::window_options(bounds), move |window, cx| {
         // The root takes the keys from the start, so Ctrl+K works before any click.
         let focus = view.read(cx).focus.clone();
@@ -100,12 +101,13 @@ fn open_main_window(view: Entity<Shell>, cx: &mut App) -> Option<usize> {
         window.activate_window();
         let hwnd = tray::native_handle(window);
         handle.set(hwnd);
-        window.on_window_should_close(cx, move |_, _| match hwnd {
+        window.on_window_should_close(cx, move |_, cx| match hwnd {
             Some(hwnd) if tray::hides_on_close() => {
                 tray::hide_window(hwnd);
                 false
             }
-            _ => true,
+            // Running turns and terminals: the window asks, and its answer quits.
+            _ => asked.update(cx, |shell, cx| shell.may_quit(cx)),
         });
         view
     });
@@ -140,7 +142,22 @@ fn start_tray(hwnd: Option<usize>, view: Entity<Shell>, cx: &mut App) {
     cx.spawn(async move |cx| {
         while let Some(event) = events.next().await {
             match event {
-                tray::TrayEvent::Quit => cx.update(|cx| cx.quit()),
+                tray::TrayEvent::Quit => cx.update(|cx| {
+                    if view.update(cx, |shell, cx| shell.may_quit(cx)) {
+                        cx.quit();
+                        return;
+                    }
+                    // The question is in the window: bring it up.
+                    match cx.windows().first() {
+                        Some(window) => {
+                            tray::set_window_away(false);
+                            let _ = window.update(cx, |_, window, _| window.activate_window());
+                        }
+                        None => {
+                            open_main_window(view.clone(), cx);
+                        }
+                    }
+                }),
                 tray::TrayEvent::Show => cx.update(|cx| match cx.windows().first() {
                     Some(window) => {
                         let _ = window.update(cx, |_, window, _| window.activate_window());

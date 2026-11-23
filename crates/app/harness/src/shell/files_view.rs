@@ -272,9 +272,11 @@ impl Shell {
         let current = self.right_tab;
         div()
             .flex()
+            .items_center()
             .gap(px(4.))
-            .px(px(12.))
-            .pt(px(10.))
+            .pl(px(12.))
+            .pr(px(8.))
+            .pt(px(8.))
             .child(tab("tab-session", t("tab.session"), RightTab::Session, current).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
                     this.right_tab = RightTab::Session;
@@ -294,6 +296,8 @@ impl Shell {
                     cx.notify();
                 },
             )))
+            .child(div().flex_1())
+            .child(self.hide_pane_button(super::Side::Right, cx))
     }
 
     pub(super) fn render_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

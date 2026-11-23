@@ -12,3 +12,6 @@ futures-channel = "0.3"
 history.workspace = true
 model.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true

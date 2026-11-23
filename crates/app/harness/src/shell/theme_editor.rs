@@ -94,6 +94,7 @@ impl Shell {
         let library = self.catalog.library();
         let label = library.get(&current).map(|theme| theme.name.clone()).unwrap_or_else(|| current.clone());
         let Some(draft) = ThemeDraft::of(library, &current, &format!("{label} ({})", t("theme.copy"))) else { return };
+        self.show_pane(super::Side::Right, cx);
         self.theme_editor = Some(ThemeEditor {
             name: TextField::from_text(draft.name.clone()),
             draft,
