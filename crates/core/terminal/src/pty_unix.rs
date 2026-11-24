@@ -202,10 +202,12 @@ impl Pty {
         let pkill = |args: &[&str]| {
             let _ = Command::new("pkill").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
         };
-        pkill(&["-KILL", "-s", &self.pid.to_string()]);
+        // By the terminal first: once the session's leader is gone, macOS takes the terminal
+        // away from the rest of the session and `-t` finds nothing more.
         if !self.tty.is_empty() {
             pkill(&["-KILL", "-t", &self.tty]);
         }
+        pkill(&["-KILL", "-s", &self.pid.to_string()]);
         if !self.exited.load(Ordering::SeqCst) {
             // SAFETY: the child has not exited, so the number is still its own.
             unsafe {
