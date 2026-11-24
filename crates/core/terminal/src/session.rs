@@ -699,7 +699,12 @@ mod tests {
         let started = std::time::Instant::now();
         // SAFETY: signal 0 only asks whether the process is there.
         while unsafe { libc::kill(job, 0) } == 0 {
-            assert!(started.elapsed() < Duration::from_secs(10), "the background job outlived its terminal");
+            if started.elapsed() >= Duration::from_secs(10) {
+                // What is left of it, for a failure on a system this was not tried on.
+                let table = std::process::Command::new("ps").args(["-A", "-o", "pid,ppid,pgid,stat,tty,command"]).output().map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
+                let left: Vec<&str> = table.lines().filter(|line| line.contains("sleep 300") || line.trim_start().starts_with("PID")).collect();
+                panic!("the background job {job} outlived its terminal:\n{}", left.join("\n"));
+            }
             thread::sleep(Duration::from_millis(50));
         }
         let started = std::time::Instant::now();
