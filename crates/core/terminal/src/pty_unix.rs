@@ -69,6 +69,9 @@ pub(crate) struct Pty {
     master: File,
     child: Mutex<Option<Child>>,
     pub(crate) pid: u32,
+    /// The terminal as `pkill -t` names it (`pts/3`, `ttys005`): every process that still
+    /// has it as its own terminal was started in it.
+    tty: String,
     /// The child has exited: its number may belong to another process soon, so it is not
     /// signalled any more. Set before the child is reaped.
     exited: AtomicBool,
@@ -140,6 +143,7 @@ impl Pty {
                 master,
                 child: Mutex::new(Some(child)),
                 pid,
+                tty: name.trim_start_matches("/dev/").to_owned(),
                 exited: AtomicBool::new(false),
             },
             writer,
@@ -190,13 +194,18 @@ impl Pty {
     /// terminal, so the tab ends.
     pub(crate) fn terminate(&self) {
         // A session lives as long as one of its processes, and its number is not given to a
-        // new process meanwhile: `pkill -s` reaches only what the terminal started.
-        let _ = Command::new("pkill")
-            .args(["-KILL", "-s", &self.pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // new process meanwhile: `pkill -s` reaches only what the terminal started. The
+        // `pkill` of macOS does not find a session's processes that way, so the processes
+        // whose terminal this is go too (a job of the shell keeps it; a daemon that left it,
+        // as daemons do, stays). The name is ours while `master` is open, which it is here
+        // and in `drop`: no other terminal can have it yet.
+        let pkill = |args: &[&str]| {
+            let _ = Command::new("pkill").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        };
+        pkill(&["-KILL", "-s", &self.pid.to_string()]);
+        if !self.tty.is_empty() {
+            pkill(&["-KILL", "-t", &self.tty]);
+        }
         if !self.exited.load(Ordering::SeqCst) {
             // SAFETY: the child has not exited, so the number is still its own.
             unsafe {
