@@ -35,25 +35,38 @@ pub fn session_files(summary: &SessionSummary) -> Option<Vec<String>> {
     }
 }
 
-/// Moves `files` into the trash of `harness` on the machine of `env`. A file that is not
+/// Moves `files` into the trash of `harness` on the machine of `env`, in a folder of their
+/// own named by the time: a session deleted again later (the same id resumed, a file of
+/// the same name) never meets what an earlier deletion left there. A file that is not
 /// there any more is skipped.
 pub fn move_to_trash(env: &dyn Environment, harness: &HarnessKind, files: &[String]) -> io::Result<()> {
     let home = env.home()?;
     let trash = env.join(&env.join(&home, TRASH_DIR), harness.id());
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis()).to_string();
     if env.id().is_local() {
-        std::fs::create_dir_all(&trash)?;
+        let mut folder = Path::new(&trash).join(&stamp);
+        let mut n = 0;
+        while folder.exists() {
+            n += 1;
+            folder = Path::new(&trash).join(format!("{stamp}-{n}"));
+        }
+        let mut made = false;
         for file in files {
             let from = Path::new(file);
             if !from.exists() {
                 continue;
             }
             let Some(name) = from.file_name() else { continue };
-            std::fs::rename(from, Path::new(&trash).join(name))?;
+            if !made {
+                std::fs::create_dir_all(&folder)?;
+                made = true;
+            }
+            std::fs::rename(from, folder.join(name))?;
         }
         return Ok(());
     }
-    let script = r#"set -e; trash="$1"; shift; mkdir -p "$trash"; for p in "$@"; do if [ -e "$p" ]; then mv -- "$p" "$trash/"; fi; done"#;
-    let mut args = vec!["-c", script, "sh", trash.as_str()];
+    let script = r#"set -e; d="$1/$2"; n=0; while [ -e "$d" ]; do n=$((n+1)); d="$1/$2-$n"; done; shift 2; for p in "$@"; do if [ -e "$p" ]; then mkdir -p "$d"; mv -- "$p" "$d/"; fi; done"#;
+    let mut args = vec!["-c", script, "sh", trash.as_str(), stamp.as_str()];
     args.extend(files.iter().map(String::as_str));
     env.run("sh", &args, None).map(|_| ())
 }
@@ -106,11 +119,22 @@ mod tests {
         move_to_trash(&env, &HarnessKind::Claude, &files).unwrap();
 
         let trash = home.path().join(TRASH_DIR).join("claude");
-        assert!(trash.join("s1.jsonl").is_file());
-        assert!(trash.join("s1").join("subagents").join("a.jsonl").is_file());
+        let deletions = || std::fs::read_dir(&trash).unwrap().flatten().map(|entry| entry.path()).collect::<Vec<_>>();
+        let [first] = deletions().try_into().expect("one folder per deletion");
+        assert!(first.join("s1.jsonl").is_file());
+        assert!(first.join("s1").join("subagents").join("a.jsonl").is_file());
         assert!(!project.join("s1.jsonl").exists() && !project.join("s1").exists());
         assert!(project.join("s2.jsonl").exists(), "other sessions stay");
-        // Deleting again finds nothing to move.
+        // Deleting again finds nothing to move, and leaves no empty folder.
         move_to_trash(&env, &HarnessKind::Claude, &files).unwrap();
+        assert_eq!(deletions().len(), 1);
+
+        // The same session back (resumed under its id) and deleted again: both wait.
+        std::fs::create_dir_all(project.join("s1").join("subagents")).unwrap();
+        std::fs::write(project.join("s1.jsonl"), "{\"again\":1}\n").unwrap();
+        std::fs::write(project.join("s1").join("subagents").join("a.jsonl"), "{}\n").unwrap();
+        move_to_trash(&env, &HarnessKind::Claude, &files).unwrap();
+        assert!(!project.join("s1.jsonl").exists() && !project.join("s1").exists());
+        assert_eq!(deletions().iter().filter(|folder| folder.join("s1.jsonl").is_file()).count(), 2);
     }
 }

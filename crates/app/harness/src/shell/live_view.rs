@@ -28,6 +28,13 @@ fn choice_setting(kind: &str, key: &SessionKey) -> String {
     format!("choice.{kind}.{}", key.encode())
 }
 
+/// Whether a model picked in the composer becomes the one new sessions of `harness` start
+/// with: a preset of the list does (the harness default among them), a session's own full
+/// id does not, since the settings could not show it.
+fn sets_default(harness: &HarnessKind, model: Option<&str>) -> bool {
+    model_presets(harness).contains(&model)
+}
+
 /// The model a session's history names, as its next turn asks for it: the preset it is
 /// (OpenCode's carry the provider in front), else the id itself for a harness that takes
 /// any model id. `None` for a placeholder such as Claude Code's `<synthetic>`.
@@ -46,6 +53,34 @@ fn history_model(harness: &HarnessKind, used: &str) -> Option<String> {
 /// A Claude model named the way one provider names it (Bedrock's `us.anthropic.…`, a
 /// gateway's own names): passed back to the harness it can fail where another provider
 /// serves the session, so the harness keeps its own choice instead.
+/// Where the open session's turn is among the runs (id, session, finished): the one its
+/// view started, else one of its session that still runs, else one that ended. A turn that
+/// ended stays in the list until the history is read again, and must not hide the turn
+/// that the queue started after it.
+fn live_position<'a>(runs: impl Iterator<Item = (u64, &'a SessionKey, bool)> + Clone, open_run: Option<u64>, key: &SessionKey) -> Option<usize> {
+    let of_session = |run_key: &SessionKey| !run_key.id.is_empty() && run_key == key;
+    let mut runs = runs.enumerate();
+    runs.clone()
+        .find(|(_, (id, _, _))| open_run == Some(*id))
+        .or_else(|| runs.clone().find(|(_, (_, run_key, finished))| !finished && of_session(run_key)))
+        .or_else(|| runs.find(|(_, (_, run_key, _))| of_session(run_key)))
+        .map(|(ix, _)| ix)
+}
+
+/// The turn the queue starts after one that ended: as that one was asked for, but with the
+/// model and effort picked for the session meanwhile (`None`: none picked; an empty pick is
+/// the harness default) and the permissions the composer shows now.
+fn queued_spec(mut spec: TurnSpec, model: Option<String>, effort: Option<String>, permission: Permission) -> TurnSpec {
+    if let Some(model) = model {
+        spec.model = (!model.is_empty() && !foreign_model(&spec.harness, &model)).then_some(model);
+    }
+    if let Some(effort) = effort {
+        spec.effort = (!effort.is_empty()).then_some(effort);
+    }
+    spec.permission = permission;
+    spec
+}
+
 fn foreign_model(harness: &HarnessKind, model: &str) -> bool {
     *harness == HarnessKind::Claude && !model.starts_with("claude-") && !model_presets(harness).contains(&Some(model))
 }
@@ -58,12 +93,27 @@ fn effort_label(effort: Option<&str>) -> String {
     }
 }
 
+/// Where the composer and the terminals of a session wait while it is not open: a draft
+/// by its folder (all drafts of one environment and harness have one key, with no id), any
+/// other session by its key.
+fn parked(summary: &SessionSummary) -> SessionKey {
+    draft_slot(&summary.key, summary.cwd.as_deref())
+}
+
+/// [`parked`] of the session `key` in the folder `cwd`: what a turn knows of its session.
+fn draft_slot(key: &SessionKey, cwd: Option<&str>) -> SessionKey {
+    if !key.id.is_empty() {
+        return key.clone();
+    }
+    SessionKey { id: format!("\u{0}draft:{}", cwd.unwrap_or_default()), ..key.clone() }
+}
+
 impl Shell {
     /// Where the turn of the open session is in `runs`: the one started from this view, or
     /// one of the same session.
     pub(super) fn live_ix(&self) -> Option<usize> {
         let open = self.open.as_ref()?;
-        self.runs.iter().position(|run| open.run == Some(run.id) || (!run.key.id.is_empty() && run.key == open.summary.key))
+        live_position(self.runs.iter().map(|run| (run.id, &run.key, run.finished)), open.run, &open.summary.key)
     }
 
     /// The turn of the open session, running or just finished.
@@ -82,20 +132,30 @@ impl Shell {
     }
 
     /// Keeps what was typed for the session being left and brings back what was typed for
-    /// `to`: every session has its own composer.
-    pub(super) fn switch_composer(&mut self, to: Option<&SessionKey>) {
-        let from = self.open.as_ref().map(|open| open.summary.key.clone());
-        if from.as_ref() == to {
+    /// `to`: every session has its own composer. A draft left keeps its terminals too, by
+    /// its folder, and a draft of that folder gets them back.
+    pub(super) fn switch_composer(&mut self, to: Option<&SessionSummary>, cx: &mut Context<Self>) {
+        let leaving = self.open.as_ref().map(|open| (open.summary.key.clone(), parked(&open.summary)));
+        let to = to.map(|summary| (summary.key.clone(), parked(summary)));
+        if leaving.as_ref().map(|(_, slot)| slot) == to.as_ref().map(|(_, slot)| slot) {
             return;
         }
         let text = std::mem::replace(&mut self.composer, TextField::from_text(""));
         let attachments = std::mem::take(&mut self.attachments);
-        if let Some(from) = from
-            && (!text.text.is_empty() || !attachments.is_empty())
-        {
-            self.drafts.insert(from, (text, attachments));
+        if let Some((key, slot)) = leaving {
+            if !text.text.is_empty() || !attachments.is_empty() {
+                self.drafts.insert(slot.clone(), (text, attachments));
+            }
+            if key != slot {
+                self.rename_terminal_owner(&key, &slot, cx);
+            }
         }
-        if let Some((text, attachments)) = to.and_then(|to| self.drafts.remove(to)) {
+        if let Some((key, slot)) = &to
+            && key != slot
+        {
+            self.rename_terminal_owner(slot, key, cx);
+        }
+        if let Some((text, attachments)) = to.and_then(|(_, slot)| self.drafts.remove(&slot)) {
             self.composer = text;
             self.attachments = attachments;
         }
@@ -160,13 +220,16 @@ impl Shell {
     }
 
     /// A model picked in the composer: for the open session, and for new sessions of
-    /// `harness` too.
+    /// `harness` too when it is one of the list's presets. The session's own full id (from
+    /// its history) stays its own: new sessions keep the model they had.
     fn set_composer_model(&self, harness: &HarnessKind, model: Option<&str>) {
         let library = self.lib();
         if let Some(key) = self.open_session_key() {
             let _ = library.set_setting(&choice_setting("model", &key), model.unwrap_or(""));
         }
-        let _ = library.set_setting(&format!("model.{}", harness.id()), model.unwrap_or(""));
+        if sets_default(harness, model) {
+            let _ = library.set_setting(&format!("model.{}", harness.id()), model.unwrap_or(""));
+        }
     }
 
     fn set_composer_effort(&self, harness: &HarnessKind, effort: Option<&str>) {
@@ -314,11 +377,13 @@ impl Shell {
     pub(super) fn start_draft(&mut self, harness: HarnessKind, window: &mut Window, cx: &mut Context<Self>) {
         let env = self.open.as_ref().map_or_else(EnvId::local, |open| open.summary.key.env.clone());
         let shared = self.env_for(&env);
+        // The home folder of this computer only: a host's would be a round trip on the
+        // window's thread.
         let cwd = self
             .open
             .as_ref()
             .and_then(|open| open.summary.cwd.clone())
-            .or_else(|| shared.as_ref().and_then(|env| env.home().ok()));
+            .or_else(|| shared.as_ref().filter(|_| env.is_local()).and_then(|env| env.home().ok()));
         self.open_draft(env, harness, cwd, window, cx);
     }
 
@@ -343,10 +408,41 @@ impl Shell {
             source: SourceStamp::default(),
         };
         self.selected = None;
+        // A session still loading would replace the draft when it comes; a finished turn
+        // would open its session over it.
+        self.load_generation += 1;
+        self.loading = false;
+        self.pending_open = None;
         self.runs.retain(|run| !run.finished);
-        self.switch_composer(Some(&summary.key));
+        self.forget_view_state();
+        self.switch_composer(Some(&summary), cx);
+        // A host's repository is asked about in the background, and shows when it answers.
+        let local = summary.key.env.is_local();
+        if !local
+            && let (Some(cwd), Some(env)) = (summary.cwd.clone(), shared.clone())
+        {
+            let key = summary.key.clone();
+            let task = cx.background_spawn({
+                let cwd = cwd.clone();
+                async move { env.git_info(&cwd) }
+            });
+            cx.spawn(async move |this, cx| {
+                let git = task.await;
+                this.update(cx, |this, cx| {
+                    if let Some(open) = &mut this.open
+                        && open.summary.key == key
+                        && open.summary.cwd.as_deref() == Some(cwd.as_str())
+                    {
+                        open.git = git;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
         self.open = Some(OpenSession {
-            git: summary.cwd.as_deref().and_then(|cwd| shared.as_ref().and_then(|env| env.git_info(cwd))),
+            git: summary.cwd.as_deref().filter(|_| local).and_then(|cwd| shared.as_ref().and_then(|env| env.git_info(cwd))),
             summary,
             model: None,
             usage: Default::default(),
@@ -404,7 +500,7 @@ impl Shell {
             }
             args.push("/context");
             let out = if env.id().is_local() {
-                env.run_with_input("claude", &args, cwd.as_deref(), b"")
+                crate::rerank::run_claude(&args, cwd.as_deref(), b"")
             } else {
                 // On a host the harness is on the PATH of the login shell of the user.
                 let script = r#"p=$1; shift; exec "${SHELL:-sh}" -lc 'exec "$0" "$@"' "$p" "$@""#;
@@ -498,6 +594,9 @@ impl Shell {
         };
         let session = (!summary.key.id.is_empty()).then(|| summary.key.id.clone());
         let ide = if ssh.is_none() { self.ide_of(&cwd) } else { None };
+        // Claude Code on a host reaches Bowyer's memory through the window's tunnel.
+        let mcp_config = if summary.key.harness == HarnessKind::Claude { self.turn_mcp_config(&summary.key.env, &cwd, cx) } else { None };
+        let mcp_config = mcp_config.map(live::McpConfig::Text);
         let mut spec = TurnSpec {
             harness: summary.key.harness.clone(),
             session,
@@ -510,21 +609,28 @@ impl Shell {
             attachments: Vec::new(),
             ide,
             drop_turn: if summary.key.harness == HarnessKind::Claude { self.turn_drop(&summary.key) } else { None },
+            mcp_config,
         };
         let attached = std::mem::take(&mut self.attachments);
         let backup = attached.clone();
         let harness = spec.harness.clone();
         let key = summary.key.clone();
+        let slot = draft_slot(&key, Some(&spec.cwd));
         // Claude takes pictures inline; every other file must be on the machine of the turn.
         let inline = move |a: &composer::Attached| harness == HarnessKind::Claude && a.picture.is_some();
         let as_live = |a: composer::Attached, path: String| live::Attachment {
             path,
             image: a.picture.map(|(media, bytes, _)| (media, bytes)),
         };
+        let files = attached.iter().any(|a| !inline(a));
         match spec.ssh.clone() {
-            Some(ssh) if attached.iter().any(|a| !inline(a)) => {
+            // Files and the memory's config go to the host first, off the window's thread:
+            // a slow host would freeze the window.
+            Some(ssh) if files || spec.mcp_config.is_some() => {
                 self.uploading = true;
-                self.status = Some(t("live.uploading").to_owned());
+                if files {
+                    self.status = Some(t("live.uploading").to_owned());
+                }
                 let task = cx.background_spawn(async move {
                     let mut out = Vec::new();
                     for a in attached {
@@ -535,22 +641,21 @@ impl Shell {
                         };
                         out.push(as_live(a, path));
                     }
-                    Ok::<_, std::io::Error>(out)
+                    spec.attachments = out;
+                    live::place_mcp_config(&mut spec);
+                    Ok::<_, std::io::Error>(spec)
                 });
                 cx.spawn(async move |this, cx| {
                     let uploaded = task.await;
                     this.update(cx, |this, cx| {
                         this.uploading = false;
                         match uploaded {
-                            Ok(list) => {
-                                spec.attachments = list;
-                                this.start_turn(key, spec, backup, cx);
-                            }
+                            Ok(spec) => this.start_turn(key, spec, backup, cx),
                             Err(error) => {
-                                if this.open.as_ref().is_some_and(|open| open.summary.key == key) {
+                                if this.open.as_ref().is_some_and(|open| parked(&open.summary) == slot) {
                                     this.attachments = backup;
                                 } else {
-                                    this.drafts.entry(key).or_insert_with(|| (TextField::from_text(""), Vec::new())).1 = backup;
+                                    this.drafts.entry(slot).or_insert_with(|| (TextField::from_text(""), Vec::new())).1 = backup;
                                 }
                                 this.status = Some(format!("{}: {error}", t("error")));
                                 cx.notify();
@@ -643,7 +748,9 @@ impl Shell {
     }
 
     /// The next turn of a session whose turn just ended, with the prompts sent meanwhile.
-    fn send_queued(&mut self, mut spec: TurnSpec, key: SessionKey, queued: Vec<String>, base: Option<usize>, cx: &mut Context<Self>) {
+    fn send_queued(&mut self, spec: TurnSpec, key: SessionKey, queued: Vec<String>, base: Option<usize>, cx: &mut Context<Self>) {
+        let kept = |kind: &str| self.lib().setting(&choice_setting(kind, &key));
+        let mut spec = queued_spec(spec, kept("model"), kept("effort"), self.permission);
         spec.session = Some(key.id.clone());
         spec.prompt = queued.join("\n\n");
         spec.attachments = Vec::new();
@@ -661,8 +768,18 @@ impl Shell {
     /// in; `base` is how many items of the history the turn follows, when it is not what
     /// the open view shows.
     fn start_turn_from(&mut self, key: SessionKey, spec: TurnSpec, attached: Vec<composer::Attached>, from_composer: bool, base: Option<usize>, cx: &mut Context<Self>) {
-        // The upload of the attachments may end after the user went to another session.
-        let here = self.open.as_ref().is_some_and(|open| open.summary.key == key);
+        // The upload of the attachments may end after the user went to another session, or
+        // to a draft of another folder (drafts share their key).
+        let slot = draft_slot(&key, Some(&spec.cwd));
+        let here = self.open.as_ref().is_some_and(|open| parked(&open.summary) == slot);
+        // After "Stop and quit" nothing starts: not a turn sent before it whose files were
+        // still going up, nor the next message of a queue.
+        if self.quitting() {
+            if here {
+                self.attachments = attached;
+            }
+            return;
+        }
         let choice = (spec.model.clone(), spec.effort.clone());
         let template = spec.clone();
         let turn = match live::start(spec) {
@@ -670,7 +787,7 @@ impl Shell {
             Err(error) => {
                 if here {
                     self.attachments = attached;
-                } else if let Some((_, kept)) = self.drafts.get_mut(&key) {
+                } else if let Some((_, kept)) = self.drafts.get_mut(&slot) {
                     *kept = attached;
                 }
                 self.status = Some(format!("{}: {error}", t("error")));
@@ -694,7 +811,7 @@ impl Shell {
                 open.list.scroll_to_end();
             }
         } else if from_composer {
-            self.drafts.remove(&key);
+            self.drafts.remove(&slot);
         }
         if !key.id.is_empty() {
             self.keep_choice(&key, choice.0.as_deref(), choice.1.as_deref());
@@ -1143,7 +1260,8 @@ impl Shell {
                         let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
                         self.composer = TextField::from_text(&text);
                     } else {
-                        let draft = self.drafts.entry(key.clone()).or_insert_with(|| (TextField::from_text(""), Vec::new()));
+                        let slot = draft_slot(&key, Some(&self.runs[ix].spec.cwd));
+                        let draft = self.drafts.entry(slot).or_insert_with(|| (TextField::from_text(""), Vec::new()));
                         let typed = draft.0.text.trim();
                         let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
                         draft.0 = TextField::from_text(&text);
@@ -1232,6 +1350,12 @@ impl Shell {
 
     pub(super) fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
+        // An arrow by the harness's name when a newer version of it is out where it runs.
+        let place = self.open.as_ref().map(|open| (open.summary.key.env.clone(), open.summary.key.harness.clone()));
+        if let Some((env, HarnessKind::Claude)) = &place {
+            self.want_tunnel(env, cx);
+        }
+        let update_mark = place.and_then(|(env, harness)| self.version_mark(&env, &harness, "composer-update".into(), false, false, cx));
         let Some(open) = &self.open else { return div().into_any_element() };
         let harness = open.summary.key.harness.clone();
         let focused = self.composer_focus.is_focused(window);
@@ -1438,7 +1562,8 @@ impl Shell {
                                             .text_size(px(12.))
                                             .text_color(theme.text_secondary)
                                             .child(div().size(px(8.)).rounded_full().bg(harness_color(&harness)))
-                                            .child(harness.label().to_owned()),
+                                            .child(harness.label().to_owned())
+                                            .children(update_mark),
                                     )
                                     .child(model_button)
                                     .children(effort_button)
@@ -1533,8 +1658,87 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{foreign_model, history_model};
-    use model::HarnessKind;
+    use super::{draft_slot, foreign_model, history_model, live_position, parked, queued_spec, sets_default};
+    use live::{Permission, TurnSpec};
+    use model::{EnvId, HarnessKind, SessionKey};
+
+    fn key(id: &str) -> SessionKey {
+        SessionKey { env: EnvId::local(), harness: HarnessKind::Claude, id: id.into() }
+    }
+
+    fn summary(id: &str, cwd: &str) -> model::SessionSummary {
+        model::SessionSummary {
+            key: key(id),
+            title: String::new(),
+            first_prompt: None,
+            cwd: Some(cwd.into()),
+            git_branch: None,
+            model: None,
+            created_ms: 0,
+            updated_ms: 0,
+            turn: None,
+            parent: None,
+            source: Default::default(),
+        }
+    }
+
+    /// A full model id picked for one session leaves the default of new sessions alone.
+    #[test]
+    fn only_a_preset_becomes_the_default_model() {
+        assert!(sets_default(&HarnessKind::Claude, None), "the harness default is a preset");
+        let preset = super::model_presets(&HarnessKind::Claude).iter().flatten().next().copied().expect("a preset");
+        assert!(sets_default(&HarnessKind::Claude, Some(preset)));
+        assert!(!sets_default(&HarnessKind::Claude, Some("claude-sonnet-4-5-20250929")));
+    }
+
+    /// Drafts of one environment and harness share a key; what is typed in one, and its
+    /// terminals, wait by its folder and never reach a draft of another folder.
+    #[test]
+    fn drafts_wait_by_their_folder() {
+        assert_ne!(parked(&summary("", "/a")), parked(&summary("", "/b")));
+        assert_eq!(parked(&summary("", "/a")), parked(&summary("", "/a")));
+        assert_ne!(parked(&summary("", "/a")), key(""), "a draft left is not the open draft's key");
+        assert_eq!(parked(&summary("s1", "/a")), key("s1"), "a session waits by its own key");
+        // What a turn knows (its key and folder) finds the same place.
+        assert_eq!(draft_slot(&key(""), Some("/a")), parked(&summary("", "/a")));
+    }
+
+    /// A turn that ended, still listed until the history is read again, does not hide the
+    /// turn the queue started after it.
+    #[test]
+    fn the_running_turn_of_a_session_is_found_before_the_one_that_ended() {
+        let (a, b) = (key("a"), key("b"));
+        let runs = [(1, &a, true), (2, &b, false), (3, &a, false)];
+        assert_eq!(live_position(runs.into_iter(), None, &a), Some(2));
+        assert_eq!(live_position(runs.into_iter(), Some(1), &a), Some(0), "the one the view started");
+        assert_eq!(live_position([(1, &a, true)].into_iter(), None, &a), Some(0));
+        assert_eq!(live_position(runs.into_iter(), None, &key("c")), None);
+    }
+
+    /// The turn after the queue runs with what was picked while the last one ran.
+    #[test]
+    fn a_queued_turn_takes_the_picks_made_meanwhile() {
+        let spec = TurnSpec {
+            harness: HarnessKind::Claude,
+            session: Some("a".into()),
+            cwd: "/w".into(),
+            prompt: "first".into(),
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("high".into()),
+            permission: Permission::Settings,
+            ssh: None,
+            attachments: Vec::new(),
+            ide: None,
+            drop_turn: None,
+            mcp_config: None,
+        };
+        let next = queued_spec(spec.clone(), Some("claude-haiku-5-5".into()), Some(String::new()), Permission::Bypass);
+        assert_eq!(next.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(next.effort, None, "the harness default was picked");
+        assert_eq!(next.permission, Permission::Bypass);
+        let same = queued_spec(spec, None, None, Permission::Settings);
+        assert_eq!((same.model.as_deref(), same.effort.as_deref()), (Some("claude-opus-5-5"), Some("high")));
+    }
 
     #[test]
     fn a_session_goes_on_with_the_model_its_history_used() {

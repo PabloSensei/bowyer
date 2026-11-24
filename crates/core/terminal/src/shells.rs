@@ -14,10 +14,11 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// The shells of Windows name their flags in the platform file.
+    /// A shell of Windows: Git Bash as a login and interactive shell, the others as they
+    /// are.
     #[cfg(windows)]
     pub(crate) fn new(name: &str, program: &Path) -> Self {
-        Self::with_arguments(name, program, &[])
+        Self::with_arguments(name, program, windows_arguments(program))
     }
 
     /// A shell of Unix, started as a login shell when its program knows the flag: `zsh`,
@@ -54,6 +55,14 @@ pub(crate) fn login_arguments(program: &Path) -> &'static [&'static str] {
         "zsh" | "bash" | "fish" => &["-l"],
         _ => &[],
     }
+}
+
+/// The arguments of a shell of Windows: Git Bash reads `~/.bash_profile` and its prompt
+/// only as a login shell, and is interactive in a console only when told so.
+#[cfg(windows)]
+pub(crate) fn windows_arguments(program: &Path) -> &'static [&'static str] {
+    let stem = program.file_stem().map(|name| name.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if stem == "bash" { &["--login", "-i"] } else { &[] }
 }
 
 /// `"<path>"`, the form every shell accepts on the command line of its console.

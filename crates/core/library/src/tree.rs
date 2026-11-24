@@ -115,6 +115,9 @@ pub struct TreeNode {
     /// Where a new session of a project group starts: its environment, its folder and the
     /// harness of its newest session (the group's own under a harness group).
     pub start: Option<SessionStart>,
+    /// The environment and harness a harness group stands for, when all its sessions run in
+    /// one environment: whose version the row shows.
+    pub harness: Option<(model::EnvId, model::HarnessKind)>,
 }
 
 /// The place of a new session.
@@ -221,6 +224,7 @@ fn cut_long_lists(nodes: &mut [TreeNode], show_all: &HashSet<String>) {
                 updated_ms: 0,
                 children: Vec::new(),
                 start: None,
+                harness: None,
             });
         }
     }
@@ -239,6 +243,7 @@ fn session_node(summary: &SessionSummary, placement: Option<&Placement>, collaps
         updated_ms: summary.updated_ms,
         children: Vec::new(),
         start: None,
+        harness: None,
     };
     node.collapsed = !collapsed.contains(&node.collapse_id());
     node
@@ -356,15 +361,32 @@ pub fn build_tree(
             },
         }
     }
-    let make = |summary: &SessionSummary| {
+    /// A session with its children, theirs in turn (an agent's agent, a fork of a fork),
+    /// each once: a session that names its own descendant as parent stops there.
+    fn grown(
+        summary: &SessionSummary,
+        children: &HashMap<SessionKey, Vec<&SessionSummary>>,
+        placements: &HashMap<SessionKey, Placement>,
+        collapsed: &HashSet<String>,
+        by_key: &HashMap<&SessionKey, &SessionSummary>,
+        above: &mut Vec<SessionKey>,
+    ) -> TreeNode {
         let mut node = session_node(summary, placements.get(&summary.key), collapsed);
         if let Some(kids) = children.get(&summary.key) {
-            node.children = kids.iter().map(|kid| session_node(kid, placements.get(&kid.key), collapsed)).collect();
+            above.push(summary.key.clone());
+            for kid in kids {
+                if !above.contains(&kid.key) {
+                    let child = grown(kid, children, placements, collapsed, by_key, above);
+                    node.children.push(child);
+                }
+            }
+            above.pop();
             // Newest first: with many workers the recent ones matter, and the list is cut.
-            sort_sessions(&mut node.children, SortOrder::Created, &by_key, placements);
+            sort_sessions(&mut node.children, SortOrder::Created, by_key, placements);
         }
         node
-    };
+    }
+    let make = |summary: &SessionSummary| grown(summary, &children, placements, collapsed, &by_key, &mut Vec::new());
 
     let folder_ids: HashSet<FolderId> = folders.iter().map(|f| f.id).collect();
     let mut in_folder: HashMap<FolderId, Vec<TreeNode>> = HashMap::new();
@@ -407,6 +429,7 @@ pub fn build_tree(
                     updated_ms,
                     children: kids,
                     start: None,
+                    harness: None,
                 }
             })
             .collect()
@@ -424,6 +447,7 @@ pub fn build_tree(
             updated_ms: pinned.iter().map(|s| s.updated_ms).max().unwrap_or(0),
             children: pinned,
             start: None,
+            harness: None,
         };
         node.collapsed = collapsed.contains(&node.collapse_id());
         tree.push(node);
@@ -482,6 +506,14 @@ pub fn build_tree(
                         .map(|newest| SessionStart { env: newest.key.env.clone(), harness: newest.key.harness.clone(), cwd: cwd.clone() }),
                     _ => None,
                 };
+                // A harness inside one environment has a version of its own.
+                let harness = match level {
+                    Level::Harness => {
+                        let first = &sessions[0].key;
+                        sessions.iter().all(|s| s.key.env == first.env).then(|| (first.env.clone(), first.harness.clone()))
+                    }
+                    _ => None,
+                };
                 let children = group_nodes(sessions, inner, Some(&id), order, collapsed, make, sort);
                 let mut node = TreeNode {
                     kind: TreeNodeKind::Group(id),
@@ -492,6 +524,7 @@ pub fn build_tree(
                     updated_ms: children.iter().map(|s| s.updated_ms).max().unwrap_or(0),
                     children,
                     start,
+                    harness,
                 };
                 node.collapsed = collapsed.contains(&node.collapse_id());
                 node
@@ -571,6 +604,13 @@ mod tests {
         let opencode = harnesses.iter().find(|h| h.children.len() == 1).unwrap();
         assert_eq!(opencode.children[0].start.as_ref().map(|s| s.harness.clone()), Some(model::HarnessKind::OpenCode));
         assert!(local.start.is_none() && claude.start.is_none(), "only projects start sessions");
+        // A harness inside an environment knows both, for its version; nothing else does.
+        assert_eq!(claude.harness, Some((model::EnvId::local(), summaries[1].key.harness.clone())));
+        assert!(local.harness.is_none() && claude.children[0].harness.is_none());
+        // Grouped by harness alone, a harness with sessions on two machines has no one version.
+        let by_harness = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Harness, &HashSet::new(), &HashSet::new());
+        let mixed = by_harness.iter().find(|group| group.session_count() == 3).expect("the harness of three sessions");
+        assert!(mixed.harness.is_none(), "{mixed:?}");
         assert_eq!(tree[0].children[0].children[0].start.as_ref().map(|s| s.env.0.as_str()), Some("ssh:vm"));
         // Every group has an id of its own: the same project under two harnesses too.
         let mut ids = HashSet::new();
@@ -616,6 +656,24 @@ mod tests {
         let collapsed: HashSet<String> = [tree[0].collapse_id()].into();
         let tree = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &collapsed, &HashSet::new());
         assert_eq!(flatten_visible(&tree).len(), 1);
+    }
+
+    /// A chain of sessions (a fork of a fork, an agent's agent) shows to its end.
+    #[test]
+    fn grandchildren_hang_under_their_parents() {
+        let mut fork = summary("b", "Fork", "/w", 2);
+        fork.parent = Some("a".into());
+        let mut fork_of_fork = summary("c", "Fork of the fork", "/w", 3);
+        fork_of_fork.parent = Some("b".into());
+        let summaries = vec![summary("a", "Start", "/w", 1), fork, fork_of_fork];
+        let tree = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
+        let start = &tree[0].children[0];
+        assert_eq!(start.label, "Start");
+        assert_eq!(start.children[0].label, "Fork");
+        assert_eq!(start.children[0].children[0].label, "Fork of the fork");
+        let opened: HashSet<String> = [start.collapse_id(), start.children[0].collapse_id()].into();
+        let tree = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &opened, &HashSet::new());
+        assert_eq!(flatten_visible(&tree).len(), 4, "the group and three sessions");
     }
 
     #[test]

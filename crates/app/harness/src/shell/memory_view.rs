@@ -134,8 +134,9 @@ impl Shell {
 
     /// The notes of the open session's project, as the memory server files them.
     pub(super) fn project_notes(&self) -> Vec<Note> {
-        let Some(cwd) = self.open.as_ref().and_then(|open| open.summary.cwd.clone()) else { return Vec::new() };
-        self.lib().notes(Some(&mcp::normalize(&cwd))).unwrap_or_default()
+        let Some(open) = self.open.as_ref() else { return Vec::new() };
+        let Some(cwd) = open.summary.cwd.as_deref() else { return Vec::new() };
+        self.lib().notes(Some(&mcp::note_key(Some(&open.summary.key.env), cwd))).unwrap_or_default()
     }
 
     /// The memory block on top of the MCP list.
@@ -144,9 +145,38 @@ impl Shell {
         let enabled = self.memory_enabled();
         let project = self.open_project();
         let project_on = project.as_deref().is_none_or(|project| mcp::memory_on(&self.lib(), project));
-        let command = connect_command(harness)?;
-        let copy_command = command.clone();
+        // A session on a host reaches the memory through the window's tunnel: Claude Code
+        // only, with a command for one project there.
+        let env = self.open.as_ref().map_or_else(model::EnvId::local, |open| open.summary.key.env.clone());
+        let host = env.ssh_host().map(str::to_owned);
+        let claude = *harness == HarnessKind::Claude;
+        let command = match &host {
+            None => connect_command(harness)?,
+            Some(_) if claude => {
+                self.want_tunnel(&env, cx);
+                // A session without a folder keeps the block (the switch, the tunnel's state);
+                // only the command, which names one project, is left out.
+                project.as_deref().and_then(|project| self.host_connect_command(&env, project)).unwrap_or_default()
+            }
+            Some(_) => String::new(),
+        };
+        let tunnel = host.as_ref().map(|host| {
+            let (text, color) = match self.memory_link.state(host) {
+                _ if !claude => (t("memory.host_claude_only").to_owned(), theme.text_muted),
+                Some(super::memory_tunnel::TunnelState::Ready(port)) => (t("memory.tunnel_ready").replace("{host}", host).replace("{port}", &port.to_string()), theme.success),
+                Some(super::memory_tunnel::TunnelState::Failed(error, _)) => (format!("{} {error}", t("memory.tunnel_failed")), theme.error),
+                _ => (t("memory.tunnel_starting").replace("{host}", host), theme.text_muted),
+            };
+            div().text_size(px(11.5)).text_color(color).child(text)
+        });
+        // A host's command holds its token: the screen shows it masked, and the copy starts
+        // with a space, which keeps it out of the history of a shell that ignores such lines
+        // (bash's default `ignoreboth`, zsh's `HIST_IGNORE_SPACE`).
+        let shown_command = super::memory_tunnel::masked_token(&command);
+        let copy_command = if host.is_some() { format!(" {command}") } else { command.clone() };
         let run_command = command.clone();
+        let run_env = env.clone();
+        let run_cwd = project.clone();
         let button = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
@@ -199,15 +229,17 @@ impl Shell {
                 )
             })
             .child(div().text_size(px(11.5)).text_color(theme.text_secondary).child(t("memory.about")))
-            .when(!connected, |this| {
-                this.child(
+            .children(tunnel)
+            .when(!connected && !command.is_empty(), |this| {
+                this.when(host.is_some(), |this| this.child(div().text_size(px(11.5)).text_color(theme.text_secondary).child(t("memory.host_command"))))
+                    .child(
                     div()
                         .p(px(8.))
                         .rounded(px(6.))
                         .bg(theme.main_bg)
                         .font_family(MONO)
                         .text_size(px(11.))
-                        .child(command.clone()),
+                        .child(shown_command),
                 )
                 .child(
                     div()
@@ -218,7 +250,20 @@ impl Shell {
                             this.status = Some(t("code.copied").to_owned());
                             cx.notify();
                         })))
-                        .child(button("memory-run", t("memory.run")).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        .child(button("memory-run", t("memory.run")).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            // On a host: in the project's folder, in the login shell, whose PATH
+                            // has Claude Code, in a terminal tab of the window.
+                            if !run_env.is_local() {
+                                let Some(env) = this.env_for(&run_env) else { return };
+                                let script = format!("\"${{SHELL:-sh}}\" -lc {}", envs::shell_quote(&run_command));
+                                let line = launch::block_line(&*env, run_cwd.as_deref(), launch::Shell::Posix, &script);
+                                let title = t("memory.title").to_owned();
+                                if this.show_in_terminal(line, title, window, cx) {
+                                    this.status = Some(t("code.started").to_owned());
+                                }
+                                cx.notify();
+                                return;
+                            }
                             let env = envs::LocalEnvironment::new();
                             let shell = if cfg!(windows) { launch::Shell::PowerShell } else { launch::Shell::Posix };
                             let result = launch::run_in_terminal(&env, None, shell, &run_command);

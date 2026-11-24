@@ -87,7 +87,7 @@ fn spawn_ssh_terminal(remote: Command) -> io::Result<()> {
         // A long block: `ssh` in its console directly, without the pause on an error.
         return spawn_console(&remote);
     }
-    let mut wrapper = Command::new("powershell.exe");
+    let mut wrapper = Command::new(envs::system_program("powershell.exe"));
     wrapper.args(["-NoLogo", "-NoProfile", "-EncodedCommand", &encoded]);
     spawn_console(&wrapper)
 }
@@ -219,7 +219,7 @@ fn spawn_ssh_terminal(remote: Command) -> io::Result<()> {
 
 #[cfg(windows)]
 fn spawn_local_terminal(cwd: Option<&str>, program: Option<(&str, &[String])>) -> io::Result<()> {
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(envs::system_program("powershell.exe"));
     command.arg("-NoLogo").arg("-NoExit");
     if let Some((program, args)) = program {
         command.arg("-Command").arg(powershell_line(program, args));
@@ -314,7 +314,7 @@ pub fn run_in_terminal(env: &dyn Environment, cwd: Option<&str>, shell: Shell, s
         let mut command = match shell {
             // The script goes encoded: `-Command` would drop its double quotes.
             Shell::PowerShell => {
-                let mut command = Command::new("powershell.exe");
+                let mut command = Command::new(envs::system_program("powershell.exe"));
                 let encoded = powershell_encoded(script);
                 if encoded.len() <= MAX_ENCODED {
                     command.args(["-NoLogo", "-NoExit", "-EncodedCommand", &encoded]);
@@ -326,7 +326,7 @@ pub fn run_in_terminal(env: &dyn Environment, cwd: Option<&str>, shell: Shell, s
             // cmd reads its command line as it is: `/S /K "…"` drops the outer quotes and
             // keeps every other character of the block.
             Shell::Cmd => {
-                return spawn_console_line(&format!("cmd.exe /D /S /K \"{script}\""), cwd.map(std::path::Path::new));
+                return spawn_console_line(&format!("{} /D /S /K \"{script}\"", envs::system_program_line("cmd.exe")), cwd.map(std::path::Path::new));
             }
             // Bash code goes to the bash on the PATH (Git Bash, WSL), started directly: Windows
             // PowerShell would drop the double quotes inside it. A shell stays after it.
@@ -434,7 +434,7 @@ pub fn terminal_line(env: &dyn Environment, cwd: Option<&str>, program: Option<(
         #[cfg(windows)]
         Some((program, args)) => {
             let encoded = powershell_encoded(&powershell_line(program, args));
-            (encoded.len() <= MAX_ENCODED).then(|| format!("powershell.exe -NoLogo -NoExit -EncodedCommand {encoded}"))?
+            (encoded.len() <= MAX_ENCODED).then(|| format!("{} -NoLogo -NoExit -EncodedCommand {encoded}", envs::system_program_line("powershell.exe")))?
         }
         #[cfg(not(windows))]
         Some((program, args)) => {
@@ -450,6 +450,20 @@ pub fn terminal_line(env: &dyn Environment, cwd: Option<&str>, program: Option<(
     Some(TerminalLine { line, cwd, env: Vec::new() })
 }
 
+/// A harness's own command (its update) for the terminal of the window: the program alone,
+/// so the tab ends when it does and the window knows the command is over. On this computer
+/// the program found on PATH (an npm shim runs its script with node); on a host the login
+/// shell, whose PATH has the harness. The words hold no quote.
+pub fn harness_tool_line(env: &dyn Environment, program: &str, args: &[&str]) -> Option<TerminalLine> {
+    if env.id().is_local() {
+        let (path, prefix) = live::resolve_program(program)?;
+        let args: Vec<String> = prefix.into_iter().chain(args.iter().map(|arg| (*arg).to_owned())).collect();
+        return Some(TerminalLine { line: terminal::command_line(&path, &args), cwd: None, env: Vec::new() });
+    }
+    let words = std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
+    terminal_line(env, None, Some(("sh", &["-c".to_owned(), format!("exec \"${{SHELL:-sh}}\" -lc '{words}'")])))
+}
+
 /// [`run_in_terminal`] for the terminal of the window.
 pub fn block_line(env: &dyn Environment, cwd: Option<&str>, shell: Shell, script: &str) -> Option<TerminalLine> {
     let script = script.trim();
@@ -462,9 +476,9 @@ pub fn block_line(env: &dyn Environment, cwd: Option<&str>, shell: Shell, script
     let line = match shell {
         Shell::PowerShell => {
             let encoded = powershell_encoded(script);
-            (encoded.len() <= MAX_ENCODED).then(|| format!("powershell.exe -NoLogo -NoExit -EncodedCommand {encoded}"))?
+            (encoded.len() <= MAX_ENCODED).then(|| format!("{} -NoLogo -NoExit -EncodedCommand {encoded}", envs::system_program_line("powershell.exe")))?
         }
-        Shell::Cmd => format!("cmd.exe /D /S /K \"{script}\""),
+        Shell::Cmd => format!("{} /D /S /K \"{script}\"", envs::system_program_line("cmd.exe")),
         Shell::Posix => terminal::command_line(&windows_bash(), &["-c".to_owned(), format!("{script}\nexec bash -i")]),
     };
     #[cfg(not(windows))]

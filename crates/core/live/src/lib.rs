@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 mod acp;
 mod claude_ask;
+mod follow;
 mod ide;
 mod kill;
 mod resolve;
@@ -82,6 +83,29 @@ pub struct TurnSpec {
     /// A failed turn of the Claude Code session to leave out: the line the session goes on
     /// from and the prompt dropped (`--resume-session-at`, `--resume-drops-turn`).
     pub drop_turn: Option<(String, String)>,
+    /// Claude Code on a host: the MCP config of Bowyer's memory, reached through a tunnel.
+    /// It holds a token, so it goes into a file only the user can read, never into the
+    /// command line every user of the host can see.
+    pub mcp_config: Option<McpConfig>,
+}
+
+/// The MCP config of a turn on a host.
+#[derive(Clone, Debug, PartialEq)]
+pub enum McpConfig {
+    /// Its text, put on the host when the turn starts.
+    Text(String),
+    /// The file on the host it was put in, by [`place_mcp_config`].
+    Placed(String),
+}
+
+/// Puts the MCP config of a turn on its host ahead of the turn, which then starts without a
+/// round trip to the host. Blocks for that round trip: off the window's thread. Without the
+/// file the turn still runs, only without the memory.
+pub fn place_mcp_config(spec: &mut TurnSpec) {
+    if let (Some(ssh), Some(McpConfig::Text(config))) = (&spec.ssh, &spec.mcp_config) {
+        let run = format!("{}-{}", now_ms(), std::process::id());
+        spec.mcp_config = write_mcp_config(ssh, &run, config).ok().map(McpConfig::Placed);
+    }
 }
 
 /// A file sent with a prompt.
@@ -151,14 +175,25 @@ pub struct StopHandle {
     claude: Option<(claude_ask::Input, claude_ask::Tasks)>,
     /// Whether the processes of the harness can be found.
     processes: bool,
+    /// For a run detached on a host: the connection that follows it now.
+    link: Option<follow::Link>,
 }
 
 impl StopHandle {
     pub fn stop(&self) {
-        if let Some((ssh, run)) = &self.remote {
-            let _ = ssh.stop_detached(run);
+        let reached = self.remote.as_ref().is_some_and(|(ssh, run)| ssh.stop_detached(run).is_ok());
+        match &self.link {
+            Some(link) => {
+                link.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                // A run stopped on the host ends its connection by itself, with the host's
+                // word that it ended; one out of reach is left, and the connection with it.
+                let current = link.current.load(std::sync::atomic::Ordering::SeqCst);
+                if !reached && current != 0 {
+                    stop_tree(current);
+                }
+            }
+            None => stop_tree(self.pid),
         }
-        stop_tree(self.pid);
     }
 
     /// Whether single commands of this turn can be stopped.
@@ -205,6 +240,12 @@ fn stop_tree(pid: u32) {
 
 /// The command line of a turn, without the prompt.
 pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
+    // Ids come from files and transcripts: one that starts with `-` would be read as an
+    // option of the harness.
+    let option_like = |value: &str| value.starts_with('-');
+    if spec.session.as_deref().is_some_and(option_like) || spec.drop_turn.as_ref().is_some_and(|(kept, prompt)| option_like(kept) || option_like(prompt)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a session id that reads as an option"));
+    }
     let mut args: Vec<String> = Vec::new();
     let program = match spec.harness {
         HarnessKind::Claude => {
@@ -381,15 +422,41 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Puts a turn's MCP config on the host, readable by its owner only, next to the run's other
+/// files (they go after two days), and returns its path.
+fn write_mcp_config(ssh: &envs::SshEnvironment, run: &str, config: &str) -> io::Result<String> {
+    use envs::Environment;
+    let run: String = run.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let script = format!("umask 077; d=\"$HOME/.cache/bowyer/runs\"; mkdir -p \"$d\" && f=\"$d/{run}.mcp.json\" && cat > \"$f\" && printf %s \"$f\"");
+    let path = ssh.run_with_input("sh", &["-c", &script], None, config.as_bytes())?;
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(io::Error::other("no path for the MCP config"));
+    }
+    Ok(path.to_owned())
+}
+
 /// Starts a turn on this computer.
 pub fn start(spec: TurnSpec) -> io::Result<Turn> {
-    let (program, args) = command_line(&spec)?;
+    let (program, mut args) = command_line(&spec)?;
     // A turn on an SSH host runs detached from the connection, so a dropped link does not
     // end it; the remote login shell finds the harness, the prompt still goes on stdin.
     // An ACP agent talks both ways for the whole turn, so it cannot run detached.
     let acp = spec.harness == HarnessKind::OpenCode;
     // Either way the run has a name on the host, under which its process id is kept.
     let run = spec.ssh.as_ref().map(|_| format!("{}-{}", now_ms(), std::process::id()));
+    if spec.harness == HarnessKind::Claude
+        && let (Some(ssh), Some(config), Some(run)) = (&spec.ssh, &spec.mcp_config, &run)
+    {
+        // Without the file the turn still runs, only without the memory.
+        let path = match config {
+            McpConfig::Placed(path) => Some(path.clone()),
+            McpConfig::Text(config) => write_mcp_config(ssh, run, config).ok(),
+        };
+        if let Some(path) = path {
+            args.extend(["--mcp-config".into(), path]);
+        }
+    }
     let (mut command, resolved) = match &spec.ssh {
         Some(ssh) if acp => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -461,14 +528,74 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
         });
     }
 
+    // A run detached on a host is followed over connections that may drop and be made
+    // again; anything else is read from the process the window started.
+    let link = (spec.ssh.is_some() && !acp).then(follow::Link::default);
     let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (lines, ending): (Lines, Box<dyn FnOnce() -> Ending + Send>) =
+        match (&link, &spec.ssh, &run) {
+            (Some(link), Some(ssh), Some(run)) => {
+                let first = follow::Connection {
+                    stdout: Box::new(stdout),
+                    stderr: Box::new(stderr),
+                    pid,
+                    wait: Box::new(move || child.wait().ok().and_then(|status| status.code())),
+                };
+                let (line_sender, line_receiver) = std::sync::mpsc::channel();
+                let (ssh, run, link, follow_sender) = (ssh.clone(), run.clone(), link.clone(), sender.clone());
+                let follower = thread::spawn(move || {
+                    let reopen = |from: u64| {
+                        let mut command = ssh.follow_detached(&run, from);
+                        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                        let child = command.spawn()?;
+                        follow::Connection::of(child).ok_or_else(|| io::Error::other("no output"))
+                    };
+                    follow::follow(first, reopen, &link, &line_sender, &follow_sender, follow::FIRST_PAUSE)
+                });
+                let ending = move || {
+                    let outcome = follower.join().unwrap_or(follow::Outcome { code: None, stderr: String::new(), lost: true });
+                    if outcome.lost {
+                        return Ending { success: false, stderr: follow::LOST.into(), failure: String::new() };
+                    }
+                    let failure = outcome.code.map_or_else(|| "the connection ended".to_owned(), |code| format!("the harness exited with code {code}"));
+                    Ending { success: outcome.code == Some(0), stderr: outcome.stderr, failure }
+                };
+                (Box::new(line_receiver.into_iter()), Box::new(ending))
+            }
+            _ => {
+                let lines = lossy_lines(stdout);
+                let err_sender = sender.clone();
+                let err_reader = thread::spawn(move || {
+                    let mut tail: Vec<String> = Vec::new();
+                    for line in lossy_lines(stderr) {
+                        tail.push(line);
+                        if tail.len() > 20 {
+                            tail.remove(0);
+                        }
+                        let _ = err_sender.unbounded_send(LiveEvent::Stderr(tail.join("\n")));
+                    }
+                    tail.join("\n")
+                });
+                let ending = move || {
+                    let status = child.wait();
+                    let stderr = err_reader.join().unwrap_or_default();
+                    let failure = match &status {
+                        Ok(status) => format!("the harness exited with {status}"),
+                        Err(error) => error.to_string(),
+                    };
+                    Ending { success: status.is_ok_and(|status| status.success()), stderr, failure }
+                };
+                (Box::new(lines), Box::new(ending))
+            }
+        };
+
     let reader_sender = sender.clone();
     let harness = spec.harness.clone();
     let prompt = prompt_blocks(&spec);
     let reader_spec = spec.clone();
     let (reader_answers, reader_tasks) = (answers.clone(), tasks.clone());
     let reader = thread::spawn(move || {
-        let lines = BufReader::new(stdout).lines().map_while(Result::ok);
         match (harness, acp_stdin) {
             (_, Some(stdin)) => {
                 let error = acp::run_turn(stdin, lines, &reader_spec, &prompt, &reader_sender);
@@ -485,39 +612,17 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
         }
     });
 
-    let stderr = child.stderr.take().expect("piped stderr");
-    let err_sender = sender.clone();
-    let err_reader = thread::spawn(move || {
-        let mut tail: Vec<String> = Vec::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            tail.push(line);
-            if tail.len() > 20 {
-                tail.remove(0);
-            }
-            let _ = err_sender.unbounded_send(LiveEvent::Stderr(tail.join("\n")));
-        }
-        tail.join("\n")
-    });
-
     thread::spawn(move || {
-        let status = child.wait();
+        let ending = ending();
         let error_from_output = reader.join().ok().flatten();
-        let stderr_tail = err_reader.join().unwrap_or_default();
         // An ACP agent is stopped once its turn ends: its exit code says nothing.
-        let ok = (acp || status.as_ref().is_ok_and(|s| s.success())) && error_from_output.is_none();
+        let ok = (acp || ending.success) && error_from_output.is_none();
         let error = if ok {
             None
         } else {
             error_from_output.or_else(|| {
-                let tail = stderr_tail.trim();
-                Some(if tail.is_empty() {
-                    match status {
-                        Ok(status) => format!("the harness exited with {status}"),
-                        Err(error) => error.to_string(),
-                    }
-                } else {
-                    tail.to_owned()
-                })
+                let tail = ending.stderr.trim();
+                Some(if tail.is_empty() { ending.failure } else { tail.to_owned() })
             })
         };
         let _ = sender.unbounded_send(LiveEvent::Finished { ok, error });
@@ -527,7 +632,33 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
     // The processes of every harness can be found: here under the harness, on a host under
     // the process id its run left there (an ACP agent runs attached, but leaves it too).
     let processes = true;
-    Ok(Turn { stop: StopHandle { pid, remote, claude, processes }, events })
+    Ok(Turn { stop: StopHandle { pid, remote, claude, processes, link }, events })
+}
+
+/// The output of a turn, line by line.
+type Lines = Box<dyn Iterator<Item = String> + Send>;
+
+/// The lines of `stream` without their line ends, to its end. A line that is not UTF-8 (a
+/// tool's output in another code page) comes with replacement characters, and does not end
+/// the reading: the harness would then wait on a full pipe for ever.
+fn lossy_lines(stream: impl io::Read) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(stream);
+    std::iter::from_fn(move || {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(String::from_utf8_lossy(&line).trim_end_matches(['\n', '\r']).to_owned()),
+        }
+    })
+}
+
+/// How the process or connections of a turn ended.
+struct Ending {
+    success: bool,
+    /// The end of the error output.
+    stderr: String,
+    /// What to say when the error output says nothing.
+    failure: String,
 }
 
 /// Feeds `stream-json` lines to the history reader. Returns the error a `result` line
@@ -875,6 +1006,69 @@ fn read_dsh(lines: impl Iterator<Item = String>, prompt: &[Block], sender: &Unbo
 mod tests {
     use super::*;
 
+    /// The MCP config of a turn lands on the host readable by its owner only, and is
+    /// removed after. `BOWYER_SSH_HOST=user@host cargo test -p live -- --ignored mcp_config`.
+    #[test]
+    #[ignore = "needs an SSH host"]
+    fn the_mcp_config_is_for_its_owner_only() {
+        use envs::Environment;
+        let host = std::env::var("BOWYER_SSH_HOST").expect("BOWYER_SSH_HOST");
+        let mut ssh = envs::SshEnvironment::new(&host);
+        let system = std::path::Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe");
+        if cfg!(windows) && system.is_file() {
+            ssh.ssh = system.to_path_buf();
+        }
+        let run = format!("test-{}", std::process::id());
+        let path = write_mcp_config(&ssh, &run, r#"{"mcpServers":{}}"#).unwrap();
+        assert!(path.ends_with(&format!(".cache/bowyer/runs/{run}.mcp.json")), "{path}");
+        let check = ssh.run("sh", &["-c", &format!("stat -c %a \"{path}\"; cat \"{path}\"; rm -f \"{path}\"")], None).unwrap();
+        assert_eq!(check.lines().collect::<Vec<_>>(), ["600", r#"{"mcpServers":{}}"#]);
+
+        // Put ahead of the turn, the config is a file by the time the turn starts.
+        let mut turn = spec(HarnessKind::Claude);
+        turn.ssh = Some(ssh.clone());
+        turn.mcp_config = Some(McpConfig::Text(r#"{"mcpServers":{"x":{}}}"#.into()));
+        place_mcp_config(&mut turn);
+        let Some(McpConfig::Placed(path)) = turn.mcp_config else { panic!("not placed: {:?}", turn.mcp_config) };
+        let check = ssh.run("sh", &["-c", &format!("cat \"{path}\"; rm -f \"{path}\"")], None).unwrap();
+        assert_eq!(check.trim(), r#"{"mcpServers":{"x":{}}}"#);
+    }
+
+    /// Without a host there is nothing to put anywhere.
+    #[test]
+    fn a_local_turn_places_no_mcp_config() {
+        let mut turn = spec(HarnessKind::Claude);
+        turn.mcp_config = Some(McpConfig::Text("{}".into()));
+        place_mcp_config(&mut turn);
+        assert_eq!(turn.mcp_config, Some(McpConfig::Text("{}".into())));
+    }
+
+    /// An id that reads as an option never reaches the harness's command line.
+    #[test]
+    fn an_id_that_reads_as_an_option_is_refused() {
+        for harness in [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::DeepSeek] {
+            let mut turn = spec(harness.clone());
+            turn.session = Some("--dangerously-skip-permissions".into());
+            assert_eq!(command_line(&turn).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{harness}");
+        }
+        let mut turn = spec(HarnessKind::Claude);
+        turn.drop_turn = Some(("kept".into(), "-p".into()));
+        assert!(command_line(&turn).is_err());
+        assert!(command_line(&spec(HarnessKind::Claude)).is_ok());
+    }
+
+    /// A line that is not UTF-8 is read with replacement characters, and the lines after it
+    /// still come.
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_end_the_output() {
+        let bytes: &[u8] = b"first\ncp1251 \xcf\xf0\xe8\xe2\xe5\xf2\r\nlast";
+        let lines: Vec<String> = lossy_lines(bytes).collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "first");
+        assert!(lines[1].starts_with("cp1251 ") && lines[1].contains(char::REPLACEMENT_CHARACTER), "{:?}", lines[1]);
+        assert_eq!(lines[2], "last");
+    }
+
     fn spec(harness: HarnessKind) -> TurnSpec {
         TurnSpec {
             harness,
@@ -888,6 +1082,7 @@ mod tests {
             attachments: Vec::new(),
             ide: None,
             drop_turn: None,
+            mcp_config: None,
         }
     }
 
@@ -1058,7 +1253,7 @@ mod tests {
         .map(String::from);
         let (sender, _events) = unbounded();
         read_claude(lines.into_iter(), &[], &sender, &answers, &tasks);
-        let stop = StopHandle { pid: 0, remote: None, claude: Some((answers, tasks)), processes: false };
+        let stop = StopHandle { pid: 0, remote: None, claude: Some((answers, tasks)), processes: false, link: None };
         assert!(stop.stops_commands());
         stop.stop_command("toolu_1", Some("python -c pass")).unwrap();
         let sent: Value = serde_json::from_str(String::from_utf8(written.0.lock().unwrap().clone()).unwrap().trim()).unwrap();

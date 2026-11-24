@@ -110,6 +110,12 @@ pub fn hide_window(main: usize) {
     imp::hide_window(main);
 }
 
+/// Brings the hidden window `main` back: shown, restored and in front.
+pub fn show_window(main: usize) {
+    set_window_away(false);
+    imp::show_window(main);
+}
+
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use super::*;
@@ -121,6 +127,8 @@ mod imp {
     pub fn remove(_tray: &Tray) {}
 
     pub fn hide_window(_main: usize) {}
+
+    pub fn show_window(_main: usize) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -374,6 +382,8 @@ mod imp {
     }
 
     pub fn hide_window(_main: usize) {}
+
+    pub fn show_window(_main: usize) {}
 }
 
 #[cfg(windows)]
@@ -466,6 +476,11 @@ mod imp {
     pub fn hide_window(main: usize) {
         // SAFETY: a window handle of this process.
         unsafe { ShowWindow(main as HWND, SW_HIDE) };
+    }
+
+    pub fn show_window(main: usize) {
+        // SAFETY: a window handle of this process; a stale one only fails the calls.
+        unsafe { show_main(main as HWND) };
     }
 
     /// The small icon of `bowyer.exe` (resource 1, see build.rs), or the default one.

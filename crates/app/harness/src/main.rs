@@ -106,6 +106,9 @@ fn open_main_window(view: Entity<Shell>, cx: &mut App) -> Option<usize> {
                 tray::hide_window(hwnd);
                 false
             }
+            // Where the window closes into the icon (Linux), Bowyer goes on without it:
+            // nothing stops, so nothing to ask, as with the title bar's own close button.
+            None if tray::hides_on_close() => true,
             // Running turns and terminals: the window asks, and its answer quits.
             _ => asked.update(cx, |shell, cx| shell.may_quit(cx)),
         });
@@ -147,10 +150,13 @@ fn start_tray(hwnd: Option<usize>, view: Entity<Shell>, cx: &mut App) {
                         cx.quit();
                         return;
                     }
-                    // The question is in the window: bring it up.
+                    // The question is in the window: bring it up, from the icon too.
                     match cx.windows().first() {
                         Some(window) => {
-                            tray::set_window_away(false);
+                            match hwnd {
+                                Some(hwnd) => tray::show_window(hwnd),
+                                None => tray::set_window_away(false),
+                            }
                             let _ = window.update(cx, |_, window, _| window.activate_window());
                         }
                         None => {

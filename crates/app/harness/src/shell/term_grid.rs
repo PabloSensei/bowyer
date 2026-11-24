@@ -173,6 +173,18 @@ pub fn row_text(screen: &Screen, row: u16) -> String {
         .collect()
 }
 
+/// The text of each column of a row, as copying takes it: the character with the accents
+/// and joined parts of no width that follow it.
+fn column_texts(screen: &Screen, row: u16) -> Vec<String> {
+    let mut texts: Vec<String> = row_text(screen, row).chars().map(String::from).collect();
+    for (col, text) in texts.iter_mut().enumerate() {
+        if let Some(marks) = screen.marks_at(row, col as u16) {
+            text.push_str(marks);
+        }
+    }
+    texts
+}
+
 /// The text of the cells a selection covers. A line the screen does not show is left
 /// out, as a selection cannot name text nobody sees.
 pub fn selection_text(screen: &Screen, selection: Selection) -> String {
@@ -184,7 +196,7 @@ pub fn selection_text(screen: &Screen, selection: Selection) -> String {
         if row < 0 || row >= screen.rows as i32 {
             continue;
         }
-        let text: Vec<char> = row_text(screen, row as u16).chars().collect();
+        let text = column_texts(screen, row as u16);
         let from = if line == start.line {
             start.column as usize
         } else {
@@ -197,7 +209,7 @@ pub fn selection_text(screen: &Screen, selection: Selection) -> String {
         };
         let from = from.min(text.len());
         let to = to.min(text.len()).max(from);
-        let mut piece: String = text[from..to].iter().collect();
+        let mut piece: String = text[from..to].concat();
         while piece.ends_with(' ') {
             piece.pop();
         }
@@ -709,7 +721,7 @@ fn layout<H: GridPanel>(
                     .push((Bounds::new(point(left, y), span), bg));
             }
             let before = text.len();
-            for cell in &cells[start..end] {
+            for (col, cell) in cells.iter().enumerate().take(end).skip(start) {
                 // The wide glyph on the left covers it; a space keeps the columns in place.
                 let spacer = cell.flags.contains(CellFlags::WIDE_SPACER);
                 text.push(if spacer || cell.ch == '\0' {
@@ -717,6 +729,10 @@ fn layout<H: GridPanel>(
                 } else {
                     cell.ch
                 });
+                // Accents of no width shape onto the character before them, in its cell.
+                if let Some(marks) = screen.marks_at(row, col as u16) {
+                    text.push_str(marks);
+                }
             }
             runs.push(text_run(text.len() - before, first, fg, &mono));
             start = end;
@@ -1021,6 +1037,17 @@ mod tests {
             display_offset: offset,
             ..Screen::default()
         }
+    }
+
+    /// An accent made of a second character is copied with its letter.
+    #[test]
+    fn a_copy_keeps_the_accents_of_no_width() {
+        let mut screen = screen(&["cafe ok"], 0);
+        screen.marks = vec![(3, "\u{301}".to_owned())];
+        let all = Selection::new(Position::new(0, 0), Position::new(0, 6));
+        assert_eq!(selection_text(&screen, all), "cafe\u{301} ok");
+        let last = Selection::new(Position::new(0, 3), Position::new(0, 3));
+        assert_eq!(selection_text(&screen, last), "e\u{301}");
     }
 
     #[test]

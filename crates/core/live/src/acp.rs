@@ -261,7 +261,7 @@ fn prompt_content(spec: &TurnSpec) -> Vec<Value> {
             None => {
                 let path = attachment.path.replace('\\', "/");
                 let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
-                content.push(json!({"type": "resource_link", "uri": format!("file:///{}", path.trim_start_matches('/')), "name": name}));
+                content.push(json!({"type": "resource_link", "uri": file_uri(&path), "name": name}));
             }
         }
     }
@@ -403,6 +403,22 @@ fn ask(writer: &Writer, request: Value, params: &Value, permission: Permission, 
     thread::spawn(move || reply(&writer, answers.recv().ok().flatten()));
 }
 
+/// The `file:` URI of a path, `/` or `\` separated: a space, `#`, `%` or a letter
+/// outside ASCII in it is percent-encoded, as a URI needs, so the harness reads the path
+/// back as it was.
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut uri = String::from("file:///");
+    for byte in path.trim_start_matches('/').bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~' | b':') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
+}
+
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
@@ -424,6 +440,7 @@ mod tests {
             attachments: vec![Attachment { path: "/w/app/notes.txt".into(), image: None }],
             ide: None,
             drop_turn: None,
+            mcp_config: None,
         }
     }
 
@@ -502,6 +519,8 @@ mod tests {
         let prompt = &messages.iter().find(|m| m["method"] == "session/prompt").unwrap()["params"]["prompt"];
         assert_eq!(prompt[1]["type"], "resource_link");
         assert_eq!(prompt[1]["uri"], "file:///w/app/notes.txt");
+        assert_eq!(file_uri("/w/my notes/über#1.txt"), "file:///w/my%20notes/%C3%BCber%231.txt");
+        assert_eq!(file_uri(r"C:\w\a b.txt"), "file:///C:/w/a%20b.txt");
         let answer = messages.iter().find(|m| m["id"] == 0 && m.get("result").is_some()).expect("the question is answered");
         assert_eq!(answer["result"]["outcome"]["optionId"], "once");
     }

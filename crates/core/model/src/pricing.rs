@@ -48,10 +48,44 @@ pub enum CacheKind {
 const LONG_PROMPT: &str = "@long";
 const PEAK: &str = "@peak";
 
+/// The version of a Claude model from its name, as (major, minor): `claude-opus-5-5` is
+/// (5, 5), `claude-sonnet-4-5-20250929` (4, 5), `claude-sonnet-4-20250514` (4, 0), the
+/// older `claude-3-5-sonnet` (3, 5). A date is not a version; a bucket's mark and a `[1m]`
+/// are left out.
+pub fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let model = model.to_ascii_lowercase();
+    if !model.starts_with("claude") {
+        return None;
+    }
+    let name = model.split(['@', '[']).next().unwrap_or_default();
+    let number = |part: &str| (!part.is_empty() && part.len() <= 2 && part.bytes().all(|b| b.is_ascii_digit())).then(|| part.parse::<u32>().ok()).flatten();
+    let parts: Vec<&str> = name.split('-').collect();
+    let at = parts.iter().position(|part| number(part).is_some())?;
+    let major = number(parts[at])?;
+    let minor = parts.get(at + 1).and_then(|part| number(part)).unwrap_or(0);
+    Some((major, minor))
+}
 fn family(model: &str) -> Option<(Price, CacheKind)> {
     let m = model.to_ascii_lowercase();
     let m = m.as_str();
     let claude = |price| Some((price, CacheKind::Explicit));
+    // The models before 5 had prices of their own.
+    if let Some((major, minor)) = claude_version(m).filter(|(major, _)| *major < 5) {
+        let price = if m.contains("opus") {
+            if (major, minor) >= (4, 5) { Price::new(5.0, 25.0, 6.25, 10.0, 0.50) } else { Price::new(15.0, 75.0, 18.75, 30.0, 1.50) }
+        } else if m.contains("sonnet") {
+            Price::new(3.0, 15.0, 3.75, 6.0, 0.30)
+        } else if m.contains("haiku") {
+            match (major, minor) {
+                (4, _) => Price::new(1.0, 5.0, 1.25, 2.0, 0.10),
+                (3, 5) => Price::new(0.80, 4.0, 1.0, 1.6, 0.08),
+                _ => Price::new(0.25, 1.25, 0.30, 0.50, 0.03),
+            }
+        } else {
+            return None;
+        };
+        return claude(price);
+    }
     if m.contains("fable") {
         return claude(Price::new(8.0, 40.0, 10.0, 16.0, 0.20));
     }
@@ -124,7 +158,8 @@ fn deepseek_peak(timestamp_ms: i64) -> bool {
 /// under a different price of the same model.
 pub fn bucket(model: &str, usage: &Usage, timestamp_ms: i64) -> String {
     let lower = model.to_ascii_lowercase();
-    if lower.contains("haiku") && usage.context() > 100_000 {
+    // Only Haiku 5 costs more for long prompts.
+    if lower.contains("haiku") && claude_version(&lower).is_none_or(|(major, _)| major >= 5) && usage.context() > 100_000 {
         return format!("{model}{LONG_PROMPT}");
     }
     if lower.contains("deepseek") && deepseek_peak(timestamp_ms) {
@@ -205,6 +240,32 @@ pub fn compact_cost(model: &str, context: u64, warm: bool, long_cache: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_versions_are_read_from_the_name() {
+        assert_eq!(claude_version("claude-opus-5-5"), Some((5, 5)));
+        assert_eq!(claude_version("claude-opus-5-5[1m]"), Some((5, 5)));
+        assert_eq!(claude_version("claude-haiku-5-5@long"), Some((5, 5)));
+        assert_eq!(claude_version("claude-sonnet-4-5-20250929"), Some((4, 5)));
+        assert_eq!(claude_version("claude-sonnet-4-20250514"), Some((4, 0)));
+        assert_eq!(claude_version("claude-3-5-sonnet-20241022"), Some((3, 5)));
+        assert_eq!(claude_version("claude-fable-5-2"), Some((5, 2)));
+        assert_eq!(claude_version("gpt-5.5"), None);
+    }
+
+    /// The models before 5 are priced as they were, not as the ones of their family now.
+    #[test]
+    fn older_claude_models_keep_their_prices() {
+        assert_eq!(price_of("claude-opus-4-1-20250805").unwrap().input, 15.0);
+        assert_eq!(price_of("claude-opus-4-5-20251101").unwrap().input, 5.0);
+        assert_eq!(price_of("claude-sonnet-4-5").unwrap().output, 15.0);
+        assert_eq!(price_of("claude-haiku-4-5").unwrap().input, 1.0);
+        assert_eq!(price_of("claude-3-5-haiku-20241022").unwrap().input, 0.80);
+        assert_eq!(price_of("claude-opus-5-5").unwrap().input, 4.0);
+        let long = Usage { input: 150_000, ..Default::default() };
+        assert_eq!(bucket("claude-haiku-4-5", &long, 0), "claude-haiku-4-5", "only Haiku 5 has a long-prompt price");
+        assert_eq!(bucket("claude-haiku-5-5", &long, 0), "claude-haiku-5-5@long");
+    }
 
     #[test]
     fn a_real_haiku_turn_costs_what_claude_code_reported() {

@@ -264,14 +264,24 @@ impl HistorySource for DshSource {
         }
         let mut sessions = Vec::new();
         for meta in newest.into_values() {
-            if let Some(summary) = known.known(&meta.path)
+            let known = known.known(&meta.path);
+            if let Some(summary) = &known
                 && summary.source.size == meta.size
                 && summary.source.modified_ms == meta.modified_ms
             {
-                sessions.push(summary);
+                sessions.push(summary.clone());
                 continue;
             }
-            let bytes = decode(&env.read(&meta.path, ReadRange::All)?)?;
+            // One file that does not read or unpack stops nothing else; it keeps what was
+            // known of it.
+            let bytes = match env.read(&meta.path, ReadRange::All).and_then(|bytes| decode(&bytes)) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("deepseek history {}: {error}", meta.path);
+                    sessions.extend(known);
+                    continue;
+                }
+            };
             let parsed = parse(&String::from_utf8_lossy(&bytes));
             if parsed.first_prompt.is_none() && parsed.title.is_none() {
                 continue;
@@ -323,6 +333,27 @@ mod tests {
         assert!(text.starts_with(HEADER));
         assert!(text.contains("session/title"));
         assert_eq!(decode(b"{\"plain\":1}").unwrap(), b"{\"plain\":1}");
+    }
+
+    /// A session file that does not unpack leaves the other sessions in the scan.
+    #[test]
+    fn one_broken_session_stops_nothing_else() {
+        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+        let dir = TempDir::new("dsh_scan_broken");
+        let sessions = dir.path().join(".dsh/sessions/---work-app--");
+        let good = sessions.join("session-11111111-2222-3333-4444-555555555555");
+        let broken = sessions.join("session-99999999-2222-3333-4444-555555555555");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&broken).unwrap();
+        let mut bytes = compress_to_vec(format!("{HEADER}\n{BODY}\n").as_bytes(), CompressionLevel::Fastest);
+        std::fs::write(good.join("session.v4.jsonl.zstd"), &bytes).unwrap();
+        bytes.truncate(4);
+        bytes.extend([0xFF; 16]);
+        std::fs::write(broken.join("session.v4.jsonl.zstd"), bytes).unwrap();
+        let env = LocalEnvironment::with_home(dir.path());
+        let found = DshSource.scan(&env, &(), dir.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Listing files");
     }
 
     #[test]

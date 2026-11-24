@@ -499,10 +499,18 @@ impl ScrollBars {
     }
 }
 
+/// The start of a fade that is not over at `now`.
+fn still_fading(fade_from: Option<Instant>, now: Instant) -> Option<Instant> {
+    fade_from.filter(|from| now.saturating_duration_since(*from) < FADE)
+}
+
 impl Render for ScrollBars {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let opacity = self.opacity(now);
+        // Frames only while the bar fades: a finished fade asks for none, or the window would
+        // be drawn again every frame for as long as it is open.
+        self.fade_from = still_fading(self.fade_from, now);
         if self.fade_from.is_some() {
             window.request_animation_frame();
         }
@@ -564,9 +572,17 @@ pub fn scrollable(
         let name = name.clone();
         move |_, _| ScrollBars::new(source, theme, name)
     });
-    // The same place can show another list (another session): the bars read the
-    // state given now, not the one they were made with.
-    bars.update(cx, |bars, _| bars.source = source);
+    // The same place can show another list (another session), in another theme: the bars
+    // read the state and the colours given now, not the ones they were made with.
+    let theme = *theme;
+    bars.update(cx, |bars, cx| {
+        bars.source = source;
+        let colours = |theme: &Theme| (theme.scrollbar_track, theme.scrollbar_thumb, theme.scrollbar_thumb_hover);
+        if colours(&bars.theme) != colours(&theme) {
+            bars.theme = theme;
+            cx.notify();
+        }
+    });
     let scroll = bars.clone();
     div()
         .id(id)
@@ -584,7 +600,17 @@ pub fn scrollable(
 mod tests {
     use gpui_kit::{ScrollHandle, px};
 
-    use super::{ScrollAreaHandle, offset_for_thumb, page_offset, set_scroll, thumb};
+    use super::{FADE, ScrollAreaHandle, offset_for_thumb, page_offset, set_scroll, still_fading, thumb};
+
+    /// A fade asks for frames until it is over, and none after.
+    #[test]
+    fn a_finished_fade_stops_asking_for_frames() {
+        let start = std::time::Instant::now();
+        assert_eq!(still_fading(Some(start), start + FADE / 2), Some(start));
+        assert_eq!(still_fading(Some(start), start + FADE), None);
+        assert_eq!(still_fading(Some(start), start + FADE * 10), None);
+        assert_eq!(still_fading(None, start), None);
+    }
 
     #[test]
     fn the_thumb_is_a_fraction_of_the_track_with_a_minimum() {

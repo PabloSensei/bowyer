@@ -128,8 +128,26 @@ impl Environment for LocalEnvironment {
     }
 
     fn run(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<String> {
+        self.run_bytes(program, args, cwd).map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    fn run_bytes(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<Vec<u8>> {
         let mut command = Command::new(program);
         command.args(args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        hide_console(&mut command);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()));
+        }
+        Ok(output.stdout)
+    }
+
+    fn run_with_vars(&self, program: &str, args: &[&str], cwd: Option<&str>, vars: &[(&str, &str)]) -> io::Result<String> {
+        let mut command = Command::new(program);
+        command.args(args).envs(vars.iter().copied());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }

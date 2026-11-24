@@ -78,7 +78,7 @@ fn listing() -> io::Result<Vec<Proc>> {
     // UTF-8 out: in a pipe PowerShell would write the console code page, and a command
     // with Cyrillic in it would never match.
     let script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }";
-    let output = Command::new("powershell.exe")
+    let output = Command::new(envs::system_program("powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x0800_0000)
         .stdin(Stdio::null())

@@ -20,6 +20,8 @@ use std::process::Command;
 use base64::Engine;
 use serde::Deserialize;
 
+pub mod harness;
+
 /// The feed: the newest version and its packages by platform (see [`platform`]).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Manifest {
@@ -128,9 +130,18 @@ pub fn newer(manifest: &Manifest, current: &str, platform: &str) -> Result<Optio
     Ok(Some(Release {
         version,
         notes: manifest.notes.clone(),
-        page: manifest.page.clone(),
+        page: manifest.page.clone().filter(|page| web_page(page)),
         package: manifest.platforms.get(platform).cloned(),
     }))
+}
+
+/// Whether the feed's page about a release may be opened: a web page over `https`. The
+/// system opens what it is given, and a share (`\\host\x.exe`) or a `file:` would run a
+/// program the signature never saw.
+fn web_page(page: &str) -> bool {
+    page.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        && page.len() > 8
+        && !page.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
 }
 
 /// Text that is either itself or base64 of itself, as signatures and keys travel both ways.
@@ -150,6 +161,11 @@ fn plain_or_base64(text: &str) -> String {
 /// Checks `data` against a minisign `signature` made by the key `public_key`: the key's file,
 /// its line `RW…`, or either in base64.
 pub fn verify(data: &[u8], signature: &str, public_key: &str) -> Result<()> {
+    verify_signed(data, signature, public_key).map(drop)
+}
+
+/// [`verify`], and the signature's trusted comment, which the key signed too.
+fn verify_signed(data: &[u8], signature: &str, public_key: &str) -> Result<String> {
     let key_text = plain_or_base64(public_key);
     let key = if key_text.contains('\n') {
         minisign_verify::PublicKey::decode(&key_text)
@@ -159,7 +175,52 @@ pub fn verify(data: &[u8], signature: &str, public_key: &str) -> Result<()> {
     .map_err(|error| Error::Signature(format!("public key: {error}")))?;
     let signature = minisign_verify::Signature::decode(&plain_or_base64(signature))
         .map_err(|error| Error::Signature(format!("signature: {error}")))?;
-    key.verify(data, &signature, false).map_err(|error| Error::Signature(error.to_string()))
+    key.verify(data, &signature, false).map_err(|error| Error::Signature(error.to_string()))?;
+    Ok(signature.trusted_comment().to_owned())
+}
+
+/// What a package's signature has to say of it, beyond that the key made it: the signature
+/// of a package proves who made the file, not which version it is, so an old signed
+/// package could be sent as a new one.
+#[derive(Clone, Debug)]
+pub struct Expected {
+    /// The version the feed announced.
+    pub version: semver::Version,
+    /// When the running program was built (seconds since 1970): a package signed before
+    /// is an older release. `0` when not known.
+    pub signed_after: u64,
+}
+
+/// Checks the trusted comment of a package's signature (`timestamp:…` and `file:…` apart by
+/// a tab, as the packager writes it): it names the package's own file, the file's version
+/// (when its name has one) is the one announced, and it was signed after the running program
+/// was built.
+fn check_comment(comment: &str, url: &str, expected: &Expected) -> Result<()> {
+    let field = |name: &str| comment.split('\t').find_map(|part| part.trim().strip_prefix(name)).map(str::trim);
+    let refused = |why: &str| Err(Error::Signature(why.to_owned()));
+    let Some(file) = field("file:") else { return refused("the signature names no file") };
+    if file != file_name(url) {
+        return refused("the signature is of another file");
+    }
+    let names_one = file.split(['_', '-']).any(|part| semver::Version::parse(part.trim_start_matches('v')).is_ok());
+    let version = expected.version.to_string();
+    // The whole version, not its start: `0.2.0` is not in `bowyer_0.2.0-beta.1_x64`.
+    let names_it = file.match_indices(&version).any(|(at, _)| {
+        let rest = &file[at + version.len()..];
+        let before = file[..at].chars().next_back();
+        before.is_none_or(|c| matches!(c, '_' | '-' | 'v'))
+            && (rest.is_empty() || rest.starts_with('_') || rest.strip_prefix('.').is_some_and(|ext| !ext.starts_with(|c: char| c.is_ascii_digit())))
+    });
+    if names_one && !names_it {
+        return refused("the package is of another version than announced");
+    }
+    if expected.signed_after > 0 {
+        let signed = field("timestamp:").and_then(|time| time.parse::<u64>().ok());
+        if signed.is_none_or(|signed| signed <= expected.signed_after) {
+            return refused("the package was signed before this version was built: an older release");
+        }
+    }
+    Ok(())
 }
 
 /// Whether `url` may be fetched: `https`, or `http` on this computer.
@@ -236,16 +297,17 @@ fn file_name(url: &str) -> String {
     if name.is_empty() { "bowyer-update".to_owned() } else { name.to_owned() }
 }
 
-/// Downloads `package` into `dir` and checks its signature with `public_key`. A file whose
-/// signature does not match is deleted.
-pub fn download(package: &Package, dir: &Path, public_key: &str) -> Result<PathBuf> {
+/// Downloads `package` into `dir` and checks its signature with `public_key`, and that the
+/// signature says what is `expected` of it. A file that fails is deleted.
+pub fn download(package: &Package, dir: &Path, public_key: &str, expected: &Expected) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(&package.url));
     let partial = path.with_extension("part");
     let _ = std::fs::remove_file(&partial);
     transfer(&package.url, Some(&partial))?;
     let data = std::fs::read(&partial)?;
-    if let Err(error) = verify(&data, &package.signature, public_key) {
+    let checked = verify_signed(&data, &package.signature, public_key).and_then(|comment| check_comment(&comment, &package.url, expected));
+    if let Err(error) = checked {
         let _ = std::fs::remove_file(&partial);
         return Err(error);
     }

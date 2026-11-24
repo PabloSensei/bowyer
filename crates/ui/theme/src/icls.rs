@@ -138,7 +138,13 @@ fn option_value(option: &Node) -> Option<String> {
     option.attribute("value").and_then(read_color)
 }
 
+/// A colour as the IDE writes it: hex of `0xRRGGBB` without its leading zeros (`ff` is
+/// blue, `8000` a green), never the short CSS form.
 fn read_color(text: &str) -> Option<String> {
+    let text = text.trim();
+    if !text.is_empty() && text.len() < 6 && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Color::from_text(&format!("{text:0>6}")).map(Color::to_text);
+    }
     Color::from_text(text).map(Color::to_text)
 }
 
@@ -208,6 +214,16 @@ mod tests {
             Tokens::dark().text,
             "the rest comes from the parent"
         );
+    }
+
+    /// The IDE drops the leading zeros of a colour.
+    #[test]
+    fn a_colour_without_its_leading_zeros_is_read() {
+        assert_eq!(read_color("ff").as_deref(), Some("#0000ff"));
+        assert_eq!(read_color("8000").as_deref(), Some("#008000"));
+        assert_eq!(read_color("0").as_deref(), Some("#000000"));
+        assert_eq!(read_color("fff").as_deref(), Some("#000fff"), "not the short form of white");
+        assert_eq!(read_color("2b2b2b").as_deref(), Some("#2b2b2b"));
     }
 
     #[test]

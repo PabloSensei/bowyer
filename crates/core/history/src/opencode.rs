@@ -162,6 +162,25 @@ fn has_table(connection: &Connection, name: &str) -> bool {
         .is_some()
 }
 
+/// `column` of `table`, or NULL where the table is of a version without it (an old
+/// `session` has no `model`): one missing column must not hide every session.
+fn column_or_null(connection: &Connection, table: &str, column: &str) -> &'static str {
+    let found = connection
+        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+        .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(1)).map(|names| names.flatten().any(|name| name == column)))
+        .unwrap_or(false);
+    if !found {
+        return "NULL";
+    }
+    match column {
+        "parent_id" => "parent_id",
+        "directory" => "directory",
+        "title" => "title",
+        "model" => "model",
+        _ => "NULL",
+    }
+}
+
 fn sql_error(error: rusqlite::Error) -> io::Error {
     io::Error::other(error)
 }
@@ -202,13 +221,21 @@ impl HistorySource for OpenCodeSource {
             turn: None,
         };
         if has_table(&connection, "session_v2") {
+            let column = |name| match column_or_null(&connection, "session_v2", name) {
+                "NULL" => "NULL".to_owned(),
+                found => format!("s.{found}"),
+            };
             let mut statement = connection
-                .prepare(
-                    "SELECT s.id, s.parent_id, s.directory, s.title, s.model, s.time_created, s.time_updated,
+                .prepare(&format!(
+                    "SELECT s.id, {}, {}, {}, {}, s.time_created, s.time_updated,
                        (SELECT json_extract(m.data, '$.text') FROM session_message m
                          WHERE m.session_id = s.id AND m.type = 'user' ORDER BY m.seq LIMIT 1)
                      FROM session_v2 s WHERE s.time_archived IS NULL",
-                )
+                    column("parent_id"),
+                    column("directory"),
+                    column("title"),
+                    column("model"),
+                ))
                 .map_err(sql_error)?;
             let rows = statement
                 .query_map([], |row| {
@@ -219,8 +246,15 @@ impl HistorySource for OpenCodeSource {
         }
         if has_table(&connection, "session") {
             let known: std::collections::HashSet<String> = sessions.iter().map(|s| s.key.id.clone()).collect();
+            let column = |name| column_or_null(&connection, "session", name);
             let mut statement = connection
-                .prepare("SELECT id, parent_id, directory, title, model, time_created, time_updated FROM session")
+                .prepare(&format!(
+                    "SELECT id, {}, {}, {}, {}, time_created, time_updated FROM session",
+                    column("parent_id"),
+                    column("directory"),
+                    column("title"),
+                    column("model"),
+                ))
                 .map_err(sql_error)?;
             let rows = statement
                 .query_map([], |row| {
@@ -275,12 +309,12 @@ impl HistorySource for OpenCodeSource {
                 .map_err(sql_error)?
                 .flatten()
                 .collect();
-            if rows.is_empty() { None } else { Some(parse_v2(&rows)) }
+            if rows.is_empty() { None } else { Some(parse_v2(&rows, summary.model.clone())) }
         } else {
             None
         };
         if transcript.is_none() && has_table(&connection, "part") {
-            transcript = Some(load_v1(&connection, id)?);
+            transcript = Some(load_v1(&connection, id, summary.model.clone())?);
         }
         let mut transcript = transcript.unwrap_or_default();
         if transcript.model.is_none() {
@@ -334,8 +368,9 @@ fn tool_block(item: &Value, id_field: &str, name_field: &str) -> Block {
 }
 
 /// Rows of `session_message` in order: `(type, data, time_created)`.
-pub fn parse_v2(rows: &[(String, String, i64)]) -> Transcript {
-    let mut transcript = Transcript::default();
+pub fn parse_v2(rows: &[(String, String, i64)], model: Option<String>) -> Transcript {
+    // Calls before the first message that names its model are the session's model's.
+    let mut transcript = Transcript { model, ..Transcript::default() };
     for (kind, data, created) in rows {
         let Ok(value) = serde_json::from_str::<Value>(data) else { continue };
         let next_id = transcript.entries.len().to_string();
@@ -443,8 +478,8 @@ fn turn_of(kind: &str, finish: Option<&str>, completed: bool, tool_running: bool
 }
 
 /// The layout before version 2: messages with their parts in a table of their own.
-fn load_v1(connection: &Connection, id: &str) -> io::Result<Transcript> {
-    let mut transcript = Transcript::default();
+fn load_v1(connection: &Connection, id: &str, model: Option<String>) -> io::Result<Transcript> {
+    let mut transcript = Transcript { model, ..Transcript::default() };
     let mut messages = connection
         .prepare("SELECT id, data, time_created FROM message WHERE session_id = ?1 ORDER BY time_created")
         .map_err(sql_error)?;
@@ -638,6 +673,30 @@ mod tests {
         assert_eq!(transcript.entries[1].blocks.len(), 3);
         assert_eq!(transcript.last_usage.map(|u| u.context()), Some(422));
         assert_eq!(transcript.tasks(false)[0].title, "npm test");
+        // The first call names no model: it counts as the session's, which has a price.
+        let buckets: Vec<&str> = transcript.usage_by_model.iter().map(|(bucket, _)| bucket.as_str()).collect();
+        assert!(!buckets.iter().any(|bucket| bucket.contains("unknown")), "{buckets:?}");
+    }
+
+    /// A `session` table of a version before the `model` column still lists its sessions.
+    #[test]
+    fn an_old_session_table_without_a_model_is_read() {
+        let dir = TempDir::new("opencode-old");
+        let folder = dir.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&folder).unwrap();
+        let connection = Connection::open(folder.join("opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+                 INSERT INTO session VALUES ('ses_a', NULL, '/w', 'Old one', 1, 2);",
+            )
+            .unwrap();
+        drop(connection);
+        let env = LocalEnvironment::with_home(dir.path());
+        let sessions = OpenCodeSource.scan(&env, &(), dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Old one");
+        assert_eq!(sessions[0].model, None);
     }
 }
 

@@ -28,11 +28,15 @@ enum MenuAction {
     MoveOut,
     CopyId,
     DeleteSession,
+    /// A harness group: run the harness's update, or ask for versions again.
+    UpdateHarness,
+    CheckVersions,
 }
 
 impl Shell {
     pub(super) fn open_context_menu(&mut self, row: Row, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if matches!(row.kind, TreeNodeKind::Group(_) | TreeNodeKind::More(..)) {
+        // Of the groups only a harness's has a menu: its version and update.
+        if matches!(row.kind, TreeNodeKind::More(..)) || (matches!(row.kind, TreeNodeKind::Group(_)) && row.harness.is_none()) {
             return;
         }
         self.context_menu = Some(ContextMenu { position, row, confirm_delete: false });
@@ -80,6 +84,16 @@ impl Shell {
                 self.status = Some(format!("{}: {}", t("code.copied"), key.id));
             }
             (MenuAction::DeleteSession, TreeNodeKind::Session(key)) => self.delete_session(key.clone(), cx),
+            (MenuAction::UpdateHarness, _) => {
+                if let Some((env, harness)) = row.harness.clone() {
+                    self.update_harness(env, harness, window, cx);
+                }
+            }
+            (MenuAction::CheckVersions, _) => {
+                if let Some((env, _)) = &row.harness {
+                    self.check_versions(env, cx);
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -102,6 +116,8 @@ impl Shell {
             return;
         };
         self.status = Some(t("menu.deleting").to_owned());
+        // A `claude --resume` left in one of its terminals would bring it back from the trash.
+        self.close_terminals_of(|owner| *owner == key, cx);
         let harness = key.harness.clone();
         let task = cx.background_spawn(async move { history::move_to_trash(&*env, &harness, &files) });
         cx.spawn(async move |this, cx| {
@@ -165,7 +181,14 @@ impl Shell {
                 };
                 entries.push((MenuAction::DeleteSession, label, true));
             }
-            TreeNodeKind::Group(_) | TreeNodeKind::More(..) => return None,
+            TreeNodeKind::Group(_) => {
+                let (env, harness) = menu.row.harness.as_ref()?;
+                if self.harness_versions.newer(env, harness).is_some() && super::harness_view::update_args(harness).is_some() {
+                    entries.push((MenuAction::UpdateHarness, t("menu.update_harness"), false));
+                }
+                entries.push((MenuAction::CheckVersions, t("menu.check_versions"), false));
+            }
+            TreeNodeKind::More(..) => return None,
         }
         let confirm = menu.confirm_delete;
         let list = div()

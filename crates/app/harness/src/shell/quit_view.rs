@@ -7,6 +7,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 
 use super::Shell;
+use super::update_view::PendingUpdate;
 use crate::i18n::t;
 
 /// How long the window waits for the stopped turns before it quits anyway.
@@ -16,6 +17,8 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 pub(super) struct QuitAsk {
     stopping: bool,
+    /// The update that goes in once everything has stopped, when installing it asked.
+    update: Option<PendingUpdate>,
 }
 
 impl Shell {
@@ -36,20 +39,43 @@ impl Shell {
     /// Whether the app may quit now. With turns or terminals running it asks the user
     /// instead and says no; their answer quits later.
     pub(crate) fn may_quit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.quit_ask.as_ref().is_some_and(|ask| ask.stopping) {
+        if self.quitting() {
             return false;
         }
         if self.running_turns().is_empty() && self.open_terminals(cx).is_empty() {
             return true;
         }
-        self.quit_ask = Some(QuitAsk::default());
+        // A question already up keeps the update it waits with.
+        self.quit_ask.get_or_insert_with(QuitAsk::default);
         cx.notify();
         false
     }
 
-    /// Stops every turn and terminal, waits until the turns have ended, then quits.
+    /// Whether the user chose to stop everything and quit: no turn starts any more.
+    pub(super) fn quitting(&self) -> bool {
+        self.quit_ask.as_ref().is_some_and(|ask| ask.stopping)
+    }
+
+    /// Puts an update behind the open question: its answer installs it.
+    pub(super) fn set_quit_update(&mut self, update: PendingUpdate) {
+        if let Some(ask) = &mut self.quit_ask {
+            ask.update = Some(update);
+        }
+    }
+
+    /// Closes the question without quitting; an update waiting behind it is given up.
+    fn cancel_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_ask.take().is_some_and(|ask| ask.update.is_some()) {
+            self.update_given_up();
+        }
+        cx.notify();
+    }
+
+    /// Stops every turn and terminal, waits until the turns have ended, then quits, or
+    /// installs the update the question was for (which quits).
     fn stop_all_and_quit(&mut self, cx: &mut Context<Self>) {
-        self.quit_ask = Some(QuitAsk { stopping: true });
+        let update = self.quit_ask.take().and_then(|ask| ask.update);
+        self.quit_ask = Some(QuitAsk { stopping: true, update: None });
         for run in self.runs.iter_mut().filter(|run| !run.finished) {
             run.asks.clear();
             let stop = run.stop.clone();
@@ -69,7 +95,16 @@ impl Shell {
                     break;
                 }
             }
-            cx.update(|cx| cx.quit());
+            match update {
+                None => cx.update(|cx| cx.quit()),
+                Some(update) => {
+                    this.update(cx, |this, cx| {
+                        this.quit_ask = None;
+                        this.apply_update(update, cx);
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
     }
@@ -110,10 +145,7 @@ impl Shell {
                 .flex()
                 .justify_end()
                 .gap(px(8.))
-                .child(button("quit-cancel", t("quit.cancel"), false).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.quit_ask = None;
-                    cx.notify();
-                })))
+                .child(button("quit-cancel", t("quit.cancel"), false).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_quit(cx))))
                 .child(button("quit-stop", t("quit.stop"), true).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop_all_and_quit(cx))))
                 .into_any_element()
         };
@@ -141,6 +173,9 @@ impl Shell {
                         .shadow(popup_shadow(&theme))
                         .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(15.)).child(t("quit.title")))
                         .child(div().text_size(px(12.5)).text_color(theme.text_secondary).child(t("quit.text")))
+                        .when(ask.update.is_some(), |this| {
+                            this.child(div().text_size(px(12.5)).text_color(theme.text_secondary).child(t("quit.update")))
+                        })
                         .children(list(t("quit.turns"), turns))
                         .children(list(t("quit.terminals"), terminals))
                         .child(actions),

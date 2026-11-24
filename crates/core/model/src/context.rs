@@ -172,7 +172,7 @@ pub fn window_of(model: &str) -> Option<u64> {
         return Some(1_000_000);
     }
     // The 5.x Claude models and Fable have a window of a million tokens, older ones 200K.
-    if model.contains("fable") || (model.starts_with("claude") && model.contains("-5-")) {
+    if model.contains("fable") || crate::pricing::claude_version(&model).is_some_and(|(major, _)| major >= 5) {
         return Some(1_000_000);
     }
     if model.starts_with("claude") {
@@ -243,6 +243,15 @@ fn parse_count(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{Entry, Role, Usage};
+
+    #[test]
+    fn only_claude_5_has_a_window_of_a_million() {
+        assert_eq!(window_of("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(window_of("claude-sonnet-4-5-20250929"), Some(200_000));
+        assert_eq!(window_of("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(window_of("claude-3-5-sonnet-20241022"), Some(200_000));
+        assert_eq!(window_of("claude-sonnet-4-5[1m]"), Some(1_000_000));
+    }
 
     #[test]
     fn claude_counts_its_context_by_category() {

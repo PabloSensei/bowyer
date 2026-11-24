@@ -5,10 +5,12 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::session::SpawnSpec;
 
@@ -67,6 +69,9 @@ pub(crate) struct Pty {
     master: File,
     child: Mutex<Option<Child>>,
     pub(crate) pid: u32,
+    /// The child has exited: its number may belong to another process soon, so it is not
+    /// signalled any more. Set before the child is reaped.
+    exited: AtomicBool,
 }
 
 impl Pty {
@@ -88,9 +93,12 @@ impl Pty {
             master
         };
         let name = slave_name(&master)?;
+        // `O_NOCTTY`: a window started without a terminal must not take this one as its
+        // own (a session leader opening a terminal would); only the child's session does.
         let slave = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(&name)?;
         // macOS refuses the size of a terminal whose slave side nobody has opened yet.
         set_size(&master, spec.cols, spec.rows)?;
@@ -132,6 +140,7 @@ impl Pty {
                 master,
                 child: Mutex::new(Some(child)),
                 pid,
+                exited: AtomicBool::new(false),
             },
             writer,
             reader,
@@ -153,6 +162,16 @@ impl Pty {
         let Some(child) = child.as_mut() else {
             return 1;
         };
+        // Wait without reaping first: until the flag is up the number is still the child's,
+        // so a `terminate` meanwhile cannot hit a process that took it over.
+        // SAFETY: `info` is written by the call and read by nobody.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            while libc::waitid(libc::P_PID, self.pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) != 0
+                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {}
+        }
+        self.exited.store(true, Ordering::SeqCst);
         match child.wait() {
             Ok(status) => status.code().map_or_else(
                 || 128 + status.signal().unwrap_or(0) as u32,
@@ -165,12 +184,25 @@ impl Pty {
     /// The output stream ends when the child closes the slave; nothing else is needed.
     pub(crate) fn close_console(&self) {}
 
-    /// Kills the child and everything it started.
+    /// Kills the child and everything it started. The shell puts each job in a process
+    /// group of its own, so the group of the child is not enough: every process of the
+    /// child's session goes, background jobs too, and with them the last holders of the
+    /// terminal, so the tab ends.
     pub(crate) fn terminate(&self) {
-        // SAFETY: a negative pid names the session of the child.
-        unsafe {
-            libc::kill(-(self.pid as i32), libc::SIGKILL);
-            libc::kill(self.pid as i32, libc::SIGKILL);
+        // A session lives as long as one of its processes, and its number is not given to a
+        // new process meanwhile: `pkill -s` reaches only what the terminal started.
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-s", &self.pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !self.exited.load(Ordering::SeqCst) {
+            // SAFETY: the child has not exited, so the number is still its own.
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+                libc::kill(self.pid as i32, libc::SIGKILL);
+            }
         }
     }
 

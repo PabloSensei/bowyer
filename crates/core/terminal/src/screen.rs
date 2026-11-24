@@ -131,6 +131,10 @@ pub struct Screen {
     pub rows: u16,
     /// `rows * cols` cells, row after row.
     pub cells: Vec<Cell>,
+    /// The characters of no width that follow a cell's own: combining accents (`e` and
+    /// U+0301 make `é`), the joiner and the other parts of an emoji sequence. By the index of
+    /// the cell in `cells`, in its order; few cells have any.
+    pub marks: Vec<(u32, String)>,
     /// `(row, col)`, `None` while the cursor is hidden or scrolled out of view.
     pub cursor: Option<(u16, u16)>,
     /// Lines of history above the live screen that are in view.
@@ -157,11 +161,25 @@ impl Screen {
         &self.cells[row * cols..(row + 1) * cols]
     }
 
+    /// The characters of no width after the cell at `col` of `row`, if any.
+    pub fn marks_at(&self, row: u16, col: u16) -> Option<&str> {
+        let index = (row as usize * self.cols as usize + col as usize) as u32;
+        let at = self.marks.binary_search_by_key(&index, |(at, _)| *at).ok()?;
+        Some(self.marks[at].1.as_str())
+    }
+
     /// The text of a row without trailing blanks.
     pub fn line(&self, row: u16) -> String {
-        let cells = self.row(row).iter();
-        let visible = cells.filter(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER));
-        let line: String = visible.map(|cell| cell.ch).collect();
+        let mut line = String::new();
+        for (col, cell) in self.row(row).iter().enumerate() {
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            line.push(cell.ch);
+            if let Some(marks) = self.marks_at(row, col as u16) {
+                line.push_str(marks);
+            }
+        }
         line.trim_end().to_string()
     }
 

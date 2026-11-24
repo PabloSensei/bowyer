@@ -918,7 +918,7 @@ fn hunk_lines(hunk: &vcs::Hunk, lang: Option<&'static highlight::Lang>, theme: &
         .map(|line| {
             let line = line.trim_end_matches('\r');
             let mark = line.chars().next().unwrap_or(' ');
-            let code = line.get(mark.len_utf8()..).unwrap_or("").replace('\t', "    ");
+            let code = super::files_view::shown_line(line.get(mark.len_utf8()..).unwrap_or(""));
             let spans = match (&mut highlighter, mark) {
                 (Some(h), '+' | '-' | ' ') => h.line(&code),
                 _ => Vec::new(),

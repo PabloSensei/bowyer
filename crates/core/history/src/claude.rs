@@ -22,6 +22,9 @@ pub struct ClaudeSource;
 
 const HEAD_BYTES: u64 = 96 * 1024;
 const TAIL_BYTES: u64 = 256 * 1024;
+/// How much of the start is read when the first prompt is not in [`HEAD_BYTES`]: a picture
+/// in the first prompt makes its line megabytes long.
+const LONG_HEAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Lines that hold nothing the window draws. Checked on the raw text, before parsing: some
 /// of them are the largest lines in the file.
@@ -268,6 +271,7 @@ impl HistorySource for ClaudeSource {
                 _ => changed.push(meta),
             }
         }
+        let mut again = Vec::new();
         for chunk in changed.chunks(BATCH) {
             let requests: Vec<Vec<(String, ReadRange)>> = chunk.iter().map(Self::requests).collect();
             let flat: Vec<(String, ReadRange)> = requests.iter().flatten().cloned().collect();
@@ -277,13 +281,34 @@ impl HistorySource for ClaudeSource {
                 match parts {
                     Ok(parts) => {
                         let summary = Self::summarize(env, meta, parts);
-                        // A session without a single prompt has nothing to show.
-                        if summary.first_prompt.is_some() || !summary.title.is_empty() {
+                        if summary.first_prompt.is_none() && meta.size > HEAD_BYTES + TAIL_BYTES {
+                            again.push((meta.clone(), summary));
+                        } else if shown(&summary) {
                             sessions.push(summary);
                         }
                     }
-                    Err(error) => eprintln!("claude history {}: {error}", meta.path),
+                    Err(error) => {
+                        eprintln!("claude history {}: {error}", meta.path);
+                        // A file that did not read this time (a connection that dropped on
+                        // its batch) keeps what was known of it: a scan without it would
+                        // drop its row, its index and its paid digest.
+                        if let Some(summary) = known.known(&meta.path) {
+                            sessions.push(summary);
+                        }
+                    }
                 }
+            }
+        }
+        // The prompt, the folder and the start were not in the head: a long first line hid
+        // them. Those files are read further, one at a time.
+        for (meta, short) in again {
+            let requests = [(meta.path.clone(), ReadRange::Head(LONG_HEAD_BYTES)), (meta.path.clone(), ReadRange::Tail(TAIL_BYTES))];
+            let summary = match env.read_many(&requests).into_iter().collect::<io::Result<Vec<_>>>() {
+                Ok(parts) => Self::summarize(env, &meta, parts),
+                Err(_) => short,
+            };
+            if shown(&summary) {
+                sessions.push(summary);
             }
         }
         Ok(sessions)
@@ -293,6 +318,11 @@ impl HistorySource for ClaudeSource {
         let bytes = env.read(&summary.source.path, ReadRange::All)?;
         Ok(parse_transcript(&String::from_utf8_lossy(&bytes)))
     }
+}
+
+/// A session without a single prompt or a title has nothing to show.
+fn shown(summary: &SessionSummary) -> bool {
+    summary.first_prompt.is_some() || !summary.title.is_empty()
 }
 
 fn usage_of(value: &Value) -> Option<Usage> {
@@ -598,7 +628,7 @@ impl ClaudeParser {
             .map(|turn| model::FailedTurn { prompt: turn.prompt.clone(), kept: turn.kept.clone(), start: turn.start });
         for id in std::mem::take(&mut self.call_order) {
             if let Some((model, usage, timestamp_ms)) = self.calls_by_message.remove(&id) {
-                self.transcript.add_call(model.as_deref().filter(|m| !m.starts_with('<')), usage, timestamp_ms);
+                self.transcript.add_named_call(&id, model.as_deref().filter(|m| !m.starts_with('<')), usage, timestamp_ms);
             }
         }
         // A compaction after the last call: the context is its summary until the next call.
@@ -908,6 +938,22 @@ mod tests {
         assert!(transcript.usage_since(next_day).is_empty());
     }
 
+    /// A session resumed into a new file repeats the calls of the one before: the month's
+    /// sum counts them once.
+    #[test]
+    fn a_resumed_session_does_not_count_the_calls_before_it_twice() {
+        let first = parse_transcript(SESSION);
+        let resumed = parse_transcript(&format!("{SESSION}{SESSION}"));
+        assert!(!first.named_calls.is_empty());
+        let mut alone = model::UsageSum::default();
+        alone.add_session(&first.spent_since(0));
+        let mut both = model::UsageSum::default();
+        both.add_session(&first.spent_since(0));
+        both.add_session(&resumed.spent_since(0));
+        assert_eq!(both.buckets, alone.buckets);
+        assert_eq!(alone.buckets, first.usage_by_model);
+    }
+
     #[test]
     fn a_follower_reads_on_as_the_file_grows() {
         let dir = TempDir::new("claude_follow");
@@ -1034,5 +1080,60 @@ Task 0.16: previews"), "Task 0.16: previews");
         assert_eq!(session.git_branch.as_deref(), Some("fix/parser"));
         assert_eq!(session.first_prompt.as_deref(), Some("Fix the failing test in parser.rs"));
         assert_eq!(session.model.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    struct Known(Vec<SessionSummary>);
+
+    impl KnownSummaries for Known {
+        fn known(&self, source_path: &str) -> Option<SessionSummary> {
+            self.0.iter().find(|summary| summary.source.path == source_path).cloned()
+        }
+    }
+
+    /// A picture in the first prompt makes the first line longer than the head that is read:
+    /// the prompt, the folder and the start are read further into the file.
+    #[test]
+    fn a_picture_in_the_first_prompt_hides_nothing() {
+        let dir = TempDir::new("claude_scan_picture");
+        let projects = dir.path().join(".claude/projects/-work-app");
+        std::fs::create_dir_all(&projects).unwrap();
+        let picture = "A".repeat((HEAD_BYTES + 10_000) as usize);
+        let first = serde_json::json!({
+            "parentUuid": null, "type": "user", "uuid": "u1", "timestamp": "2026-11-01T10:00:00.000Z", "cwd": "/work/app", "sessionId": "s1",
+            "message": {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": picture}},
+                {"type": "text", "text": "What is wrong on this screen?"}
+            ]}
+        });
+        let answer = serde_json::json!({
+            "type": "assistant", "uuid": "a1", "timestamp": "2026-11-01T10:05:00.000Z", "cwd": "/work/app", "sessionId": "s1",
+            "message": {"id": "m1", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "z".repeat(1000)}]}
+        });
+        let mut text = format!("{first}\n");
+        while text.len() < (HEAD_BYTES + TAIL_BYTES) as usize + 50_000 {
+            text.push_str(&format!("{answer}\n"));
+        }
+        std::fs::write(projects.join("s1.jsonl"), text).unwrap();
+        let sessions = ClaudeSource.scan(&LocalEnvironment::with_home(dir.path()), &(), dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].first_prompt.as_deref(), Some("What is wrong on this screen?"));
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/work/app"));
+        assert_eq!(model::format_ms_utc(sessions[0].created_ms).get(..16), Some("2026-11-01 10:00"));
+    }
+
+    /// A session whose file changed but did not read this time stays as it was known.
+    #[test]
+    fn a_file_that_does_not_read_keeps_its_session() {
+        let dir = TempDir::new("claude_scan_unread");
+        let projects = dir.path().join(".claude/projects/-work-app");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("s1.jsonl"), SESSION).unwrap();
+        let env = LocalEnvironment::with_home(dir.path());
+        let before = ClaudeSource.scan(&env, &(), dir.path()).unwrap();
+        assert_eq!(before.len(), 1);
+        std::fs::write(projects.join("s1.jsonl"), format!("{SESSION}{SESSION}")).unwrap();
+        std::fs::write(projects.join("s2.jsonl"), SESSION.replace("\"s1\"", "\"s2\"")).unwrap();
+        let after = ClaudeSource.scan(&crate::test_env::Unreadable::all(env), &Known(before.clone()), dir.path()).unwrap();
+        assert_eq!(after, before, "the known session stays; the new one waits for a read");
     }
 }

@@ -124,6 +124,16 @@ fn mention_start(before: &str) -> Option<usize> {
     (starts_word && !word.contains(char::is_whitespace)).then_some(at)
 }
 
+/// What a suggestion list made for the word at `start` replaces now: from there to the
+/// caret, if the caret is still in that word. A click, or text put in from elsewhere, moves
+/// the caret without the list knowing.
+fn completion_range(text: &str, caret: usize, start: usize) -> Option<std::ops::Range<usize>> {
+    let caret = caret.min(text.len());
+    let before = text.get(..caret)?;
+    let command = start == 0 && before.strip_prefix('/').is_some_and(|query| !query.contains(char::is_whitespace));
+    (command || mention_start(before) == Some(start)).then_some(start..caret)
+}
+
 /// How well a path answers a query: lower is better; `None` when it does not.
 fn file_score(path: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
@@ -502,17 +512,22 @@ impl Shell {
     fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(completion) = self.completion.take() else { return };
         let Some(item) = completion.items.get(completion.selected) else { return };
+        let Some(range) = completion_range(&self.composer.text, self.composer.caret(), completion.start) else {
+            // The caret left the word: the list no longer answers it.
+            self.update_completion(cx);
+            cx.notify();
+            return;
+        };
         match item.choice.clone() {
             Choice::Run(command) => {
                 self.composer = TextField::from_text("");
                 self.run_command(command, window, cx);
             }
             Choice::Insert(text) => {
-                let caret = self.composer.caret().min(self.composer.text.len());
                 let mut line = self.composer.text.clone();
-                line.replace_range(completion.start..caret, &text);
+                line.replace_range(range.clone(), &text);
                 self.composer = TextField::from_text(line);
-                self.composer.set_caret(completion.start + text.len());
+                self.composer.set_caret(range.start + text.len());
             }
         }
         cx.notify();
@@ -713,7 +728,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the GPUI prelude brings its own `test` attribute.
-    use super::{Command, file_score, fit, mention_start};
+    use super::{Command, completion_range, file_score, fit, mention_start};
 
     #[test]
     fn mentions_start_a_word() {
@@ -721,6 +736,20 @@ mod tests {
         assert_eq!(mention_start("@"), Some(0));
         assert_eq!(mention_start("mail me@host"), None);
         assert_eq!(mention_start("@done and more"), None);
+    }
+
+    /// A list made for one word is not applied to another the caret moved to.
+    #[test]
+    fn a_stale_suggestion_list_replaces_nothing() {
+        let text = "look at @src/ma and then";
+        assert_eq!(completion_range(text, 15, 8), Some(8..15));
+        assert_eq!(completion_range(text, 3, 8), None, "the caret before the word");
+        assert_eq!(completion_range(text, 20, 8), None, "the caret in a later word");
+        assert_eq!(completion_range("@ä", 2, 0), None, "not on a character's edge");
+        assert_eq!(completion_range("@ä", 3, 0), Some(0..3));
+        assert_eq!(completion_range("ab", 9, 0), None, "the text got shorter");
+        assert_eq!(completion_range("/mod", 4, 0), Some(0..4));
+        assert_eq!(completion_range("/model and", 10, 0), None);
     }
 
     #[test]

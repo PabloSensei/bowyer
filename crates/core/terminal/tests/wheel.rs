@@ -47,6 +47,18 @@ fn received(session: &TerminalSession) -> String {
         .replace("^[", "\x1b")
 }
 
+/// Ctrl with `/` or a digit reaches a program that reads a byte stream as the control
+/// character xterm sends, through the console.
+#[test]
+fn ctrl_with_a_digit_or_slash_reaches_a_program_as_a_control_character() {
+    use terminal::{Key, KeyEvent, Mods};
+    for (ch, expected) in [('/', "^_"), ('2', "^@"), ('3', "\x1b"), ('6', "^^"), ('7', "^_"), ('8', "^?"), ('c', "^C")] {
+        let session = tui(&[]);
+        session.key(KeyEvent::new(Key::Char(ch), Mods::CTRL)).expect("key");
+        assert_eq!(received(&session), expected, "Ctrl+{ch}");
+    }
+}
+
 #[test]
 fn a_wheel_turn_reaches_a_program_that_asked_for_sgr_mouse_reports() {
     let session = tui(&["alt", "mouse", "sgr"]);

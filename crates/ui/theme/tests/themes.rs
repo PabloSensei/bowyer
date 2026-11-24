@@ -175,6 +175,34 @@ fn a_theme_of_the_folder_joins_the_library_over_a_parent() {
     assert_eq!(themes_folder(folder.path()), folder.path().join("themes"));
 }
 
+/// A theme may build on a file that comes after it by name, and parents that name each
+/// other in a loop are refused.
+#[test]
+fn a_theme_builds_on_a_later_file_and_a_loop_is_refused() {
+    let folder = test_support::TempDir::new("theme-order");
+    std::fs::write(
+        folder.join("alpha.theme.json"),
+        r##"{"name": "Alpha", "dark": true, "parent": "zulu", "ui": {"accent": "#00ff00"}}"##,
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("zulu.theme.json"),
+        r##"{"name": "Zulu", "dark": true, "parent": "dark", "ui": {"editor_bg": "#123456"}}"##,
+    )
+    .unwrap();
+    std::fs::write(folder.join("ping.theme.json"), r##"{"name": "Ping", "dark": true, "parent": "pong", "ui": {}}"##).unwrap();
+    std::fs::write(folder.join("pong.theme.json"), r##"{"name": "Pong", "dark": true, "parent": "ping", "ui": {}}"##).unwrap();
+    let library = ThemeLibrary::load(folder.path());
+    let alpha = library.get("alpha").expect("built on the later file");
+    assert_eq!(alpha.tokens.editor_bg, Color::from_text("#123456").unwrap());
+    assert_eq!(alpha.tokens.accent, Color::from_text("#00ff00").unwrap());
+    let ids: Vec<&str> = library.themes().iter().filter(|theme| !theme.builtin).map(|theme| theme.id.as_str()).collect();
+    assert_eq!(ids, ["alpha", "zulu"], "listed by file name");
+    assert!(library.get("ping").is_none() && library.get("pong").is_none());
+    let errors: Vec<String> = library.errors().iter().map(ToString::to_string).collect();
+    assert!(errors.iter().any(|error| error.contains("ping")) && errors.iter().any(|error| error.contains("pong")), "{errors:?}");
+}
+
 #[test]
 fn a_broken_file_is_left_out_and_named() {
     let folder = test_support::TempDir::new("theme-broken");

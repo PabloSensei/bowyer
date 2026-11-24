@@ -49,6 +49,18 @@ fn run_command(session: &TerminalSession, text: &str) {
     session.key(KeyEvent::plain(Key::Enter)).expect("enter");
 }
 
+/// An accent written as a second character and an emoji joined of three stay on the
+/// screen with their letters.
+#[test]
+fn accents_of_no_width_stay_with_their_letters() {
+    let session = probe_with(&["tui".to_string(), "accents".to_string()]);
+    let shown = session.wait_for(WAIT, |screen| screen.contains("done"));
+    assert!(shown, "the probe printed");
+    let screen = session.screen();
+    assert!(screen.contains("cafe\u{301} and"), "{:?}", screen.lines());
+    assert!(screen.contains("\u{1F469}\u{200D}\u{1F4BB}"), "{:?}", screen.lines());
+}
+
 #[test]
 fn a_session_can_be_hosted_in_a_console() {
     let session = probe_with(&["attach".to_string(), "cmd.exe /q".to_string()]);

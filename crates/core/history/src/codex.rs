@@ -21,6 +21,8 @@ use crate::{HistorySource, KnownSummaries, parse_rfc3339_ms, text_of};
 pub struct CodexSource;
 
 const HEAD_BYTES: u64 = 64 * 1024;
+/// How much is read when the first prompt is not in [`HEAD_BYTES`].
+const LONG_HEAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Text the CLI injects as user messages: instructions and the environment.
 fn injected(text: &str) -> bool {
@@ -34,8 +36,58 @@ fn injected(text: &str) -> bool {
 fn file_id(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let name = name.strip_suffix(".jsonl").unwrap_or(name);
-    // rollout-2025-01-01T10-00-00-<uuid>: the uuid is the last 36 characters.
-    if name.len() > 36 { name[name.len() - 36..].to_owned() } else { name.to_owned() }
+    // rollout-2025-01-01T10-00-00-<uuid>: the uuid is the last 36 characters (counted as
+    // characters: a name of another kind may hold letters of more than one byte).
+    match name.char_indices().rev().nth(35) {
+        Some((start, _)) if start > 0 => name[start..].to_owned(),
+        _ => name.to_owned(),
+    }
+}
+
+/// What the start of a session file says of it.
+fn summary_of_head(env: &dyn Environment, meta: &envs::FileMeta, head: &str) -> SessionSummary {
+    let mut summary = SessionSummary {
+        key: SessionKey { env: env.id(), harness: HarnessKind::Codex, id: file_id(&meta.path) },
+        title: String::new(),
+        first_prompt: None,
+        cwd: None,
+        git_branch: None,
+        model: None,
+        created_ms: meta.modified_ms,
+        updated_ms: meta.modified_ms,
+        turn: None,
+        parent: None,
+        source: SourceStamp { path: meta.path.clone(), size: meta.size, modified_ms: meta.modified_ms },
+    };
+    for line in head.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        match value.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    summary.key.id = id.to_owned();
+                }
+                summary.cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_owned);
+                summary.git_branch = payload.pointer("/git/branch").and_then(Value::as_str).map(str::to_owned);
+                if let Some(ms) = payload.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms) {
+                    summary.created_ms = ms;
+                }
+            }
+            Some("turn_context") if summary.model.is_none() => {
+                summary.model = payload.get("model").and_then(Value::as_str).map(str::to_owned);
+            }
+            Some("response_item") if summary.first_prompt.is_none() => {
+                if payload.get("role").and_then(Value::as_str) == Some("user") {
+                    let text = text_of(payload.get("content").unwrap_or(&Value::Null));
+                    if !text.trim().is_empty() && !injected(&text) {
+                        summary.first_prompt = Some(model::shorten(text.trim(), 500));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    summary
 }
 
 impl HistorySource for CodexSource {
@@ -49,57 +101,36 @@ impl HistorySource for CodexSource {
         files.extend(env.find_files(&env.join(&codex, "archived_sessions"), ".jsonl", 4)?);
         let mut sessions = Vec::new();
         for meta in files {
-            if let Some(summary) = known.known(&meta.path)
+            let known = known.known(&meta.path);
+            if let Some(summary) = &known
                 && summary.source.size == meta.size
                 && summary.source.modified_ms == meta.modified_ms
             {
-                sessions.push(summary);
+                sessions.push(summary.clone());
                 continue;
             }
-            let head = env.read(&meta.path, ReadRange::Head(HEAD_BYTES))?;
-            let head = String::from_utf8_lossy(&head);
-            let mut summary = SessionSummary {
-                key: SessionKey { env: env.id(), harness: HarnessKind::Codex, id: file_id(&meta.path) },
-                title: String::new(),
-                first_prompt: None,
-                cwd: None,
-                git_branch: None,
-                model: None,
-                created_ms: meta.modified_ms,
-                updated_ms: meta.modified_ms,
-                turn: None,
-                parent: None,
-                source: SourceStamp { path: meta.path.clone(), size: meta.size, modified_ms: meta.modified_ms },
-            };
-            for line in head.lines() {
-                let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
-                let payload = value.get("payload").unwrap_or(&Value::Null);
-                match value.get("type").and_then(Value::as_str) {
-                    Some("session_meta") => {
-                        if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                            summary.key.id = id.to_owned();
-                        }
-                        summary.cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_owned);
-                        summary.git_branch =
-                            payload.pointer("/git/branch").and_then(Value::as_str).map(str::to_owned);
-                        if let Some(ms) = payload.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms) {
-                            summary.created_ms = ms;
-                        }
+            // One file that does not read stops nothing else; it keeps what was known of it.
+            // The first prompt is mostly near the start; a long first line (the instructions,
+            // a picture) pushes it further, and then more of the file is read.
+            let mut read = HEAD_BYTES;
+            let summary = loop {
+                let head = match env.read(&meta.path, ReadRange::Head(read)) {
+                    Ok(head) => head,
+                    Err(error) => {
+                        eprintln!("codex history {}: {error}", meta.path);
+                        break None;
                     }
-                    Some("turn_context") if summary.model.is_none() => {
-                        summary.model = payload.get("model").and_then(Value::as_str).map(str::to_owned);
-                    }
-                    Some("response_item") if summary.first_prompt.is_none() => {
-                        if payload.get("role").and_then(Value::as_str) == Some("user") {
-                            let text = text_of(payload.get("content").unwrap_or(&Value::Null));
-                            if !text.trim().is_empty() && !injected(&text) {
-                                summary.first_prompt = Some(model::shorten(text.trim(), 500));
-                            }
-                        }
-                    }
-                    _ => {}
+                };
+                let summary = summary_of_head(env, &meta, &String::from_utf8_lossy(&head));
+                if summary.first_prompt.is_some() || meta.size <= read || read >= LONG_HEAD_BYTES {
+                    break Some(summary);
                 }
-            }
+                read = LONG_HEAD_BYTES;
+            };
+            let Some(mut summary) = summary else {
+                sessions.extend(known);
+                continue;
+            };
             if summary.first_prompt.is_some() {
                 // Where the turn stands, for a session written lately: from the end of its file.
                 if meta.modified_ms >= crate::now_ms() - TURN_WINDOW_MS
@@ -134,6 +165,7 @@ fn usage_of(value: &Value) -> Usage {
 pub fn parse_transcript(text: &str) -> Transcript {
     let mut transcript = Transcript::default();
     let mut calls: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut last_total: Option<Value> = None;
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
         let timestamp_ms = value.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms).unwrap_or(0);
@@ -149,19 +181,21 @@ pub fn parse_transcript(text: &str) -> Transcript {
                 text: payload.get("message").and_then(Value::as_str).unwrap_or("").to_owned(),
             }, true),
             "event_msg" if payload_type == "token_count" => {
-                if let Some(total) = payload.pointer("/info/total_token_usage") {
-                    transcript.total_usage = usage_of(total);
+                // Codex repeats its last count when only the rate limits changed: a call is
+                // a count whose total moved.
+                let total = payload.pointer("/info/total_token_usage");
+                if total.is_some() && total == last_total.as_ref() {
+                    continue;
                 }
+                last_total = total.cloned();
                 if let Some(last) = payload.pointer("/info/last_token_usage") {
-                    // Totals come from the harness; the per-call record prices the session.
-                    let usage = usage_of(last);
-                    let model = transcript.model.clone().unwrap_or_else(|| "unknown".into());
-                    match transcript.usage_by_model.iter_mut().find(|(name, _)| *name == model) {
-                        Some((_, sum)) => sum.add(&usage),
-                        None => transcript.usage_by_model.push((model, usage)),
-                    }
-                    transcript.last_usage = Some(usage);
-                    transcript.last_call_ms = Some(timestamp_ms);
+                    // The per-call record prices the session and its days.
+                    let model = transcript.model.clone();
+                    transcript.add_call(model.as_deref(), usage_of(last), timestamp_ms);
+                }
+                // The totals come from the harness.
+                if let Some(total) = total {
+                    transcript.total_usage = usage_of(total);
                 }
             }
             "response_item" => match payload_type {
@@ -291,6 +325,17 @@ pub fn codex_turn_of_tail(tail: &[u8]) -> Option<TurnState> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_file_name_of_any_letters_gives_an_id() {
+        use super::file_id;
+        let uuid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(file_id(&format!("/h/.codex/sessions/2025/01/01/rollout-2025-01-01T10-00-00-{uuid}.jsonl")), uuid);
+        // 38 letters in 63 bytes: the 36th byte from the end is the second half of a `ü`.
+        let umlauts = format!("/h/.codex/sessions/{}{}.jsonl", "ü".repeat(25), "a".repeat(13));
+        assert_eq!(file_id(&umlauts).chars().count(), 36, "no panic in a letter");
+        assert_eq!(file_id("/h/.codex/sessions/kürzer.jsonl"), "kürzer");
+    }
+
+    #[test]
     fn the_last_line_that_tells_gives_the_turn() {
         use super::codex_turn_of_tail;
         use model::TurnState;
@@ -351,5 +396,49 @@ mod tests {
         assert_eq!(sessions[0].first_prompt.as_deref(), Some("Add a health endpoint"));
         assert_eq!(sessions[0].git_branch.as_deref(), Some("dev"));
         assert_eq!(sessions[0].cwd.as_deref(), Some("/work/api"));
+    }
+
+    /// Codex repeats its last count when only the rate limits change: the call counts once,
+    /// and its day is known.
+    #[test]
+    fn a_repeated_token_count_is_one_call() {
+        let count = ROLLOUT.lines().find(|line| line.contains("token_count")).unwrap();
+        let once = parse_transcript(ROLLOUT);
+        let twice = parse_transcript(&ROLLOUT.replacen(count, &format!("{count}\n{count}"), 1));
+        assert_eq!(twice.usage_by_model, once.usage_by_model);
+        assert_eq!(once.usage_by_model.iter().map(|(_, usage)| usage.output).sum::<u64>(), 100);
+        assert_eq!(once.usage_since(0), once.usage_by_model, "the calls have their days");
+        assert_eq!(once.total_usage.output, 300, "the total is the harness's");
+    }
+
+    /// Long instructions in the first line push the first prompt past the usual head: the
+    /// session is still found, with its folder and prompt.
+    #[test]
+    fn a_first_prompt_far_in_the_file_is_found() {
+        let dir = TempDir::new("codex_scan_long");
+        let day = dir.path().join(".codex/sessions/2026/10/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let long = "x".repeat(HEAD_BYTES as usize + 1000);
+        let rollout = ROLLOUT.replacen(r#""git":{"branch":"dev"}"#, &format!(r#""git":{{"branch":"dev"}},"instructions":"{long}""#), 1);
+        assert_ne!(rollout, ROLLOUT);
+        std::fs::write(day.join("rollout-2026-10-01T09-00-00-0199aaaa-bbbb-cccc-dddd-eeeeffff0000.jsonl"), rollout).unwrap();
+        let sessions = CodexSource.scan(&LocalEnvironment::with_home(dir.path()), &(), dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].first_prompt.as_deref(), Some("Add a health endpoint"));
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/work/api"));
+    }
+
+    /// A file that does not read leaves the others in the scan.
+    #[test]
+    fn one_file_that_does_not_read_stops_nothing_else() {
+        let dir = TempDir::new("codex_scan_one_bad");
+        let day = dir.path().join(".codex/sessions/2026/10/01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-2026-10-01T09-00-00-0199aaaa-bbbb-cccc-dddd-eeeeffff0000.jsonl"), ROLLOUT).unwrap();
+        std::fs::write(day.join("rollout-2026-10-01T10-00-00-broken.jsonl"), ROLLOUT).unwrap();
+        let env = crate::test_env::Unreadable::paths_with(LocalEnvironment::with_home(dir.path()), "broken");
+        let sessions = CodexSource.scan(&env, &(), dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].key.id, "0199aaaa-bbbb-cccc-dddd-eeeeffff0000");
     }
 }

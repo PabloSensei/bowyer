@@ -53,6 +53,8 @@ mod update_view;
 pub use titlebar::window_options;
 mod ssh_view;
 mod new_session;
+mod harness_view;
+mod memory_tunnel;
 
 pub const APP_NAME: &str = "Bowyer";
 
@@ -111,6 +113,13 @@ pub(crate) const MONO: &str = "JetBrains Mono";
 
 fn hex(color: u32) -> Hsla {
     rgb(color).into()
+}
+
+/// Puts the results a model ranked first back in its order, the others after them as the
+/// search gave them.
+fn keep_ranking(hits: &mut [SearchHit], order: &[SessionKey]) {
+    let rank = |hit: &SearchHit| order.iter().position(|key| *key == hit.key).unwrap_or(usize::MAX);
+    hits.sort_by_key(rank);
 }
 
 fn harness_color(harness: &HarnessKind) -> Hsla {
@@ -222,6 +231,8 @@ struct Row {
     turn: Option<model::TurnState>,
     /// Where the + of a project row starts a new session.
     start: Option<library::SessionStart>,
+    /// The environment and harness of a harness group: its version and updates.
+    harness: Option<(model::EnvId, HarnessKind)>,
 }
 
 /// What a session is doing now, by where its last turn stands and when it last wrote.
@@ -441,6 +452,9 @@ pub struct Shell {
     search: TextField,
     search_focus: FocusHandle,
     hits: Option<Vec<SearchHit>>,
+    /// The order a model ranked the results of a query in: the same query searched again
+    /// (after a scan, say) keeps it.
+    ranked: Option<(String, Vec<SessionKey>)>,
     /// The number of the latest search: an older one that finishes later is dropped.
     search_seq: u64,
 
@@ -550,6 +564,8 @@ pub struct Shell {
     /// How many of the open session's commands and agents the right pane lists, newest first;
     /// another session starts again from `TASKS_SHOWN`.
     tasks_shown: Option<(SessionKey, usize)>,
+    /// The same for its agents.
+    agents_shown: Option<(SessionKey, usize)>,
     /// The plan of each account the open sessions used, and an API account's month.
     plans: HashMap<(model::EnvId, HarnessKind), plan_view::PlanState>,
     months: HashMap<(model::EnvId, HarnessKind), plan_view::MonthState>,
@@ -571,6 +587,10 @@ pub struct Shell {
     /// Turns the window runs, of any session; finished ones stay until their session is
     /// read again.
     runs: Vec<LiveRun>,
+    /// The harnesses' versions in each environment and the newest releases.
+    harness_versions: harness_view::HarnessVersions,
+    /// The memory server over HTTP and the tunnels that bring it to SSH hosts.
+    memory_link: memory_tunnel::MemoryLink,
     next_run: u64,
     /// What was typed in the composer of each session the user left, with its attachments.
     drafts: std::collections::HashMap<SessionKey, (TextField, Vec<composer::Attached>)>,
@@ -587,6 +607,9 @@ pub struct Shell {
     extensions_open: bool,
     theme_editor: Option<theme_editor::ThemeEditor>,
     extensions: Option<Result<Vec<Extension>, String>>,
+    /// The session place `extensions` is (or is being read) for: its environment, harness
+    /// and folder. Another session open reads them again.
+    extensions_of: Option<(model::EnvId, HarnessKind, Option<String>)>,
     status: Option<String>,
     pub(crate) focus: FocusHandle,
 }
@@ -664,6 +687,7 @@ impl Shell {
             search: TextField::from_text(""),
             search_focus: cx.focus_handle(),
             hits: None,
+            ranked: None,
             search_seq: 0,
             renaming: None,
             rename_focus: cx.focus_handle(),
@@ -731,6 +755,7 @@ impl Shell {
             terminal_anchor: Default::default(),
             folded,
             tasks_shown: None,
+            agents_shown: None,
             plans: HashMap::new(),
             months: HashMap::new(),
             month_cache: Default::default(),
@@ -742,9 +767,12 @@ impl Shell {
             diff_view: None,
             commit_view: None,
             runs: Vec::new(),
+            harness_versions: Default::default(),
+            memory_link: Default::default(),
             next_run: 1,
             drafts: Default::default(),
-            permission: Permission::default(),
+            // Turns from the window run with everything allowed unless the user picks otherwise.
+            permission: Permission::Bypass,
             composer_menu: None,
             composer_anchors: Default::default(),
             footer_menu: None,
@@ -753,6 +781,7 @@ impl Shell {
             extensions_open: false,
             theme_editor: None,
             extensions: None,
+            extensions_of: None,
             status: None,
             focus: cx.focus_handle(),
         };
@@ -874,6 +903,7 @@ impl Shell {
                         updated_ms: summary.updated_ms,
                         turn: summary.turn,
                         start: None,
+                        harness: None,
                     })
                 })
                 .collect();
@@ -907,6 +937,7 @@ impl Shell {
                 },
                 // Only a harness the window can run takes a new session from the tree.
                 start: node.start.clone().filter(|start| can_run_live(&start.harness)),
+                harness: node.harness.clone(),
             })
             .collect();
     }
@@ -1327,9 +1358,8 @@ impl Shell {
         let task = cx.background_spawn(async move {
             match ranker {
                 rerank::Ranker::Haiku => {
-                    let env = envs::LocalEnvironment::new();
                     let folder = std::env::temp_dir();
-                    let out = env.run_with_input("claude", &rerank::arguments(), folder.to_str(), prompt.as_bytes()).map_err(|e| e.to_string())?;
+                    let out = rerank::run_claude(&rerank::arguments(), folder.to_str(), prompt.as_bytes()).map_err(|e| e.to_string())?;
                     rerank::read_answer(&out).ok_or_else(|| model::shorten(out.trim(), 200))
                 }
                 rerank::Ranker::Local(model) => rerank::ask_local(&model, &prompt).map(|text| (text, None)),
@@ -1348,7 +1378,9 @@ impl Shell {
                         {
                             let order = rerank::parse_order(&text, count);
                             let top: Vec<SearchHit> = order.iter().map(|&i| hits[i].clone()).collect();
+                            let keys = top.iter().map(|hit| hit.key.clone()).collect();
                             hits.splice(0..count, top);
+                            this.ranked = Some((query.clone(), keys));
                             this.rebuild_rows();
                         }
                         let cost = cost.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
@@ -1635,6 +1667,11 @@ impl Shell {
             return;
         }
         self.selected = Some(key.clone());
+        // The user went to another session: the one a finished turn wanted to show again
+        // stays where it is.
+        if self.pending_open.as_ref().is_some_and(|pending| *pending != key) {
+            self.pending_open = None;
+        }
         self.runs.retain(|run| !run.finished);
         let (Some(summary), Some(env)) = (self.summary(&key).cloned(), self.env_for(&key.env)) else {
             cx.notify();
@@ -1644,7 +1681,6 @@ impl Shell {
         let generation = self.load_generation;
         self.loading = true;
         self.load_error = None;
-        self.extensions = None;
         let cache = self.cache_dir.join("remote");
         let library = self.library.clone();
         let dropped = self.dropped_prompt(&summary.key);
@@ -1686,11 +1722,12 @@ impl Shell {
                         if let Some(run) = running {
                             loaded.items.truncate(run.base_items);
                         }
-                        this.switch_composer(Some(&summary.key));
+                        this.switch_composer(Some(&summary), cx);
                         let list = conversation_list(loaded.items.len() + live_items);
                         // The same session read again after a turn of the window keeps the
                         // place the reader was at; a session opened anew shows its last item.
                         let before = this.open.as_ref().filter(|open| open.summary.key == summary.key).map(|open| &open.list);
+                        let same = before.is_some();
                         match before {
                             Some(before) if before.is_following_tail() => {}
                             Some(before) => list.scroll_to(before.logical_scroll_top()),
@@ -1699,10 +1736,10 @@ impl Shell {
                             }
                             None => {}
                         }
-                        this.open_runs.clear();
-                        this.open_calls.clear();
-                        this.open_thinking.clear();
-                        this.open_summaries.clear();
+                        // The same session read again keeps its blocks open and its selection.
+                        if !same {
+                            this.forget_view_state();
+                        }
                         this.open = Some(OpenSession {
                             summary,
                             model: loaded.transcript.model.clone(),
@@ -1724,10 +1761,15 @@ impl Shell {
                             failed: loaded.transcript.failed_turn.clone(),
                             run: None,
                         });
+                        // Each session read (a turn may have added a server) reads the
+                        // extensions again, while the panel is open.
+                        this.extensions_of = None;
                         this.look_for_ide(cx);
                         this.look_at_plan(false, cx);
                     }
                     Err(error) => {
+                        // What was typed for the session left stays with it.
+                        this.switch_composer(None, cx);
                         this.open = None;
                         this.load_error = Some(error);
                         // Loaded again later by itself; the same session's failures space
@@ -1763,6 +1805,7 @@ impl Shell {
                     updated_ms: 0,
                     children: Vec::new(),
                     start: None,
+                    harness: None,
                 }
                 .collapse_id();
                 if !self.collapsed.remove(&id) {
@@ -1970,11 +2013,17 @@ impl Shell {
             return;
         }
         let library = self.library.clone();
-        let task = cx.background_spawn(async move { library.lock().ok().and_then(|lib| lib.search(&query, 200).ok()).unwrap_or_default() });
+        let asked = query.clone();
+        let task = cx.background_spawn(async move { library.lock().ok().and_then(|lib| lib.search(&asked, 200).ok()).unwrap_or_default() });
         cx.spawn(async move |this, cx| {
-            let hits = task.await;
+            let mut hits = task.await;
             this.update(cx, |this, cx| {
                 if this.search_seq == seq {
+                    if let Some((ranked, order)) = &this.ranked
+                        && *ranked == query
+                    {
+                        keep_ranking(&mut hits, order);
+                    }
                     this.hits = Some(hits);
                     this.rebuild_rows();
                     cx.notify();
@@ -2115,27 +2164,55 @@ impl Shell {
         self.reload(cx);
     }
 
+    /// Forgets which blocks of the conversation are open and what is selected in it: they
+    /// name items by their place, which in another session are other items.
+    pub(super) fn forget_view_state(&mut self) {
+        self.open_runs.clear();
+        self.open_calls.clear();
+        self.open_thinking.clear();
+        self.open_summaries.clear();
+        self.selection = None;
+    }
+
     fn toggle_extensions(&mut self, cx: &mut Context<Self>) {
         self.extensions_open = !self.extensions_open;
-        if self.extensions_open && self.extensions.is_none() {
-            self.load_extensions(cx);
+        // Opened again, the panel reads again: a server added since then shows.
+        if self.extensions_open {
+            self.extensions_of = None;
         }
+        self.want_extensions(cx);
         cx.notify();
     }
 
+    /// Reads the extensions of the open session while the panel is open, unless they are
+    /// read (or being read) for its place already.
+    fn want_extensions(&mut self, cx: &mut Context<Self>) {
+        if !self.extensions_open {
+            return;
+        }
+        let place = self.open.as_ref().map(|open| (open.summary.key.env.clone(), open.summary.key.harness.clone(), open.summary.cwd.clone()));
+        if place != self.extensions_of {
+            self.extensions = None;
+            self.extensions_of = place;
+            self.load_extensions(cx);
+        }
+    }
+
     fn load_extensions(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = &self.open else { return };
-        let Some(env) = self.env_for(&open.summary.key.env) else { return };
-        let harness = open.summary.key.harness.clone();
-        let cwd = open.summary.cwd.clone();
+        let Some(asked) = self.extensions_of.clone() else { return };
+        let Some(env) = self.env_for(&asked.0) else { return };
+        let (harness, cwd) = (asked.1.clone(), asked.2.clone());
         let task = cx.background_spawn(async move {
             extensions::list(&*env, &harness, cwd.as_deref()).map_err(|e| e.to_string())
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.extensions = Some(result);
-                cx.notify();
+                // The answer for a session left since then is not this one's.
+                if this.extensions_of.as_ref() == Some(&asked) {
+                    this.extensions = Some(result);
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -2584,6 +2661,11 @@ impl Shell {
                 Some(DragItem::Folder(*id, row.label.clone())),
             ),
             TreeNodeKind::Group(_) => {
+                // A harness row shows its version there, and an arrow when a newer one is out.
+                let version = row
+                    .harness
+                    .clone()
+                    .and_then(|(env, harness)| self.version_mark(&env, &harness, SharedString::from(format!("tree-update-{ix}")), true, false, cx));
                 // A project row starts a new session in its folder.
                 let new_session = row.start.clone().map(|start| {
                     let tip = t("tree.new_session").replace("{harness}", start.harness.label());
@@ -2610,6 +2692,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(px(6.))
+                        .children(version)
                         .children(new_session)
                         .child(div().text_color(theme.text_muted).text_size(px(11.)).child(row.count.to_string()))
                         .into_any_element(),
@@ -2858,6 +2941,7 @@ impl Shell {
     }
 
     fn render_extensions(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.want_extensions(cx);
         let theme = *cx.global::<Theme>();
         let connected = matches!(&self.extensions, Some(Ok(list)) if list.iter().any(|e| e.kind == ExtensionKind::Mcp && e.name == "bowyer"));
         let harness = self.open.as_ref().map(|open| open.summary.key.harness.clone());
@@ -3386,63 +3470,63 @@ impl Shell {
         };
         let outputs = self.fold("outputs", t("outputs"), None, outputs, cx);
 
-        let collapsed = self.folded.contains("tasks");
-        let shown = match &self.tasks_shown {
+        // Agents and commands are lists of their own: an agent is a piece of the work, a
+        // command one step, and hundreds of commands would bury the few agents.
+        let (agents, commands): (Vec<&TaskRun>, Vec<&TaskRun>) = open.tasks.iter().partition(|task| task.kind == model::ToolKind::Agent);
+        let shown_of = |state: &Option<(SessionKey, usize)>| match state {
             Some((key, shown)) if *key == summary.key => *shown,
             _ => TASKS_SHOWN,
         };
-        let hidden = open.tasks.len().saturating_sub(shown);
-        let live_tasks = if collapsed { None } else { self.render_live_tasks(cx) };
-        let count = (!open.tasks.is_empty())
-            .then(|| div().text_size(px(11.)).text_color(theme.text_muted).child(open.tasks.len().to_string()).into_any_element());
-        let more = (!collapsed && hidden > 0).then(|| {
+        let (agents_shown, commands_shown) = (shown_of(&self.agents_shown), shown_of(&self.tasks_shown));
+        let count_of = |n: usize| (n > 0).then(|| div().text_size(px(11.)).text_color(theme.text_muted).child(n.to_string()).into_any_element());
+        let (agents_count, commands_count) = (count_of(agents.len()), count_of(commands.len()));
+        let more = |id: &'static str, hidden: usize, agents: bool, shown: usize, cx: &mut Context<Self>| {
             let key = summary.key.clone();
-            div()
-                .id("tasks-more")
-                .h(px(22.))
+            (hidden > 0).then(|| {
+                div()
+                    .id(id)
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.))
+                    .text_color(theme.accent)
+                    .hover(|style| style.underline())
+                    .child(t("tree.show_more").replace("{n}", &hidden.min(TASKS_MORE).to_string()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let state = Some((key.clone(), shown + TASKS_MORE));
+                        if agents {
+                            this.agents_shown = state;
+                        } else {
+                            this.tasks_shown = state;
+                        }
+                        cx.notify();
+                    }))
+            })
+        };
+        let agents_more = more("agents-more", agents.len().saturating_sub(agents_shown), true, agents_shown, cx);
+        let commands_more = more("tasks-more", commands.len().saturating_sub(commands_shown), false, commands_shown, cx);
+        let agents = (!agents.is_empty()).then(|| {
+            let list = div()
                 .flex()
-                .items_center()
-                .text_size(px(12.))
-                .text_color(theme.accent)
-                .hover(|style| style.underline())
-                .child(t("tree.show_more").replace("{n}", &hidden.min(TASKS_MORE).to_string()))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.tasks_shown = Some((key.clone(), shown + TASKS_MORE));
-                    cx.notify();
-                }))
+                .flex_col()
+                .gap(px(2.))
+                .children(agents.iter().rev().take(agents_shown).map(|task| task_row(task, false, &theme)))
+                .children(agents_more);
+            self.fold("agents", t("agents"), agents_count, list, cx)
         });
-        let tasks = section_body().children(live_tasks).child(if open.tasks.is_empty() {
-            div().text_size(px(12.)).text_color(theme.text_muted).child(t("no_tasks")).into_any_element()
+        let live_tasks = if self.folded.contains("tasks") { None } else { self.render_live_tasks(cx) };
+        let tasks = section_body().children(live_tasks).child(if commands.is_empty() {
+            div().text_size(px(12.)).text_color(theme.text_muted).child(t("no_commands")).into_any_element()
         } else {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .children(open.tasks.iter().rev().take(shown).map(|task| {
-                    let color = match task.status {
-                        TaskStatus::Running => theme.accent,
-                        TaskStatus::Done => theme.success,
-                        TaskStatus::Failed => theme.error,
-                    };
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .h(px(22.))
-                        .text_size(px(12.))
-                        .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(theme.text_muted)
-                                .child(if task.kind == model::ToolKind::Agent { "agent" } else { "$" }),
-                        )
-                        .child(div().truncate().font_family(MONO).text_size(px(11.5)).child(task.title.clone()))
-                }))
-                .children(more)
+                .children(commands.iter().rev().take(commands_shown).map(|task| task_row(task, true, &theme)))
+                .children(commands_more)
                 .into_any_element()
         });
-        let tasks = self.fold("tasks", t("tasks"), count, tasks, cx);
+        let tasks = self.fold("tasks", t("commands"), commands_count, tasks, cx);
 
         let notes = self.render_notes(cx);
         let tabs = self.render_right_tabs(cx);
@@ -3472,6 +3556,7 @@ impl Shell {
             .child(cost)
             .child(spend)
             .child(outputs)
+            .children(agents)
             .child(tasks)
             .children(notes);
         pane.flex()
@@ -3558,7 +3643,7 @@ enum FooterMenu {
 }
 
 /// The sections of the right pane that fold.
-const FOLDING: [&str; 7] = ["context", "plan", "cost", "tokens", "outputs", "tasks", "notes"];
+const FOLDING: [&str; 8] = ["context", "plan", "cost", "tokens", "outputs", "agents", "tasks", "notes"];
 
 impl Shell {
     /// A section of the right pane whose title folds it: the title with a chevron and
@@ -3594,6 +3679,24 @@ impl Shell {
             .when(!folded, |this| this.child(body))
             .into_any_element()
     }
+}
+
+/// A command or an agent of the session: whether it runs, ended or failed, and what it is.
+fn task_row(task: &TaskRun, command: bool, theme: &Theme) -> Div {
+    let color = match task.status {
+        TaskStatus::Running => theme.accent,
+        TaskStatus::Done => theme.success,
+        TaskStatus::Failed => theme.error,
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .h(px(22.))
+        .text_size(px(12.))
+        .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
+        .when(command, |this| this.child(div().flex_none().text_color(theme.text_muted).child("$")))
+        .child(div().truncate().when(command, |this| this.font_family(MONO).text_size(px(11.5))).child(task.title.clone()))
 }
 
 /// The body of a section: its parts one under another.
@@ -4115,6 +4218,17 @@ fn parse_stats(out: &str) -> HashMap<String, (u64, i64)> {
 
 #[cfg(test)]
 mod pinned_tests {
+    /// The order a model ranked a query in outlives the search done again for it.
+    #[test]
+    fn a_ranked_order_is_kept_when_the_query_is_searched_again() {
+        let key = |id: &str| model::SessionKey { env: model::EnvId::local(), harness: model::HarnessKind::Claude, id: id.into() };
+        let hit = |id: &str| library::SearchHit { key: key(id), title: id.into(), snippet: String::new() };
+        let mut hits = vec![hit("a"), hit("b"), hit("c"), hit("new"), hit("d")];
+        super::keep_ranking(&mut hits, &[key("c"), key("a"), key("gone")]);
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.key.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b", "new", "d"]);
+    }
+
     #[test]
     fn failures_are_tried_again_ever_later_up_to_five_minutes() {
         let mut retry = super::Retry::after(None);

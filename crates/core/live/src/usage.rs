@@ -20,7 +20,8 @@ pub const CLAUDE_ARGS: [&str; 10] = [
 ];
 
 /// The program and arguments that ask: on this computer the program found on PATH (an npm
-/// shim runs its script with node), on a host a login shell, whose PATH has the harness.
+/// shim runs its script with node), run in a folder of the caller's; on a host a login
+/// shell, whose PATH has the harness, in [`HOST_FOLDER`].
 pub fn claude_command(local: bool) -> (String, Vec<String>) {
     let args = CLAUDE_ARGS.iter().map(|arg| (*arg).to_owned());
     if local {
@@ -29,9 +30,15 @@ pub fn claude_command(local: bool) -> (String, Vec<String>) {
     } else {
         // The arguments are plain words: no quoting needed inside the login shell.
         let line = std::iter::once("claude".to_owned()).chain(args).collect::<Vec<_>>().join(" ");
-        ("sh".into(), vec!["-c".into(), "exec \"${SHELL:-sh}\" -lc \"$1\"".into(), "sh".into(), line])
+        let script = format!("umask 077; d=\"$HOME/{HOST_FOLDER}\"; mkdir -p \"$d\" && cd \"$d\" && exec \"${{SHELL:-sh}}\" -lc \"$1\"");
+        ("sh".into(), vec!["-c".into(), script, "sh".into(), line])
     }
 }
+
+/// The folder the request runs in on a host, under the home folder: the user's own and
+/// empty. A folder others may write to (`/tmp`) could hold project settings with a hook
+/// that would then run as the user.
+pub const HOST_FOLDER: &str = ".cache/bowyer/usage";
 
 /// The lines to send on standard input: the plan, and the status that tells whether anyone
 /// is signed in (without a login the plan reads like an API key's).
@@ -253,6 +260,37 @@ mod tests {
         let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"bowyer-usage","error":"Unsupported control request subtype: get_usage"}}"#;
         assert_eq!(parse_claude(refused), Plan::Unknown("Unsupported control request subtype: get_usage".into()));
         assert!(matches!(parse_claude("Not logged in"), Plan::Unknown(text) if text == "Not logged in"));
+    }
+
+    /// On a host the request runs in a folder of the user's own, never in `/tmp`.
+    #[test]
+    fn a_host_is_asked_in_a_folder_of_its_user() {
+        let (program, args) = claude_command(false);
+        assert_eq!(program, "sh");
+        assert!(args[1].contains("umask 077") && args[1].contains("$HOME/.cache/bowyer/usage") && !args[1].contains("/tmp"), "{}", args[1]);
+        assert!(args[3].starts_with("claude -p ") && args[3].ends_with("--setting-sources project"), "{}", args[3]);
+    }
+
+    /// The folder on a real host: made private, and the one the command runs in. Runs `pwd`
+    /// in place of Claude Code. `BOWYER_SSH_HOST=user@host cargo test -p live -- --ignored
+    /// folder_of_its_user_on`.
+    #[test]
+    #[ignore = "needs an SSH host"]
+    fn a_host_is_asked_in_a_folder_of_its_user_on_a_host() {
+        use envs::Environment;
+        let host = std::env::var("BOWYER_SSH_HOST").expect("BOWYER_SSH_HOST");
+        let mut ssh = envs::SshEnvironment::new(&host);
+        let system = std::path::Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe");
+        if cfg!(windows) && system.is_file() {
+            ssh.ssh = system.to_path_buf();
+        }
+        let (program, mut args) = claude_command(false);
+        args[3] = "pwd; stat -c %a .".into();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = ssh.run(&program, &args, None).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].ends_with("/.cache/bowyer/usage"), "{output}");
+        assert_eq!(lines[1], "700", "{output}");
     }
 
     /// Asks the Claude Code of this computer, signed in to a subscription. No model call:

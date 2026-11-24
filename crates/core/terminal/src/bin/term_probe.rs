@@ -117,6 +117,7 @@ fn tui(modes: &[&str]) {
             "sgr" => picture.push_str("\x1b[?1006h"),
             "cursor" => picture.push_str("\x1b[?1h"),
             "erase" => picture.push_str("\x1b[2J\x1b[3J\x1b[H"),
+            "accents" => picture.push_str("cafe\u{301} and \u{1F469}\u{200D}\u{1F4BB} done\r\n"),
             "lines" => {
                 for number in 1..=60 {
                     picture.push_str(&format!("line {number:02}\r\n"));
@@ -153,6 +154,9 @@ fn tui(modes: &[&str]) {
             .map(|&byte| match byte {
                 0x1b => "^[".to_string(),
                 b'\r' => "^M".to_string(),
+                // Other control characters in caret notation: `^@` is NUL, `^?` DEL.
+                0x00..=0x1f => format!("^{}", char::from(byte + 0x40)),
+                0x7f => "^?".to_string(),
                 other => char::from(other).to_string(),
             })
             .collect();

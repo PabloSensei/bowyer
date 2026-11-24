@@ -57,11 +57,17 @@ fn coord(cols: u16, rows: u16) -> COORD {
     }
 }
 
+/// The environment of the child as Windows takes it: sorted by name, and each name once.
+/// Names do not differ by case there, and a name given twice (`TERM` inherited and then
+/// set, `Path` and `PATH`) keeps its last value: the one that was meant to win. Twice in
+/// the block, the child would read whichever its runtime finds first.
 fn environment_block(env: &[(String, String)]) -> Vec<u16> {
-    let mut sorted: Vec<_> = env.iter().collect();
-    sorted.sort_by_key(|(key, _)| key.to_uppercase());
+    let mut by_name = std::collections::BTreeMap::new();
+    for (key, value) in env {
+        by_name.insert(key.to_uppercase(), (key, value));
+    }
     let mut block = Vec::new();
-    for (key, value) in sorted {
+    for (key, value) in by_name.into_values() {
         block.extend(OsStr::new(&format!("{key}={value}")).encode_wide());
         block.push(0);
     }
@@ -338,6 +344,16 @@ mod tests {
     fn line(arguments: &[&str]) -> String {
         let arguments: Vec<String> = arguments.iter().map(|text| text.to_string()).collect();
         command_line(Path::new("tool.exe"), &arguments)
+    }
+
+    /// A name given twice, in any case, goes to the child once, with its last value.
+    #[test]
+    fn the_environment_names_each_variable_once() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let env = [pair("TERM", "dumb"), pair("Path", "C:/old"), pair("HOME", "h"), pair("PATH", "C:/new"), pair("TERM", "xterm-256color")];
+        let block = String::from_utf16(&environment_block(&env)).unwrap();
+        let entries: Vec<&str> = block.split('\0').filter(|entry| !entry.is_empty()).collect();
+        assert_eq!(entries, ["HOME=h", "PATH=C:/new", "TERM=xterm-256color"]);
     }
 
     #[test]

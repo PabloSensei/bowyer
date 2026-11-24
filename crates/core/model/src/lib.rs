@@ -223,6 +223,18 @@ impl Usage {
         self.cache_write += other.cache_write;
         self.cache_write_long += other.cache_write_long;
     }
+
+    pub fn subtract(&mut self, other: &Usage) {
+        self.input = self.input.saturating_sub(other.input);
+        self.output = self.output.saturating_sub(other.output);
+        self.cache_read = self.cache_read.saturating_sub(other.cache_read);
+        self.cache_write = self.cache_write.saturating_sub(other.cache_write);
+        self.cache_write_long = self.cache_write_long.saturating_sub(other.cache_write_long);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Usage::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +382,62 @@ pub struct Transcript {
     /// errors came back): the harness can resume without it.
     #[serde(default)]
     pub failed_turn: Option<FailedTurn>,
+    /// The calls the harness named (Claude's message ids), each with its bucket, tokens and
+    /// time: a session resumed into a new file repeats the calls of the one it came from,
+    /// and a sum over sessions counts each of them once.
+    #[serde(default)]
+    pub named_calls: Vec<NamedCall>,
+}
+
+/// A model call with the name the harness gave it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NamedCall {
+    pub id: String,
+    pub bucket: String,
+    pub usage: Usage,
+    pub at_ms: i64,
+}
+
+/// The tokens of sessions summed per bucket, each named call once.
+#[derive(Default)]
+pub struct UsageSum {
+    pub buckets: Vec<(String, Usage)>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl UsageSum {
+    pub fn add(&mut self, bucket: &str, usage: &Usage) {
+        match self.buckets.iter_mut().find(|(name, _)| name == bucket) {
+            Some((_, sum)) => sum.add(usage),
+            None => self.buckets.push((bucket.to_owned(), *usage)),
+        }
+    }
+
+    /// Adds what a session spent from `since_ms` on, as [`Transcript::spent_since`] gave it.
+    pub fn add_session(&mut self, spent: &SpentSince) {
+        for (bucket, usage) in &spent.unnamed {
+            self.add(bucket, usage);
+        }
+        for call in &spent.named {
+            if self.seen.insert(call.id.clone()) {
+                self.add(&call.bucket, &call.usage);
+            }
+        }
+    }
+}
+
+/// What a session spent in a span of time: its named calls, and the tokens of the others
+/// per bucket.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpentSince {
+    pub named: Vec<NamedCall>,
+    pub unnamed: Vec<(String, Usage)>,
+}
+
+impl SpentSince {
+    pub fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.unnamed.is_empty()
+    }
 }
 
 /// A prompt that only got API errors, at the end of a Claude Code session.
@@ -385,6 +453,15 @@ pub struct FailedTurn {
 
 impl Transcript {
     /// Counts one model call: the totals, the tokens of its model, and the last call.
+    /// [`Self::add_call`] for a call the harness named.
+    pub fn add_named_call(&mut self, id: &str, model: Option<&str>, usage: Usage, timestamp_ms: i64) {
+        self.add_call(model, usage, timestamp_ms);
+        if !id.is_empty() {
+            let bucket = pricing::bucket(model.unwrap_or("unknown"), &usage, timestamp_ms);
+            self.named_calls.push(NamedCall { id: id.to_owned(), bucket, usage, at_ms: timestamp_ms });
+        }
+    }
+
     pub fn add_call(&mut self, model: Option<&str>, usage: Usage, timestamp_ms: i64) {
         self.total_usage.add(&usage);
         let bucket = pricing::bucket(model.unwrap_or("unknown"), &usage, timestamp_ms);
@@ -426,6 +503,21 @@ impl Transcript {
             }
         }
         sums
+    }
+
+    /// What the session spent from the UTC day of `since_ms` on: its named calls apart, so
+    /// that a sum over sessions counts a call two files share once ([`UsageSum`]).
+    pub fn spent_since(&self, since_ms: i64) -> SpentSince {
+        let first = since_ms.div_euclid(DAY_MS);
+        let named: Vec<NamedCall> = self.named_calls.iter().filter(|call| call.at_ms.div_euclid(DAY_MS) >= first).cloned().collect();
+        let mut unnamed = self.usage_since(since_ms);
+        for call in &named {
+            if let Some((_, sum)) = unnamed.iter_mut().find(|(bucket, _)| *bucket == call.bucket) {
+                sum.subtract(&call.usage);
+            }
+        }
+        unnamed.retain(|(_, usage)| !usage.is_empty());
+        SpentSince { named, unnamed }
     }
 
     /// Files the session changed, from its edit and write calls, in first-touch order.

@@ -376,6 +376,25 @@ impl Shell {
         cx.notify();
     }
 
+    /// Closes every tab whose session `gone` says is gone, and ends what runs there: a
+    /// deleted session, or the sessions of a host the user removed. A harness left running
+    /// in such a tab would write the session back.
+    pub(super) fn close_terminals_of(&mut self, gone: impl Fn(&SessionKey) -> bool, cx: &mut Context<Self>) {
+        let mut owners = Vec::new();
+        self.terminals.retain(|view| {
+            let view = view.read(cx);
+            let Some(owner) = view.owner.as_ref().filter(|owner| gone(owner)) else { return true };
+            view.terminate();
+            owners.push(Some(owner.clone()));
+            false
+        });
+        for owner in owners {
+            self.terminal_shown.remove(&owner);
+            self.active_terminal.remove(&owner);
+        }
+        cx.notify();
+    }
+
     /// Whether a terminal has the keyboard: its programs get the keys the window would take.
     pub(super) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
         self.terminals.iter().any(|view| view.read(cx).focus_handle().is_focused(window))

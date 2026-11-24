@@ -35,6 +35,12 @@ fn public_key() -> Option<&'static str> {
     BUILT_KEY.filter(|key| !key.trim().is_empty())
 }
 
+/// A downloaded, checked package waiting for the window to be free to close.
+pub(super) struct PendingUpdate {
+    install: update::Install,
+    package: std::path::PathBuf,
+}
+
 impl Shell {
     fn update_feed(&self) -> Option<String> {
         self.lib()
@@ -111,10 +117,14 @@ impl Shell {
         .detach();
     }
 
-    /// Downloads the package, checks its signature, puts it in place and quits: the new version
-    /// starts by itself.
+    /// Downloads the package and checks its signature, then asks about running turns and
+    /// terminals like any quit; only once the window may close does the package go in (on
+    /// Windows the installer closes Bowyer), and the new version starts by itself.
     fn install_update(&mut self, cx: &mut Context<Self>) {
-        let Some(package) = self.updates.release.as_ref().and_then(|release| release.package.clone()) else { return };
+        let Some(release) = self.updates.release.as_ref() else { return };
+        let Some(package) = release.package.clone() else { return };
+        // The signature has to be of this version, made after this program was built.
+        let expected = update::Expected { version: release.version.clone(), signed_after: env!("BOWYER_BUILT_AT").parse().unwrap_or(0) };
         let Some(key) = public_key() else { return };
         if self.updates.installing {
             return;
@@ -124,28 +134,50 @@ impl Shell {
         self.updates.installing = true;
         self.updates.error = None;
         cx.notify();
-        let task = cx.background_spawn(async move {
-            let path = update::download(&package, &dir, key)?;
-            update::apply(&install, &path)
-        });
+        let task = cx.background_spawn(async move { update::download(&package, &dir, key, &expected) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(path) => {
+                    let update = PendingUpdate { install, package: path };
                     if this.may_quit(cx) {
-                        cx.quit();
+                        this.apply_update(update, cx);
+                    } else {
+                        // The question is up; its answer installs, or gives the button back.
+                        this.set_quit_update(update);
                     }
                 }
-                Err(error) => {
-                    log::warn!("update install: {error}");
-                    this.updates.installing = false;
-                    this.updates.error = Some(error.to_string());
-                    cx.notify();
-                }
+                Err(error) => this.update_failed(error.to_string(), cx),
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Puts the downloaded package in place and quits, once nothing runs any more.
+    pub(super) fn apply_update(&mut self, update: PendingUpdate, cx: &mut Context<Self>) {
+        let task = cx.background_spawn(async move { update::apply(&update.install, &update.package) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => cx.quit(),
+                Err(error) => this.update_failed(error.to_string(), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The user kept the window open: the update waits for the button again.
+    pub(super) fn update_given_up(&mut self) {
+        self.updates.installing = false;
+    }
+
+    pub(super) fn update_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        log::warn!("update install: {error}");
+        self.updates.installing = false;
+        self.updates.error = Some(error);
+        cx.notify();
     }
 
     /// The chip in the sidebar footer when a version is out.

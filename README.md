@@ -56,7 +56,7 @@
 - **Native and fast.** Rust from top to bottom and a GPU-rendered UI on GPUI. No Electron, no web view. Hundreds of sessions load in a moment and search as you type.
 - **Your files stay yours.** Bowyer only reads what the harnesses write. Folders, pins, names and notes live in Bowyer's own database; your agents keep working exactly as before, with or without the window open.
 - **See what a session really costs.** The context window split by what fills it, token totals, cost at API prices, and whether the prompt cache is still warm, so you know when compacting pays off.
-- **Keep going from the window.** Type a message and the harness runs the turn in the background, here or on an SSH host. Every session has its own turn, composer, model and effort, so several can run at once. The answer streams in; permission prompts and questions show up as buttons, not as a terminal you have to find.
+- **Keep going from the window.** Type a message and the harness runs the turn in the background, here or on an SSH host. Every session has its own turn, composer, model and effort, so several can run at once. The answer streams in; turns start with every permission allowed (one click switches to the harness's own settings or to accepting edits only), and questions show up as buttons, not as a terminal you have to find.
 - **Know where your plan stands.** For a Claude subscription the side panel shows the five-hour and weekly limits with their reset times; for an API key, what this month cost.
 
 ## Features
@@ -83,7 +83,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>What a session holds</h3>
-      Environment, folder, Git branch (worktrees too) and model. The context window split by what fills it: for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages. The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month. Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache. Every file the session changed as a tree, and every command and sub-agent it ran, the latest ten first. Each section folds by its title; the context title keeps a small gauge of how full the window is.
+      Environment, folder, Git branch (worktrees too) and model. The context window split by what fills it: for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages. The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month. Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache. Every file the session changed as a tree, every command it ran, and the sub-agents it started in a list of their own, the latest ten first. Each section folds by its title; the context title keeps a small gauge of how full the window is.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/session.png" alt="The Session panel with folding sections: context 51k of 1M split into six parts, plan limits folded, session cost $0.227, token totals, changed files and commands" width="60%">
@@ -103,7 +103,8 @@
 And more:
 
 - **SSH hosts from the window.** Add `user@host` with a key of its own or a password kept by the system: Windows Credential Manager, the macOS Keychain, or the Secret Service keyring on Linux (GNOME Keyring, KWallet, KeePassXC; the Linux keyring tried against a test keyring only). The connection is checked before it is saved, an unknown host key is shown by its fingerprint before you trust it, and sessions on the host appear next to local ones.
-- **Memory for your agents.** `bowyer mcp` is an MCP server with one `recall` tool: an agent asks "did we solve this before?" and gets the past sessions of the project with their problem, fix, commit and ticket, then reads the parts it needs. Short digests of sessions can be written by a cheap model on request. One switch turns it off, another turns it off for a single project, and the window shows the command that connects it to Claude Code, Codex or OpenCode.
+- **Memory for your agents.** `bowyer mcp` is an MCP server with one `recall` tool: an agent asks "did we solve this before?" and gets the past sessions of the project with their problem, fix, commit and ticket, then reads the parts it needs. Short digests of sessions can be written by a cheap model on request. One switch turns it off, another turns it off for a single project, and the window shows the command that connects it to Claude Code, Codex or OpenCode. Claude Code on an SSH host reaches it too, through a tunnel the window keeps open, with a token of that host's own.
+- **Harness versions** next to each harness in the tree, the composer and the new-session dialog, with an arrow when a newer release is out: it runs the harness's own update in a terminal tab. A harness that is not installed shows its official install command (OpenCode 2 included).
 - **MCP servers and plugins** of each harness at a glance; Claude Code plugins switch on and off (Bowyer keeps a backup of the settings it changes).
 - **Settings in one place,** in a dialog over the window: language, appearance, sessions, harnesses, SSH hosts, terminal, search, memory and updates.
 - **Quits cleanly.** With turns or terminals still running, quitting asks first, then stops them and waits for them to end.

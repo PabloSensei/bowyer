@@ -5,7 +5,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::shells::{Shell, find_in, push_unique, quote};
+use crate::shells::{Shell, find_in, push_unique};
 
 /// The command line of the shell found, quoted for the console of Windows.
 pub fn default_shell() -> Option<String> {
@@ -74,16 +74,7 @@ fn git_bash_in(path: &OsStr) -> Option<PathBuf> {
 }
 
 fn command_line(shell: &Path) -> String {
-    let quoted = quote(shell);
-    let name = shell
-        .file_stem()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if name == "bash" {
-        format!("{quoted} --login -i")
-    } else {
-        quoted
-    }
+    Shell::new("", shell).command_line
 }
 
 fn find_in_path(program: &str) -> Option<PathBuf> {
@@ -160,6 +151,7 @@ mod tests {
         assert_eq!(shells.len(), 1);
         assert_eq!(shells[0].name, "Git Bash");
         assert!(shells[0].command_line.contains(&git.join("bash.exe").display().to_string()), "{}", shells[0].command_line);
+        assert!(shells[0].command_line.ends_with("--login -i"), "the menu's Git Bash is a login shell too");
     }
 
     #[test]

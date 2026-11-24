@@ -22,7 +22,7 @@ pub use git::{GitInfo, git_info_local, parse_head};
 pub use local::LocalEnvironment;
 pub use ssh::{
     ASKPASS_HOST, HostKeys, SshEnvironment, SshHost, askpass_answer, changed_host_key_files, changed_key_is_own, host_takes_no_password, is_unknown_host_key, key_has_passphrase, read_ssh_config, refused_sign_in, set_askpass, set_known_hosts,
-    shell_quote,
+    shell_quote, RUN_END, RUN_STARTED, TUNNEL_READY,
 };
 
 /// A file as a listing returns it.
@@ -93,9 +93,18 @@ pub trait Environment: Send + Sync {
     /// Runs a command to the end and returns its standard output.
     fn run(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<String>;
 
+    /// Like [`Environment::run`], with the output in the bytes the command wrote: the diff
+    /// of a file that is not UTF-8 goes back to `git apply` as it came.
+    fn run_bytes(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<Vec<u8>> {
+        self.run(program, args, cwd).map(String::into_bytes)
+    }
+
     /// Like [`Environment::run`], with `input` on the command's standard input: a patch
     /// for `git apply`.
     fn run_with_input(&self, program: &str, args: &[&str], cwd: Option<&str>, input: &[u8]) -> io::Result<String>;
+
+    /// Like [`Environment::run`], with the variables `vars` set for the command.
+    fn run_with_vars(&self, program: &str, args: &[&str], cwd: Option<&str>, vars: &[(&str, &str)]) -> io::Result<String>;
 
     /// A command that starts `program` in `cwd` interactively, for a terminal or a harness.
     /// Over SSH it asks for a terminal on the remote side.
@@ -108,6 +117,31 @@ pub trait Environment: Send + Sync {
 pub type SharedEnv = Arc<dyn Environment>;
 
 /// Text of bytes that may end inside a character, as a range read leaves them.
+/// A program of Windows itself by its full path, as `powershell.exe` or `cmd.exe`. A name
+/// alone is looked for in the current folder too when it goes in a command line, and the
+/// folder of a session is a project anyone may have put a `cmd.exe` in. Elsewhere, and where
+/// the file is not found, the name stays.
+pub fn system_program(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let system = root.join("System32");
+        let path = match name {
+            "powershell.exe" => system.join("WindowsPowerShell").join("v1.0").join(name),
+            other => system.join(other),
+        };
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// [`system_program`] for a command line: quoted when its path has a space.
+pub fn system_program_line(name: &str) -> String {
+    let path = system_program(name).to_string_lossy().into_owned();
+    if path.contains(' ') { format!("\"{path}\"") } else { path }
+}
+
 pub fn lossy_lines(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -136,4 +170,23 @@ pub(crate) fn output_with_input(mut command: Command, input: &[u8]) -> io::Resul
 
 pub(crate) fn not_found(path: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{path}: not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Windows's own programs are named by their place in the system folder, never by a
+    /// name the current folder could answer.
+    #[test]
+    fn system_programs_are_named_by_their_full_path() {
+        let powershell = system_program("powershell.exe");
+        let cmd = system_program("cmd.exe");
+        if cfg!(windows) {
+            assert!(powershell.is_absolute() && powershell.ends_with("WindowsPowerShell/v1.0/powershell.exe"), "{}", powershell.display());
+            assert!(cmd.is_absolute() && cmd.ends_with("System32/cmd.exe"), "{}", cmd.display());
+        }
+        assert_eq!(system_program("no-such-program.exe"), PathBuf::from("no-such-program.exe"));
+        assert!(!system_program_line("cmd.exe").starts_with(' '));
+    }
 }

@@ -115,7 +115,40 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE started (parent TEXT NOT NULL, title TEXT NOT NULL, PRIMARY KEY (parent, title));
     DELETE FROM indexed WHERE session_key LIKE '%|claude|%';
     "#,
+    // Where each session's row is in the full-text tables: a column of an FTS table has no
+    // index, and finding a row by it read the whole table for every row written.
+    r#"
+    CREATE TABLE search_rows (session_key TEXT PRIMARY KEY, row INTEGER NOT NULL);
+    INSERT OR REPLACE INTO search_rows (session_key, row) SELECT session_key, rowid FROM search ORDER BY rowid;
+    DELETE FROM search WHERE rowid NOT IN (SELECT row FROM search_rows);
+    CREATE TABLE digest_rows (session_key TEXT PRIMARY KEY, row INTEGER NOT NULL);
+    INSERT OR REPLACE INTO digest_rows (session_key, row) SELECT session_key, rowid FROM digest_search ORDER BY rowid;
+    DELETE FROM digest_search WHERE rowid NOT IN (SELECT row FROM digest_rows);
+    "#,
 ];
+
+/// The row of a session in a full-text table, through its table of rows (`search_rows`,
+/// `digest_rows`).
+fn fts_row(connection: &Connection, rows: &str, key: &str) -> Result<Option<i64>> {
+    connection
+        .query_row(&format!("SELECT row FROM {rows} WHERE session_key = ?1"), [key], |row| row.get(0))
+        .optional()
+}
+
+/// Removes a session's row from a full-text table and its table of rows.
+/// The name the user gave a session, if any.
+fn given_title(connection: &Connection, key: &str) -> Result<Option<String>> {
+    let title: Option<Option<String>> = connection.query_row("SELECT title FROM placements WHERE session_key = ?1", [key], |row| row.get(0)).optional()?;
+    Ok(title.flatten().filter(|title| !title.trim().is_empty()))
+}
+
+fn fts_delete(connection: &Connection, table: &str, rows: &str, key: &str) -> Result<()> {
+    if let Some(row) = fts_row(connection, rows, key)? {
+        connection.execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), [row])?;
+        connection.execute(&format!("DELETE FROM {rows} WHERE session_key = ?1"), [key])?;
+    }
+    Ok(())
+}
 
 /// The version of a session's source the index holds the text of.
 pub fn stamp_of(summary: &SessionSummary) -> String {
@@ -171,16 +204,35 @@ impl Library {
         Self::with_connection(Connection::open_in_memory()?)
     }
 
-    fn with_connection(connection: Connection) -> Result<Self> {
+    fn with_connection(mut connection: Connection) -> Result<Self> {
         // The window and `bowyer mcp` share the file: wait for a lock instead of failing.
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        // Switching a new file to WAL does not wait for a lock by itself.
+        let started = std::time::Instant::now();
+        loop {
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy && started.elapsed() < std::time::Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result?,
+            }
+        }
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-            connection.execute_batch(migration)?;
-            connection.pragma_update(None, "user_version", index as i64 + 1)?;
+        if (version as usize) < MIGRATIONS.len() {
+            // The window, `bowyer mcp` and the memory server may open the file at once after
+            // an update: one takes the write lock and migrates, the others wait for it and
+            // find the work done. All the steps go in together or not at all.
+            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            for migration in MIGRATIONS.iter().skip(version as usize) {
+                transaction.execute_batch(migration)?;
+            }
+            transaction.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+            transaction.commit()?;
         }
         Ok(Self { connection })
     }
@@ -214,24 +266,29 @@ impl Library {
             // file changed, not when only the title or the state did.
             let prompt = summary.first_prompt.clone().unwrap_or_default();
             let cwd = summary.cwd.clone().unwrap_or_default();
-            let updated = transaction.execute(
-                "UPDATE search SET title = ?2, prompt = ?3, cwd = ?4 WHERE session_key = ?1",
-                params![key, summary.title, prompt, cwd],
-            )?;
-            if updated == 0 {
-                transaction.execute(
-                    "INSERT INTO search (session_key, title, prompt, cwd, body) VALUES (?1, ?2, ?3, ?4, '')",
-                    params![key, summary.title, prompt, cwd],
-                )?;
+            // A session the user renamed is found by its name.
+            let title = given_title(&transaction, &key)?.unwrap_or_else(|| summary.title.clone());
+            match fts_row(&transaction, "search_rows", &key)? {
+                Some(row) => {
+                    transaction.execute("UPDATE search SET title = ?2, prompt = ?3, cwd = ?4 WHERE rowid = ?1", params![row, title, prompt, cwd])?;
+                }
+                None => {
+                    transaction.execute(
+                        "INSERT INTO search (session_key, title, prompt, cwd, body) VALUES (?1, ?2, ?3, ?4, '')",
+                        params![key, title, prompt, cwd],
+                    )?;
+                    let row = transaction.last_insert_rowid();
+                    transaction.execute("INSERT OR REPLACE INTO search_rows (session_key, row) VALUES (?1, ?2)", params![key, row])?;
+                }
             }
         }
         for key in old.keys().filter(|key| !fresh.contains(*key)) {
             changed = true;
             transaction.execute("DELETE FROM summaries WHERE session_key = ?1", [key])?;
-            transaction.execute("DELETE FROM search WHERE session_key = ?1", [key])?;
+            fts_delete(&transaction, "search", "search_rows", key)?;
             transaction.execute("DELETE FROM indexed WHERE session_key = ?1", [key])?;
             transaction.execute("DELETE FROM digests WHERE session_key = ?1", [key])?;
-            transaction.execute("DELETE FROM digest_search WHERE session_key = ?1", [key])?;
+            fts_delete(&transaction, "digest_search", "digest_rows", key)?;
         }
         transaction.commit()?;
         Ok(changed)
@@ -256,7 +313,9 @@ impl Library {
 
     /// Adds the text of a whole transcript to the index of a session.
     pub fn index_body(&self, key: &SessionKey, body: &str) -> Result<()> {
-        self.connection.execute("UPDATE search SET body = ?2 WHERE session_key = ?1", params![key.encode(), body])?;
+        if let Some(row) = fts_row(&self.connection, "search_rows", &key.encode())? {
+            self.connection.execute("UPDATE search SET body = ?2 WHERE rowid = ?1", params![row, body])?;
+        }
         Ok(())
     }
 
@@ -357,13 +416,18 @@ impl Library {
     /// Keeps the digest of a session, made from the version of its file `stamp` names.
     pub fn set_digest(&self, key: &SessionKey, stamp: &str, text: &str, by_model: bool) -> Result<()> {
         let key = key.encode();
-        self.connection.execute(
+        // The digest and its index change together: a failure between them would leave one
+        // without the other.
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "INSERT OR REPLACE INTO digests (session_key, stamp, text, by_model) VALUES (?1, ?2, ?3, ?4)",
             params![key, stamp, text, by_model],
         )?;
-        self.connection.execute("DELETE FROM digest_search WHERE session_key = ?1", [&key])?;
-        self.connection.execute("INSERT INTO digest_search (session_key, text) VALUES (?1, ?2)", params![key, text])?;
-        Ok(())
+        fts_delete(&transaction, "digest_search", "digest_rows", &key)?;
+        transaction.execute("INSERT INTO digest_search (session_key, text) VALUES (?1, ?2)", params![key, text])?;
+        let row = transaction.last_insert_rowid();
+        transaction.execute("INSERT INTO digest_rows (session_key, row) VALUES (?1, ?2)", params![key, row])?;
+        transaction.commit()
     }
 
     /// The digest of a session: the stamp it was made from, its text, whether a model wrote it.
@@ -490,8 +554,22 @@ impl Library {
         let mut placement = self.placement(key)?;
         placement.title = title.map(str::to_owned).filter(|t| !t.trim().is_empty());
         self.set_placement(key, &placement)?;
-        if let Some(title) = &placement.title {
-            self.connection.execute("UPDATE search SET title = ?2 WHERE session_key = ?1", params![key.encode(), title])?;
+        // The search finds the new name, or again the harness's title once the name is gone.
+        let encoded = key.encode();
+        let harness_title = || {
+            self.connection
+                .query_row("SELECT data FROM summaries WHERE session_key = ?1", [&encoded], |row| row.get::<_, String>(0))
+                .optional()
+                .map(|data| data.and_then(|data| serde_json::from_str::<SessionSummary>(&data).ok()).map(|summary| summary.title))
+        };
+        let shown = match &placement.title {
+            Some(title) => Some(title.clone()),
+            None => harness_title()?,
+        };
+        if let Some(title) = shown
+            && let Some(row) = fts_row(&self.connection, "search_rows", &encoded)?
+        {
+            self.connection.execute("UPDATE search SET title = ?2 WHERE rowid = ?1", params![row, title])?;
         }
         Ok(())
     }
@@ -554,6 +632,11 @@ impl Library {
         Ok(())
     }
 
+    pub fn remove_setting(&self, key: &str) -> Result<()> {
+        self.connection.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     /// SSH hosts the user added.
     pub fn ssh_environments(&self) -> Result<Vec<SshHostRecord>> {
         let mut statement = self.connection.prepare("SELECT host, label, identity, enabled FROM environments ORDER BY label")?;
@@ -581,6 +664,75 @@ impl Library {
 mod tests {
     use super::*;
     use model::{EnvId, HarnessKind, SourceStamp};
+
+    #[test]
+    fn a_setting_goes_away_when_removed() {
+        let library = Library::in_memory().unwrap();
+        library.set_setting("memory.token.dev@box", "secret").unwrap();
+        assert_eq!(library.setting("memory.token.dev@box").as_deref(), Some("secret"));
+        library.remove_setting("memory.token.dev@box").unwrap();
+        assert_eq!(library.setting("memory.token.dev@box"), None);
+        library.remove_setting("never.there").unwrap();
+    }
+
+    /// A library from before the tables of rows gets them, one row per session, and goes on
+    /// finding, renaming and dropping sessions through them.
+    #[test]
+    fn the_full_text_rows_are_found_by_their_table_of_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", MIGRATIONS.len() as i64 - 1).unwrap();
+        let key = summary("a", "Parser fix", "/w", 1).key.encode();
+        for title in ["stale twin", "Parser fix"] {
+            connection
+                .execute("INSERT INTO search (session_key, title, prompt, cwd, body) VALUES (?1, ?2, '', '/w', '')", params![key, title])
+                .unwrap();
+        }
+        let mut library = Library::with_connection(connection).unwrap();
+        let rows: i64 = library.connection.query_row("SELECT count(*) FROM search", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 1, "the older twin is gone");
+        assert!(library.search("stale", 10).unwrap().is_empty());
+
+        library.store_scan("local", "claude", &[summary("a", "Parser fix", "/w", 1), summary("b", "Lexer", "/w", 2)]).unwrap();
+        let b = summary("b", "Lexer", "/w", 2).key;
+        library.index_body(&b, "tokens and spans").unwrap();
+        assert_eq!(library.search("spans", 10).unwrap()[0].key, b);
+        library.rename_session(&b, Some("Tokenizer")).unwrap();
+        assert_eq!(library.search("tokenizer", 10).unwrap()[0].key, b);
+        library.set_digest(&b, "1:2", "first digest", false).unwrap();
+        library.set_digest(&b, "1:3", "second digest", false).unwrap();
+        assert_eq!(library.search_digests("first", 10).unwrap(), Vec::<SessionKey>::new());
+        assert_eq!(library.search_digests("second", 10).unwrap(), vec![b.clone()]);
+        library.store_scan("local", "claude", &[summary("a", "Parser fix", "/w", 1)]).unwrap();
+        assert!(library.search("tokenizer", 10).unwrap().is_empty());
+        assert!(library.search_digests("second", 10).unwrap().is_empty());
+        let left: i64 = library.connection.query_row("SELECT count(*) FROM search_rows", [], |row| row.get(0)).unwrap();
+        assert_eq!(left, 1);
+    }
+
+    /// Processes that open a new library at once all find it whole: one migrates, the
+    /// others wait and find it done.
+    #[test]
+    fn a_library_opened_at_once_is_migrated_once() {
+        for round in 0..5 {
+            let path = std::env::temp_dir().join(format!("bowyer-library-race-{}-{round}.db", std::process::id()));
+            let opened: Vec<Result<Library>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..6).map(|_| scope.spawn(|| Library::open(&path))).collect();
+                handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+            });
+            for library in &opened {
+                let library = library.as_ref().expect("every opener gets the library");
+                let version: i64 = library.connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+                assert_eq!(version as usize, MIGRATIONS.len());
+            }
+            drop(opened);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
 
     pub(crate) fn summary(id: &str, title: &str, cwd: &str, updated: i64) -> SessionSummary {
         SessionSummary {
@@ -636,6 +788,24 @@ mod tests {
         assert_eq!(library.bodies_to_index("local", i64::MAX, 10).unwrap().len(), 1);
         assert!(library.bodies_to_index("ssh:host", i64::MAX, 10).unwrap().is_empty(), "per environment");
         assert!(library.bodies_to_index("local", 5, 10).unwrap().is_empty(), "written lately: later");
+    }
+
+    /// A renamed session is found by its name after the next scan too, and by the
+    /// harness's title again once the name is taken away.
+    #[test]
+    fn a_renamed_session_is_found_by_its_name() {
+        let mut library = Library::in_memory().unwrap();
+        let first = summary("a", "Parser work", "/w", 1);
+        library.store_scan("local", "claude", &[first.clone()]).unwrap();
+        library.rename_session(&first.key, Some("Quokka")).unwrap();
+        assert_eq!(library.search("quokka", 10).unwrap().len(), 1);
+        let mut later = first.clone();
+        later.updated_ms = 2;
+        library.store_scan("local", "claude", &[later]).unwrap();
+        assert_eq!(library.search("quokka", 10).unwrap().len(), 1, "a scan keeps the name");
+        library.rename_session(&first.key, None).unwrap();
+        assert!(library.search("quokka", 10).unwrap().is_empty());
+        assert_eq!(library.search("parser", 10).unwrap().len(), 1, "the harness's title again");
     }
 
     #[test]

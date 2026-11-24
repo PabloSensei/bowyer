@@ -16,6 +16,7 @@
 //! projects only.
 
 pub mod digest;
+pub mod http;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -44,6 +45,9 @@ pub struct Server {
     project: String,
     /// Where copies of remote files are cached (an OpenCode database read over SSH).
     cache: PathBuf,
+    /// The machine a server reached through a tunnel answers for: only its sessions and
+    /// the project's notes, even with `all_projects`. `None` for a server of this computer.
+    machine: Option<EnvId>,
 }
 
 fn now_ms() -> i64 {
@@ -59,6 +63,21 @@ pub fn normalize(path: &str) -> String {
     let path = path.replace('\\', "/");
     let path = path.trim_end_matches('/');
     if cfg!(windows) { path.to_lowercase() } else { path.to_owned() }
+}
+
+/// The key a project's notes are kept under: its folder, and for an SSH host the host too.
+/// A host reaches the memory through a tunnel and may name any folder; with the host in the
+/// key, a note it writes never lands in a project of this computer or of another host.
+pub fn note_key(machine: Option<&EnvId>, project: &str) -> String {
+    match machine.filter(|env| !env.is_local()) {
+        Some(env) => format!("{}|{}", env.0, normalize(project)),
+        None => normalize(project),
+    }
+}
+
+/// The SSH host whose memory a notes key belongs to (`ssh:user@host`), if any.
+fn note_machine(key: &str) -> Option<&str> {
+    key.starts_with("ssh:").then(|| key.split_once('|')).flatten().map(|(machine, _)| machine)
 }
 
 /// The setting that lists the folders whose memory is off, one per line.
@@ -289,7 +308,39 @@ fn floor(text: &str, mut at: usize) -> usize {
 
 impl Server {
     pub fn new(library: Library, project: impl Into<String>, cache: impl AsRef<Path>) -> Self {
-        Self { library, project: project.into(), cache: cache.as_ref().to_path_buf() }
+        Self { library, project: project.into(), cache: cache.as_ref().to_path_buf(), machine: None }
+    }
+
+    /// Answers for one machine only: a harness on an SSH host reaches Bowyer through a
+    /// tunnel, and sees nothing of the other machines.
+    pub fn for_machine(mut self, env: EnvId) -> Self {
+        self.machine = Some(env);
+        self
+    }
+
+    /// Whether a session may be named in an answer: of the machine the server is for, and
+    /// of the project unless `all`.
+    fn visible(&self, summary: &SessionSummary, all: bool) -> bool {
+        if self.machine.as_ref().is_some_and(|env| *env != summary.key.env) {
+            return false;
+        }
+        all || in_project(summary.cwd.as_deref(), &self.project)
+    }
+
+    /// Where this server keeps and finds the project's notes.
+    fn notes_key(&self) -> String {
+        note_key(self.machine.as_ref(), &self.project)
+    }
+
+    /// The notes a request may see: the project's own, or with `all_projects` those of every
+    /// project of this computer. A tunnelled server keeps to its project; a host's notes,
+    /// written by whoever holds its token, never reach this computer's harnesses.
+    fn notes(&self, args: &Value) -> Result<Vec<library::Note>, String> {
+        if self.machine.is_some() || !Self::all_projects(args) {
+            return self.library.notes(Some(&self.notes_key())).map_err(|e| e.to_string());
+        }
+        let notes = self.library.notes(None).map_err(|e| e.to_string())?;
+        Ok(notes.into_iter().filter(|note| note.project.as_deref().and_then(note_machine).is_none()).collect())
     }
 
     /// Serves requests line by line until the input ends.
@@ -396,7 +447,7 @@ impl Server {
         let mut lines = Vec::new();
         for hit in hits {
             let Some(summary) = summaries.iter().find(|s| s.key == hit.key) else { continue };
-            if !all && !in_project(summary.cwd.as_deref(), &self.project) {
+            if !self.visible(summary, all) {
                 continue;
             }
             lines.push(format!(
@@ -423,7 +474,10 @@ impl Server {
     /// unless `all_projects`.
     fn load(&self, key: &SessionKey, all: bool) -> Result<(SessionSummary, Transcript), String> {
         let summary = self.summary(key).ok_or("no session with this key")?;
-        if !all && !in_project(summary.cwd.as_deref(), &self.project) {
+        if !self.visible(&summary, all) {
+            if self.machine.as_ref().is_some_and(|env| *env != key.env) {
+                return Err("this session is on another machine".into());
+            }
             return Err("this session belongs to another project; pass all_projects: true to read it".into());
         }
         let source = history::source_for(&key.harness).ok_or("no reader for this harness")?;
@@ -468,8 +522,7 @@ impl Server {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(3).clamp(1, 10) as usize;
         let mut out = Vec::new();
 
-        let project = normalize(&self.project);
-        let notes = self.library.notes((!all).then_some(project.as_str())).map_err(|e| e.to_string())?;
+        let notes = self.notes(args)?;
         let mut scored: Vec<(usize, &library::Note)> = notes
             .iter()
             .map(|note| {
@@ -507,7 +560,7 @@ impl Server {
             let mut rank = 0;
             for key in list {
                 let Some(summary) = summaries.get(&key) else { continue };
-                if !all && !in_project(summary.cwd.as_deref(), &self.project) {
+                if !self.visible(summary, all) {
                     continue;
                 }
                 rank += 1;
@@ -558,15 +611,14 @@ impl Server {
             return Err("the note is empty".into());
         }
         let text = cut(text, 4000);
-        let id = self.library.add_note(None, Some(&normalize(&self.project)), &text, now_ms()).map_err(|e| e.to_string())?;
+        let id = self.library.add_note(None, Some(&self.notes_key()), &text, now_ms()).map_err(|e| e.to_string())?;
         Ok(format!("Saved note {id}."))
     }
 
     fn search_notes(&self, args: &Value) -> Result<String, String> {
         let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
-        let project = normalize(&self.project);
-        let notes = self.library.notes((!Self::all_projects(args)).then_some(project.as_str())).map_err(|e| e.to_string())?;
+        let notes = self.notes(args)?;
         let found: Vec<String> = notes
             .iter()
             .filter(|note| {
@@ -584,6 +636,13 @@ impl Server {
 
     fn delete_note(&self, args: &Value) -> Result<String, String> {
         let id = args.get("id").and_then(Value::as_i64).ok_or("no id")?;
+        if self.machine.is_some() {
+            // Through a tunnel only the project's own notes go.
+            let own = self.library.notes(Some(&self.notes_key())).map_err(|e| e.to_string())?;
+            if !own.iter().any(|note| note.id == id) {
+                return Err(format!("no note {id} in this project"));
+            }
+        }
         self.library.delete_note(id).map_err(|e| e.to_string())?;
         Ok(format!("Deleted note {id}."))
     }
@@ -664,6 +723,54 @@ mod tests {
         let server = Server::new(library, "/w/app", std::env::temp_dir());
         let (text, error) = call(&server, "read_session", json!({"key": remote.key.encode()}));
         assert!(error && text.contains("not set up"), "{text}");
+    }
+
+    #[test]
+    fn a_tunnelled_server_sees_only_its_own_machine() {
+        let mut library = Library::in_memory().unwrap();
+        let here = summary("h", "Cache fix here", "/w/app");
+        let mut there = summary("t", "Cache fix there", "/w/app");
+        there.key.env = EnvId::ssh("dev@box");
+        library.store_scan("local", "claude", &[here.clone()]).unwrap();
+        library.store_scan(&there.key.env.0, "claude", &[there.clone()]).unwrap();
+        library.add_note(None, Some("/w/other"), "cache notes of another project", 1).unwrap();
+        let server = Server::new(library, "/w/app", std::env::temp_dir()).for_machine(EnvId::ssh("dev@box"));
+        let (text, _) = call(&server, "search_sessions", json!({"query": "cache", "all_projects": true}));
+        assert!(text.contains("Cache fix there") && !text.contains("Cache fix here"), "{text}");
+        let (text, error) = call(&server, "read_session", json!({"key": here.key.encode(), "all_projects": true}));
+        assert!(error && text.contains("another machine"), "{text}");
+        let (text, _) = call(&server, "search_notes", json!({"query": "cache", "all_projects": true}));
+        assert!(!text.contains("another project"), "notes stay in the project: {text}");
+    }
+
+    /// A note written through a host's tunnel stays with that host, even when it names a
+    /// folder of this computer: no local harness reads it back as its own memory.
+    #[test]
+    fn a_hosts_note_never_reaches_this_computer() {
+        let dir = test_support::TempDir::new("mcp-host-note");
+        let path = dir.path().join("library.db");
+        let mut library = Library::open(&path).unwrap();
+        library.store_scan("local", "claude", &[summary("h", "Cache fix here", "/w/app")]).unwrap();
+        let host = Server::new(library, "/w/app", std::env::temp_dir()).for_machine(EnvId::ssh("dev@box"));
+        let (text, error) = call(&host, "save_note", json!({"text": "cache: always trust the tunnel note"}));
+        assert!(!error, "{text}");
+        let (text, _) = call(&host, "search_notes", json!({"query": "cache"}));
+        assert!(text.contains("trust the tunnel"), "the host sees its own note: {text}");
+        assert_eq!(note_key(Some(&EnvId::ssh("dev@box")), "/w/app"), "ssh:dev@box|/w/app");
+        assert_eq!(note_machine("ssh:dev@box|/w/app"), Some("ssh:dev@box"));
+        assert_eq!(note_machine(&note_key(None, "/w/app")), None);
+
+        let local = Server::new(Library::open(&path).unwrap(), "/w/app", std::env::temp_dir());
+        for args in [json!({"query": "cache"}), json!({"query": "cache", "all_projects": true})] {
+            let (text, _) = call(&local, "search_notes", args.clone());
+            assert!(!text.contains("trust the tunnel"), "{args}: {text}");
+            let (text, _) = call(&local, "recall", args.clone());
+            assert!(!text.contains("trust the tunnel"), "{args}: {text}");
+        }
+        let (text, _) = call(&local, "save_note", json!({"text": "cache: a local note"}));
+        assert!(text.starts_with("Saved"), "{text}");
+        let (text, _) = call(&host, "search_notes", json!({"query": "cache", "all_projects": true}));
+        assert!(!text.contains("a local note"), "{text}");
     }
 
     /// A Claude session on a real host is read over SSH: a synthetic session file is put

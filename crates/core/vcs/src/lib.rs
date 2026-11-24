@@ -65,22 +65,33 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
     /// A binary file: no hunks to show.
     pub binary: bool,
+    /// The diff as git wrote it. The lines above are for reading (a byte that is not UTF-8
+    /// shows as `�`); the patch of a hunk is cut from these bytes, so it still applies.
+    pub raw: Vec<u8>,
 }
 
 impl FileDiff {
-    /// A patch with only the hunk `index`, for `git apply`.
-    pub fn patch_of(&self, index: usize) -> Option<String> {
-        let hunk = self.hunks.get(index)?;
-        let mut patch = String::new();
-        for line in &self.header {
-            patch.push_str(line);
-            patch.push('\n');
+    /// A patch with only the hunk `index`, for `git apply`: the header and that hunk, in
+    /// the bytes git wrote them.
+    pub fn patch_of(&self, index: usize) -> Option<Vec<u8>> {
+        let mut header: Vec<&[u8]> = Vec::new();
+        let mut hunks: Vec<Vec<&[u8]>> = Vec::new();
+        // As `parse_diff` splits the text: each line, the last one's ending dropped.
+        let raw = self.raw.strip_suffix(b"\n").unwrap_or(&self.raw);
+        for line in raw.split(|byte| *byte == b'\n').filter(|_| !self.raw.is_empty()) {
+            if line.starts_with(b"@@") {
+                hunks.push(vec![line]);
+            } else if let Some(hunk) = hunks.last_mut() {
+                hunk.push(line);
+            } else {
+                header.push(line);
+            }
         }
-        patch.push_str(&hunk.header);
-        patch.push('\n');
-        for line in &hunk.lines {
-            patch.push_str(line);
-            patch.push('\n');
+        let hunk = hunks.get(index)?;
+        let mut patch = Vec::new();
+        for line in header.iter().chain(hunk) {
+            patch.extend_from_slice(line);
+            patch.push(b'\n');
         }
         Some(patch)
     }
@@ -99,6 +110,27 @@ fn git(env: &dyn Environment, root: &str, args: &[&str]) -> io::Result<String> {
     let mut all = vec!["-c", "core.quotepath=off", "--no-optional-locks"];
     all.extend_from_slice(args);
     env.run("git", &all, Some(root))
+}
+
+/// [`git`] with the output in the bytes git wrote.
+fn git_bytes(env: &dyn Environment, root: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+    let mut all = vec!["-c", "core.quotepath=off", "--no-optional-locks"];
+    all.extend_from_slice(args);
+    env.run_bytes("git", &all, Some(root))
+}
+
+/// What keeps git from asking on a terminal on a remote's behalf: the window shows no
+/// terminal, and a question nobody sees would hold the command for ever. A username, a
+/// password, a key's passphrase or an unknown host key then fail with git's message. The
+/// user's own helpers and SSH command stay, and so do sign-in windows of their own (Git
+/// Credential Manager's), which the user does see.
+const NO_QUESTIONS: [(&str, &str); 3] = [("GIT_TERMINAL_PROMPT", "0"), ("SSH_ASKPASS_REQUIRE", "force"), ("SSH_ASKPASS", "bowyer-asks-nothing")];
+
+/// [`git`] for a command that talks to a remote.
+fn git_remote(env: &dyn Environment, root: &str, args: &[&str]) -> io::Result<String> {
+    let mut all = vec!["-c", "core.quotepath=off", "--no-optional-locks"];
+    all.extend_from_slice(args);
+    env.run_with_vars("git", &all, Some(root), &NO_QUESTIONS)
 }
 
 /// The root of the repository that holds `cwd`, or `None` outside one.
@@ -149,11 +181,18 @@ pub fn diff(env: &dyn Environment, root: &str, path: &str, side: Side) -> io::Re
         args.push("--cached");
     }
     args.extend(["--", path]);
-    Ok(parse_diff(&git(env, root, &args)?))
+    Ok(parse_diff_bytes(&git_bytes(env, root, &args)?))
+}
+
+/// [`parse_diff`] of the bytes git wrote, which the diff keeps for its patches.
+pub fn parse_diff_bytes(raw: &[u8]) -> FileDiff {
+    let mut diff = parse_diff(&String::from_utf8_lossy(raw));
+    diff.raw = raw.to_vec();
+    diff
 }
 
 pub fn parse_diff(text: &str) -> FileDiff {
-    let mut diff = FileDiff::default();
+    let mut diff = FileDiff { raw: text.as_bytes().to_vec(), ..FileDiff::default() };
     // Not `lines()`: it would drop the `\r` of a file kept with CRLF, and the patch of such a
     // hunk would no longer apply.
     for line in text.split_terminator('\n') {
@@ -190,7 +229,7 @@ fn apply(env: &dyn Environment, root: &str, diff: &FileDiff, index: usize, args:
     let patch = diff.patch_of(index).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such hunk"))?;
     let mut all = vec!["-c", "core.quotepath=off"];
     all.extend_from_slice(args);
-    env.run_with_input("git", &all, Some(root), patch.as_bytes()).map(|_| ())
+    env.run_with_input("git", &all, Some(root), &patch).map(|_| ())
 }
 
 pub fn stage_file(env: &dyn Environment, root: &str, path: &str) -> io::Result<()> {
@@ -259,18 +298,18 @@ pub fn parse_branch(out: &str) -> Branch {
 /// Pushes the branch to its upstream. Asks nothing: a remote that wants a password fails
 /// with git's message.
 pub fn push(env: &dyn Environment, root: &str) -> io::Result<()> {
-    git(env, root, &["push"]).map(|_| ())
+    git_remote(env, root, &["push"]).map(|_| ())
 }
 
 /// Fetches every remote, dropping branches deleted there.
 pub fn fetch(env: &dyn Environment, root: &str) -> io::Result<()> {
-    git(env, root, &["fetch", "--all", "--prune", "--quiet"]).map(|_| ())
+    git_remote(env, root, &["fetch", "--all", "--prune", "--quiet"]).map(|_| ())
 }
 
 /// Brings the upstream's commits in when that needs no merge; a branch that went its own
 /// way fails with git's message instead of making a merge commit.
 pub fn pull(env: &dyn Environment, root: &str) -> io::Result<()> {
-    git(env, root, &["pull", "--ff-only", "--quiet"]).map(|_| ())
+    git_remote(env, root, &["pull", "--ff-only", "--quiet"]).map(|_| ())
 }
 
 /// The local branches, the most recently committed first.
@@ -311,16 +350,58 @@ pub fn split_patch(text: &str) -> Vec<(String, FileDiff)> {
         .filter(|file| file.starts_with("diff --git "))
         .map(|file| {
             let diff = parse_diff(&file);
-            let path_of = |prefix: &str| {
-                diff.header.iter().find_map(|line| line.strip_prefix(prefix)).map(|p| p.trim_end_matches('\r').to_owned()).filter(|p| p != "/dev/null")
-            };
-            let path = path_of("+++ b/")
-                .or_else(|| path_of("--- a/"))
+            let path_of = |marker: &str, side: &str| diff.header.iter().find_map(|line| header_path(line.strip_prefix(marker)?, side));
+            let path = path_of("+++ ", "b/")
+                .or_else(|| path_of("--- ", "a/"))
                 .or_else(|| file.lines().next().and_then(|first| first.rsplit(" b/").next()).map(str::to_owned))
                 .unwrap_or_default();
             (path, diff)
         })
         .collect()
+}
+
+/// The path of a `---`/`+++` line after its marker, without the `a/` or `b/` of `side`.
+/// Git ends a name that holds a space with a tab, and quotes one with a quote, a backslash
+/// or a control character in it, C style.
+fn header_path(rest: &str, side: &str) -> Option<String> {
+    let rest = rest.trim_end_matches('\r');
+    let name = match rest.strip_prefix('"') {
+        Some(quoted) => unquote_c(quoted)?,
+        None => rest.trim_end_matches('\t').to_owned(),
+    };
+    name.strip_prefix(side).map(str::to_owned)
+}
+
+/// The text of a C-quoted name, after its opening quote: escapes such as `\t`, `\"` and
+/// octal bytes (`\303\251`) read back.
+fn unquote_c(quoted: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chars = quoted.bytes();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'"' => return Some(String::from_utf8_lossy(&bytes).into_owned()),
+            b'\\' => match chars.next()? {
+                b'n' => bytes.push(b'\n'),
+                b't' => bytes.push(b'\t'),
+                b'r' => bytes.push(b'\r'),
+                b'a' => bytes.push(7),
+                b'b' => bytes.push(8),
+                b'f' => bytes.push(12),
+                b'v' => bytes.push(11),
+                digit @ b'0'..=b'7' => {
+                    let mut value = u32::from(digit - b'0');
+                    for _ in 0..2 {
+                        let next = chars.next()?;
+                        value = value * 8 + u32::from(next.checked_sub(b'0').filter(|d| *d < 8)?);
+                    }
+                    bytes.push(u8::try_from(value).ok()?);
+                }
+                other => bytes.push(other),
+            },
+            other => bytes.push(other),
+        }
+    }
+    None
 }
 
 /// Commits what is staged with `message` (given on standard input, so any text goes, over
@@ -349,6 +430,17 @@ mod tests {
     use envs::LocalEnvironment;
     use test_support::TempDir;
 
+    /// A name with a space ends with a tab in the header; one with a quote is quoted.
+    #[test]
+    fn a_commit_names_its_files_as_they_are() {
+        let patch = "diff --git a/my notes.md b/my notes.md\nindex 1..2 100644\n--- a/my notes.md\t\n+++ b/my notes.md\t\n@@ -1 +1 @@\n-a\n+b\n\
+                     diff --git \"a/say \\\"hi\\\".txt\" \"b/say \\\"hi\\\".txt\"\n--- \"a/say \\\"hi\\\".txt\"\n+++ \"b/say \\\"hi\\\".txt\"\n@@ -1 +1 @@\n-a\n+b\n\
+                     diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n";
+        let files: Vec<String> = split_patch(patch).into_iter().map(|(path, _)| path).collect();
+        assert_eq!(files, ["my notes.md", "say \"hi\".txt", "gone.txt"]);
+        assert_eq!(unquote_c("caf\\303\\251\"").as_deref(), Some("café"));
+    }
+
     #[test]
     fn status_lines_parse() {
         let out = "M  src/a.rs\0 M b.txt\0?? new file.md\0R  c2.rs\0c.rs\0MM both.rs\0";
@@ -369,7 +461,7 @@ mod tests {
         let diff = parse_diff(text);
         assert_eq!(diff.header.len(), 4);
         assert_eq!(diff.hunks.len(), 2);
-        assert_eq!(diff.patch_of(1).unwrap(), "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -9 +9 @@\n-y\n+Y\n");
+        assert_eq!(String::from_utf8(diff.patch_of(1).unwrap()).unwrap(), "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -9 +9 @@\n-y\n+Y\n");
     }
 
     fn git_ok(dir: &std::path::Path, args: &[&str]) {
@@ -432,6 +524,36 @@ mod tests {
         let shown = show(&env, &top, &history[0].hash).unwrap();
         assert_eq!(shown[0].0, "a.txt");
         assert_eq!(branch(&env, &top).unwrap().upstream, None, "no remote");
+    }
+
+    /// A remote that wants a password gets no question nobody would see: the fetch fails at
+    /// once with git's message.
+    #[test]
+    fn a_remote_that_asks_for_a_password_fails_at_once() {
+        use std::io::{Read, Write};
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return; // No git on this machine.
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let dir = TempDir::new("vcs_password");
+        let root = dir.path();
+        git_ok(root, &["init", "-q"]);
+        // No helper of this machine's: the test must not open a sign-in window.
+        git_ok(root, &["config", "credential.helper", ""]);
+        git_ok(root, &["remote", "add", "origin", &format!("http://127.0.0.1:{port}/repo.git")]);
+        let env = LocalEnvironment::new();
+        let started = std::time::Instant::now();
+        let error = fetch(&env, &root.to_string_lossy()).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{error}");
+        assert!(error.to_string().contains("terminal prompts disabled") || error.to_string().contains("Authentication failed"), "{error}");
     }
 
     /// Two clones of one bare repository: what one pushes, the other fetches and pulls;
@@ -512,6 +634,39 @@ echo b > one/b.txt; git -C one add b.txt; git -C one commit -q -m Second; git -C
     }
 
     /// A real repository: stage the second hunk only, then discard the first.
+    #[test]
+    fn a_hunk_of_a_file_that_is_not_utf8_stages() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return; // No git on this machine.
+        }
+        let dir = TempDir::new("vcs_latin1");
+        let root = dir.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "test@example.com"]);
+        git_ok(root, &["config", "user.name", "Test"]);
+        git_ok(root, &["config", "core.autocrlf", "false"]);
+        // Latin-1: `é` is the single byte 0xE9.
+        let lines: Vec<Vec<u8>> = (1..=30).map(|i| [b"caf\xE9 ".as_slice(), i.to_string().as_bytes()].concat()).collect();
+        let join = |lines: &[Vec<u8>]| lines.iter().flat_map(|line| line.iter().copied().chain(*b"\n")).collect::<Vec<u8>>();
+        std::fs::write(root.join("old.txt"), join(&lines)).unwrap();
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-qm", "first"]);
+        let mut changed = lines.clone();
+        changed[1].extend_from_slice(b" \xE9t\xE9");
+        changed[27].extend_from_slice(b" fin");
+        std::fs::write(root.join("old.txt"), join(&changed)).unwrap();
+
+        let env = LocalEnvironment::new();
+        let repo = status(&env, &root.to_string_lossy()).unwrap().root;
+        let unstaged = diff(&env, &repo, "old.txt", Side::Unstaged).unwrap();
+        assert_eq!(unstaged.hunks.len(), 2);
+        assert!(unstaged.hunks[0].lines.iter().any(|line| line.contains('\u{fffd}')), "shown with a replacement");
+        stage_hunk(&env, &repo, &unstaged, 0).unwrap();
+        let staged = diff(&env, &repo, "old.txt", Side::Staged).unwrap();
+        assert_eq!(staged.hunks.len(), 1);
+        assert_eq!(diff(&env, &repo, "old.txt", Side::Unstaged).unwrap().hunks.len(), 1, "the other hunk stays");
+    }
+
     #[test]
     fn hunks_stage_and_discard_on_a_real_repository() {
         if std::process::Command::new("git").arg("--version").output().is_err() {

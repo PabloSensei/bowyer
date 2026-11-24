@@ -25,8 +25,12 @@ const INPUT_MESSAGES: usize = 1024;
 const REPLIES: usize = 256;
 const EVENTS: usize = 1024;
 const CONTROLS: usize = 64;
-/// One write to the pipe. The boundaries fall on chars, and replies pass between chunks.
+/// One write to the pipe. The boundaries fall on chars, and replies pass between chunks
+/// (not inside a bracketed paste).
 const WRITE_CHUNK: usize = 16 * 1024;
+/// The brackets of a paste, for a program that asked for them.
+const PASTE_OPEN: &[u8] = b"\x1b[200~";
+const PASTE_CLOSE: &[u8] = b"\x1b[201~";
 /// The shortest gap between two snapshots of the process table while output flows.
 const ADOPT_INTERVAL: Duration = Duration::from_millis(250);
 /// Lines one notch of the wheel moves, as Windows gives them by default. A notch is one mouse
@@ -124,7 +128,18 @@ impl Shared {
     }
 }
 
+/// The smallest terminal: two columns (a wide character takes two) and one row. A panel
+/// not laid out yet asks for nothing, and neither the pseudoconsole nor the screen takes
+/// a size of zero.
+const MIN_COLS: u16 = 2;
+const MIN_ROWS: u16 = 1;
+
+fn usable_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.max(MIN_COLS), rows.max(MIN_ROWS))
+}
+
 fn pack_size(cols: u16, rows: u16) -> u32 {
+    let (cols, rows) = usable_size(cols, rows);
     (cols as u32) << 16 | rows as u32
 }
 
@@ -145,6 +160,8 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub fn spawn(spec: &SpawnSpec) -> io::Result<Self> {
+        let (cols, rows) = usable_size(spec.cols, spec.rows);
+        let spec = &SpawnSpec { cols, rows, ..spec.clone() };
         let (pty, input_pipe, output_pipe) = Pty::spawn(spec)?;
         let pty = Arc::new(pty);
         let shared = Arc::new(Shared {
@@ -257,8 +274,7 @@ impl TerminalSession {
         let normalized = sanitize(text).replace('\n', "\r");
         let encoded = encode_text(&normalized, modes);
         let segments = if modes.bracketed_paste {
-            let (open, close) = (b"\x1b[200~".to_vec(), b"\x1b[201~".to_vec());
-            vec![open, encoded, close]
+            vec![PASTE_OPEN.to_vec(), encoded, PASTE_CLOSE.to_vec()]
         } else {
             vec![encoded]
         };
@@ -523,8 +539,10 @@ fn chunk_end(bytes: &[u8]) -> usize {
 }
 
 /// Replies go first: a program waiting for one may stop reading input until it gets it.
-fn write_loop(mut pipe: File, replies: Receiver<Vec<u8>>, input: Receiver<Vec<Vec<u8>>>) {
-    let write_replies = |pipe: &mut File| -> io::Result<()> {
+/// Inside a bracketed paste they wait for its end: between the brackets the program takes
+/// every byte as pasted text, an answer to its question among them.
+fn write_loop<W: Write>(mut pipe: W, replies: Receiver<Vec<u8>>, input: Receiver<Vec<Vec<u8>>>) {
+    let write_replies = |pipe: &mut W| -> io::Result<()> {
         while let Ok(reply) = replies.try_recv() {
             pipe.write_all(&reply)?;
         }
@@ -543,12 +561,22 @@ fn write_loop(mut pipe: File, replies: Receiver<Vec<u8>>, input: Receiver<Vec<Ve
             }
             recv(input) -> segments => {
                 let Ok(segments) = segments else { return };
+                let mut in_paste = false;
                 for segment in segments {
+                    if segment == PASTE_OPEN {
+                        in_paste = true;
+                    }
                     let mut rest = segment.as_slice();
                     while !rest.is_empty() {
                         let (chunk, tail) = rest.split_at(chunk_end(rest));
                         rest = tail;
-                        if pipe.write_all(chunk).is_err() || write_replies(&mut pipe).is_err() {
+                        if pipe.write_all(chunk).is_err() {
+                            return;
+                        }
+                        if segment == PASTE_CLOSE {
+                            in_paste = false;
+                        }
+                        if !in_paste && write_replies(&mut pipe).is_err() {
                             return;
                         }
                     }
@@ -571,6 +599,56 @@ mod tests {
 
         assert!(end <= WRITE_CHUNK);
         assert!(text.is_char_boundary(end));
+    }
+
+    /// A pipe that answers a question of the program while the paste goes out: the
+    /// answer must not land between the brackets.
+    struct Recorder {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        replies: Sender<Vec<u8>>,
+        asked: bool,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            if !self.asked && bytes != PASTE_OPEN {
+                self.asked = true;
+                self.replies.send(b"\x1b[?62c".to_vec()).unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_answer_waits_for_the_end_of_a_paste() {
+        let (reply_sink, replies) = bounded(4);
+        let (input_sink, input) = bounded(4);
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipe = Recorder { written: written.clone(), replies: reply_sink.clone(), asked: false };
+        let text = vec![b'x'; WRITE_CHUNK * 3];
+        input_sink.send(vec![PASTE_OPEN.to_vec(), text, PASTE_CLOSE.to_vec()]).unwrap();
+        drop(input_sink);
+        drop(reply_sink);
+        write_loop(pipe, replies, input);
+        let written = written.lock().unwrap();
+        let answer = written.windows(6).position(|window| window == b"\x1b[?62c").expect("the answer went out");
+        let close = written.windows(PASTE_CLOSE.len()).position(|window| window == PASTE_CLOSE).unwrap();
+        assert!(answer > close, "the answer came after the paste");
+    }
+
+    /// A panel not laid out yet asks for no size: the terminal takes the smallest one.
+    #[test]
+    fn a_size_of_nothing_becomes_the_smallest_one() {
+        assert_eq!(usable_size(0, 0), (MIN_COLS, MIN_ROWS));
+        let unpacked = |packed: u32| ((packed >> 16) as u16, packed as u16);
+        assert_eq!(unpacked(pack_size(0, 5)), (2, 5));
+        assert_eq!(unpacked(pack_size(80, 0)), (80, 1));
+        assert_eq!(unpacked(pack_size(120, 40)), (120, 40));
     }
 
     #[test]
@@ -597,6 +675,38 @@ mod tests {
         assert_eq!(wheel_route(main_mouse, true), WheelRoute::History);
         assert_eq!(wheel_route(alt_mouse, true), WheelRoute::History);
         assert_eq!(wheel_route(alt, true), WheelRoute::History);
+    }
+
+    /// A job the shell put in the background goes with the tab, and the tab ends: the job
+    /// was the last to hold the terminal.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_terminal_ends_its_background_jobs() {
+        let line = "set -m; sleep 300 & echo job:$!; sleep 300".to_owned();
+        let session = TerminalSession::spawn(&SpawnSpec {
+            command_line: line,
+            cwd: None,
+            env: crate::allowlisted(),
+            cols: 80,
+            rows: 12,
+            shift_enter: ShiftEnter::default(),
+        })
+        .expect("spawn");
+        assert!(session.wait_for(Duration::from_secs(15), |screen| screen.contains("job:")));
+        let text = session.screen().lines().join("\n");
+        let job: i32 = text.split("job:").nth(1).and_then(|rest| rest.split_whitespace().next()).and_then(|pid| pid.parse().ok()).expect("the job's number");
+        session.terminate();
+        let started = std::time::Instant::now();
+        // SAFETY: signal 0 only asks whether the process is there.
+        while unsafe { libc::kill(job, 0) } == 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "the background job outlived its terminal");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let started = std::time::Instant::now();
+        while !session.is_closed() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the tab did not end");
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// A program that prints one line, starts a long child and then stays quiet.

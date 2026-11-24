@@ -139,6 +139,9 @@ fn virtual_key(ch: char) -> u16 {
     (scanned as u16) & 0xFF
 }
 
+/// The control character of Ctrl with `ch`: letters and `@`…`_` by their low five bits.
+/// A key record of Windows carries it as the console would; Ctrl with a digit or `/` goes
+/// as the key itself, and the console turns it into what a program of its own kind expects.
 fn control_code(ch: char) -> Option<u8> {
     match ch {
         '@'..='_' => Some(ch as u8 & 0x1F),
@@ -149,13 +152,41 @@ fn control_code(ch: char) -> Option<u8> {
     }
 }
 
+/// The character a key record carries for Ctrl with `ch`. The console makes the control
+/// characters of Ctrl+3 to Ctrl+8 out of the key itself, but not those of Ctrl+/ and
+/// Ctrl+2: the record carries those.
+#[cfg(windows)]
+fn record_control_code(ch: char) -> Option<u8> {
+    control_code(ch).or(match ch {
+        '/' => Some(0x1F),
+        '2' => Some(0),
+        _ => None,
+    })
+}
+
+/// [`control_code`] as xterm sends it in a byte stream, with the digits and `/` that stand
+/// for the control characters a keyboard has no key of its own for (Ctrl+/ undoes in Emacs
+/// and readline, Ctrl+2 is NUL).
+fn xterm_control_code(ch: char) -> Option<u8> {
+    control_code(ch).or(match ch {
+        '2' => Some(0),
+        '3' => Some(0x1B),
+        '4' => Some(0x1C),
+        '5' => Some(0x1D),
+        '6' => Some(0x1E),
+        '7' | '/' => Some(0x1F),
+        '8' => Some(0x7F),
+        _ => None,
+    })
+}
+
 #[cfg(windows)]
 fn record(event: KeyEvent) -> Record {
     let KeyEvent { key, mods } = event;
     let mut control = mods.control_state();
     let (vk, unicode) = match key {
         Key::Char(ch) => {
-            let code = mods.ctrl.then(|| control_code(ch)).flatten();
+            let code = mods.ctrl.then(|| record_control_code(ch)).flatten();
             let unicode = code.map_or(ch as u32 as u16, u16::from);
             (virtual_key(ch), unicode)
         }
@@ -267,7 +298,7 @@ fn legacy(out: &mut Vec<u8>, event: KeyEvent, modes: Modes) {
     }
     let application = modes.app_cursor;
     match key {
-        Key::Char(ch) => match mods.ctrl.then(|| control_code(ch)).flatten() {
+        Key::Char(ch) => match mods.ctrl.then(|| xterm_control_code(ch)).flatten() {
             Some(code) => out.push(code),
             None => out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes()),
         },
@@ -418,6 +449,22 @@ mod tests {
         assert!(record(Key::Char('c'), Mods::CTRL).starts_with("\x1b[67;46;3;1;8;1_"));
     }
 
+    /// Ctrl with a digit goes to the console as the key with Ctrl held, and the console
+    /// makes the control character; Ctrl+/ and Ctrl+2, which it does not make, carry theirs.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_with_a_digit_or_slash_is_a_record_of_the_key() {
+        let unicode = |ch: char| {
+            let record = record(Key::Char(ch), Mods::CTRL);
+            let fields: Vec<String> = record.trim_start_matches("\x1b[").split(';').map(str::to_owned).collect();
+            (fields[2].clone(), fields[4].clone())
+        };
+        assert_eq!(unicode('/'), ("31".to_owned(), "8".to_owned()), "0x1F with the left Ctrl");
+        assert_eq!(unicode('2'), ("0".to_owned(), "8".to_owned()));
+        assert_eq!(unicode('3'), ("51".to_owned(), "8".to_owned()));
+        assert_eq!(unicode('8'), ("56".to_owned(), "8".to_owned()));
+    }
+
     #[test]
     fn xterm_sequences_carry_modifiers() {
         assert_eq!(legacy(Key::Up, Mods::default()), "\x1b[A");
@@ -430,6 +477,18 @@ mod tests {
         assert_eq!(legacy(Key::Tab, Mods::SHIFT), "\x1b[Z");
         assert_eq!(legacy(Key::Char('c'), Mods::CTRL), "\x03");
         assert_eq!(legacy(Key::Char('x'), Mods::ALT), "\x1bx");
+    }
+
+    /// Ctrl with `/` or a digit sends the control character xterm sends.
+    #[test]
+    fn ctrl_with_a_digit_or_slash_is_a_control_character() {
+        assert_eq!(legacy(Key::Char('/'), Mods::CTRL), "\x1f");
+        assert_eq!(legacy(Key::Char('2'), Mods::CTRL), "\0");
+        assert_eq!(legacy(Key::Char('3'), Mods::CTRL), "\x1b");
+        assert_eq!(legacy(Key::Char('6'), Mods::CTRL), "\x1e");
+        assert_eq!(legacy(Key::Char('7'), Mods::CTRL), "\x1f");
+        assert_eq!(legacy(Key::Char('8'), Mods::CTRL), "\x7f");
+        assert_eq!(legacy(Key::Char('1'), Mods::CTRL), "1", "no control character of its own");
     }
 
     #[test]

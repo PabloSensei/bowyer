@@ -139,7 +139,44 @@ pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
     if !asks_secret || host_key_question {
         return None;
     }
+    // Through a jump host (`ProxyJump`) the jump host asks for its own password first: the
+    // kept password is the target's, and goes to the target only.
+    if let Some(asker) = prompt_machine(&prompt)
+        && let Some((target, jump)) = resolved(host)
+        && !answers_to(asker, &target, jump)
+    {
+        return None;
+    }
     crate::secret::load(host)
+}
+
+/// The machine a password prompt names: `user@machine's password:` or `(user@machine)
+/// Password:`.
+fn prompt_machine(prompt: &str) -> Option<&str> {
+    let prompt = prompt.trim_start();
+    let named = match prompt.strip_prefix('(') {
+        Some(rest) => &rest[..rest.find(')')?],
+        None => &prompt[..prompt.find("'s password")?],
+    };
+    named.rsplit_once('@').map(|(_, machine)| machine.trim()).filter(|machine| !machine.is_empty())
+}
+
+/// The machine `ssh` reaches for `host`, and whether it goes through a jump host there.
+fn resolved(host: &str) -> Option<(String, bool)> {
+    let ssh = SshEnvironment::new(host);
+    let mut command = Command::new(&ssh.ssh);
+    command.arg("-G").args(ssh.options()).arg(host).stdin(Stdio::null());
+    hide_console(&mut command);
+    let config = String::from_utf8_lossy(&command.output().ok()?.stdout).into_owned();
+    let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()));
+    let jump = value("proxyjump ").is_some_and(|jump| !jump.eq_ignore_ascii_case("none"));
+    Some((value("hostname ")?, jump))
+}
+
+/// Whether a prompt from `asker` gets the password of `target`: always without a jump host,
+/// and through one only when the target itself asks.
+fn answers_to(asker: &str, target: &str, jump: bool) -> bool {
+    !jump || asker.eq_ignore_ascii_case(target)
 }
 
 /// Whether the private key at `key` has a passphrase: `ssh-keygen` (next to `ssh`) cannot
@@ -239,6 +276,15 @@ fn merged_known_hosts(text: &str, new: &str) -> String {
     }
     merged
 }
+
+/// What a [`SshEnvironment::tunnel`] prints on the host once it holds the port.
+pub const TUNNEL_READY: &str = "bowyer-tunnel-ready";
+/// What a detached run's connection writes to its error output once the run is going on
+/// the host, so a connection that drops after it is followed again ([`SshEnvironment::follow_detached`]).
+pub const RUN_STARTED: &str = "bowyer-run-started";
+/// What the connection writes to its error output last, when the run has ended on the host:
+/// without it, the connection dropped while the run went on.
+pub const RUN_END: &str = "bowyer-run-end";
 
 /// The system's own files of host keys, which an option naming Bowyer's file must keep.
 #[cfg(windows)]
@@ -347,6 +393,17 @@ impl SshEnvironment {
         sessions_for(&format!("{}|{}|{:?}|{}", self.ssh.display(), self.host, self.identity, self.password))
     }
 
+    /// [`Self::base_command`] for a connection that lasts: a dead one is noticed within a
+    /// minute, not after the TCP timeout of hours.
+    fn lasting_command(&self) -> Command {
+        let mut command = Command::new(&self.ssh);
+        command.args(["-o", self.batch_mode(), "-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
+        command.args(self.options());
+        command.arg(&self.host);
+        command.envs(self.askpass_env());
+        command
+    }
+
     /// The connection a session runs over: a dead one is noticed within a minute.
     fn session_command(&self) -> Command {
         let mut command = Command::new(&self.ssh);
@@ -431,6 +488,22 @@ impl SshEnvironment {
         Err(io::Error::other(format!("{}: {message}", self.host)))
     }
 
+    /// A connection that brings `127.0.0.1:local` of this computer to `127.0.0.1:remote` of
+    /// the host (`ssh -R`), for as long as its standard input stays open: the host reads it
+    /// until it ends, so when Bowyer goes the tunnel goes with it and frees the port. Once the
+    /// port is taken on the host it prints [`TUNNEL_READY`]; a port already taken there ends
+    /// the connection (`ExitOnForwardFailure`). The caller sets up the pipes.
+    pub fn tunnel(&self, remote: u16, local: u16) -> Command {
+        let mut command = Command::new(&self.ssh);
+        command.args(["-o", self.batch_mode(), "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
+        command.args(self.options());
+        command.args(["-R", &format!("127.0.0.1:{remote}:127.0.0.1:{local}")]);
+        command.args([self.host.as_str(), "--", &format!("echo {TUNNEL_READY}; cat >/dev/null")]);
+        command.envs(self.askpass_env());
+        hide_console(&mut command);
+        command
+    }
+
     /// A program run on the host without a terminal, its standard streams over the
     /// connection: for headless harness turns. The caller sets up the pipes.
     pub fn headless(&self, program: &str, args: &[&str], cwd: Option<&str>) -> Command {
@@ -454,7 +527,7 @@ impl SshEnvironment {
         if let Some(cwd) = cwd {
             script.push_str(&format!("cd {} && ", remote_path(cwd)));
         }
-        script.push_str(&format!("d=\"$HOME/.cache/bowyer/runs\"; mkdir -p \"$d\" && echo $$ > \"$d/{run}.pid\" && "));
+        script.push_str(&format!("d=\"$HOME/.cache/bowyer/runs\"; mkdir -p \"$d\" && chmod 700 \"$d\" && echo $$ > \"$d/{run}.pid\" && "));
         script.push_str(&interactive_script(program, args));
         let mut command = self.base_command();
         command.arg("--").arg(script);
@@ -515,15 +588,32 @@ impl SshEnvironment {
         };
         let cd = cwd.map(|cwd| format!("cd {} || exit 1; ", remote_path(cwd))).unwrap_or_default();
         let script = format!(
-            "d=\"$HOME/.cache/bowyer/runs\"; mkdir -p \"$d\" || exit 1; find \"$d\" \\( -type f -o -type p \\) -mtime +2 -delete 2>/dev/null; \
+            "d=\"$HOME/.cache/bowyer/runs\"; mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; find \"$d\" \\( -type f -o -type p \\) -mtime +2 -delete 2>/dev/null; \
              f=\"$d/{run}\"; cat > \"$f.in\" || exit 1; {cd}\
              setsid nohup sh -c {job} sh \"$f\" < /dev/null > /dev/null 2>&1 & \
-             echo $! > \"$f.pid\"; tail -n +1 -F --pid=$! \"$f.out\" 2>/dev/null; \
-             cat \"$f.err\" >&2 2>/dev/null; exit \"$(cat \"$f.code\" 2>/dev/null || echo 1)\"",
+             echo $! > \"$f.pid\"; echo {RUN_STARTED} >&2; tail -c +1 -F --pid=$! \"$f.out\" 2>/dev/null; \
+             cat \"$f.err\" >&2 2>/dev/null; echo >&2; echo {RUN_END} >&2; exit \"$(cat \"$f.code\" 2>/dev/null || echo 1)\"",
             run = shell_quote(run).trim_matches('\''),
             job = shell_quote(&job),
         );
-        let mut command = self.base_command();
+        let mut command = self.lasting_command();
+        command.arg("--").arg(script);
+        hide_console(&mut command);
+        command
+    }
+
+    /// Follows a run of [`Self::detached`] again after its connection dropped: its output
+    /// from byte `from` on (counted from 0), then its error output and exit code once it
+    /// has ended.
+    pub fn follow_detached(&self, run: &str, from: u64) -> Command {
+        let script = format!(
+            "f=\"$HOME/.cache/bowyer/runs/\"{run}; p=$(cat \"$f.pid\" 2>/dev/null); \
+             if [ -n \"$p\" ]; then tail -c +{start} -F --pid=\"$p\" \"$f.out\" 2>/dev/null; else echo 'bowyer: the run is gone from the host' >&2; fi; \
+             cat \"$f.err\" >&2 2>/dev/null; echo >&2; echo {RUN_END} >&2; exit \"$(cat \"$f.code\" 2>/dev/null || echo 1)\"",
+            run = shell_quote(run),
+            start = from + 1,
+        );
+        let mut command = self.lasting_command();
         command.arg("--").arg(script);
         hide_console(&mut command);
         command
@@ -531,11 +621,7 @@ impl SshEnvironment {
 
     /// Stops a detached turn and everything it started on the host.
     pub fn stop_detached(&self, run: &str) -> io::Result<()> {
-        let run = shell_quote(run);
-        let script = format!(
-            "rm -f \"$HOME/.cache/bowyer/runs/\"{run}.fifo; p=$(cat \"$HOME/.cache/bowyer/runs/\"{run}.pid 2>/dev/null) || exit 0; kill -TERM -- \"-$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; exit 0"
-        );
-        self.script(&script).map(|_| ())
+        self.script(&stop_script(run)).map(|_| ())
     }
 
     /// Checks that the host answers without a password prompt.
@@ -573,7 +659,7 @@ impl SshEnvironment {
             .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
             .collect();
         let script = format!(
-            "d=\"$HOME/.cache/bowyer/attachments\"; mkdir -p \"$d\" && cat > \"$d\"/{name} && printf '%s' \"$d\"/{name}",
+            "d=\"$HOME/.cache/bowyer/attachments\"; mkdir -p \"$d\" && chmod 700 \"$d\" && cat > \"$d\"/{name} && printf '%s' \"$d\"/{name}",
             name = shell_quote(&name)
         );
         let mut command = self.base_command();
@@ -609,6 +695,15 @@ fn parse_listing(text: &str) -> Vec<FileMeta> {
             Some(FileMeta { path, size, modified_ms: (mtime * 1000.0) as i64, is_dir: kind == "d" })
         })
         .collect()
+}
+
+/// The script that stops a detached run and its process group. `kill -TERM -PID` names the
+/// group in every shell: `dash`, the `sh` of Debian and Ubuntu, takes no `--` there.
+fn stop_script(run: &str) -> String {
+    let run = shell_quote(run);
+    format!(
+        "rm -f \"$HOME/.cache/bowyer/runs/\"{run}.fifo; p=$(cat \"$HOME/.cache/bowyer/runs/\"{run}.pid 2>/dev/null) || exit 0; kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; exit 0"
+    )
 }
 
 impl Environment for SshEnvironment {
@@ -716,9 +811,31 @@ impl Environment for SshEnvironment {
     }
 
     fn run(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<String> {
+        self.run_bytes(program, args, cwd).map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    fn run_bytes(&self, program: &str, args: &[&str], cwd: Option<&str>) -> io::Result<Vec<u8>> {
         let mut script = String::new();
         if let Some(cwd) = cwd {
             script.push_str(&format!("cd {} && ", remote_path(cwd)));
+        }
+        script.push_str(&shell_quote(program));
+        for arg in args {
+            script.push(' ');
+            script.push_str(&shell_quote(arg));
+        }
+        self.script(&script)
+    }
+
+    fn run_with_vars(&self, program: &str, args: &[&str], cwd: Option<&str>, vars: &[(&str, &str)]) -> io::Result<String> {
+        let mut script = String::new();
+        if let Some(cwd) = cwd {
+            script.push_str(&format!("cd {} && ", remote_path(cwd)));
+        }
+        for (name, value) in vars {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                script.push_str(&format!("{name}={} ", shell_quote(value)));
+            }
         }
         script.push_str(&shell_quote(program));
         for arg in args {
@@ -771,7 +888,8 @@ impl Environment for SshEnvironment {
 
     fn git_info(&self, cwd: &str) -> Option<GitInfo> {
         let script = format!(
-            "cd {} 2>/dev/null && git rev-parse --show-toplevel --git-dir 2>/dev/null && cat \"$(git rev-parse --git-dir)/HEAD\"",
+            // `symbolic-ref` rather than the `HEAD` file: a reftable's says `.invalid`.
+            "cd {} 2>/dev/null && git rev-parse --show-toplevel --git-dir 2>/dev/null && {{ r=$(git symbolic-ref -q HEAD) && echo \"ref: $r\" || git rev-parse HEAD; }}",
             remote_path(cwd)
         );
         let text = self.script_text(&script).ok()?;
@@ -905,6 +1023,17 @@ mod tests {
         assert_eq!(askpass_answer(nobody, "Enter passphrase for key '/home/me/.ssh/id_ed25519': "), None, "no secret kept, no answer");
     }
 
+    /// Through a jump host, the target's password goes to the target only.
+    #[test]
+    fn a_jump_host_never_gets_the_targets_password() {
+        assert_eq!(prompt_machine("me@10.0.0.5's password: "), Some("10.0.0.5"));
+        assert_eq!(prompt_machine("(me@jump.example) password: "), Some("jump.example"));
+        assert_eq!(prompt_machine("password: "), None);
+        assert!(answers_to("jump.example", "10.0.0.5", false), "no jump host: the prompt is the target's");
+        assert!(answers_to("10.0.0.5", "10.0.0.5", true));
+        assert!(!answers_to("jump.example", "10.0.0.5", true));
+    }
+
     #[test]
     fn askpass_answers_a_password_question_with_the_kept_password() {
         if !crate::secret::usable_in_tests() {
@@ -1014,7 +1143,13 @@ mod tests {
         let script = command.get_args().last().unwrap().to_string_lossy().into_owned();
         assert!(script.contains(r#"f="$d/17-42"; cat > "$f.in""#), "{script}");
         assert!(script.contains(r#"cd "$HOME"/work || exit 1; setsid nohup sh -c"#), "{script}");
-        assert!(script.contains("tail -n +1 -F --pid=$!"), "{script}");
+        assert!(script.contains("echo bowyer-run-started >&2; tail -c +1 -F --pid=$!"), "{script}");
+        assert!(script.contains("echo bowyer-run-end >&2; exit"), "{script}");
+        assert!(script.contains(r#"mkdir -p "$d" && chmod 700 "$d""#), "the runs are the user's alone: {script}");
+        assert!(command.get_args().any(|arg| arg == "ServerAliveInterval=15"), "a dead connection is noticed");
+        let follow = SshEnvironment::new("vm").follow_detached("17-42", 300);
+        let again = follow.get_args().last().unwrap().to_string_lossy().into_owned();
+        assert!(again.contains("tail -c +301 -F") && again.contains("echo bowyer-run-end >&2; exit"), "{again}");
         assert!(script.contains(r#"exec claude -p '\''it'\''\'\'''\''s'\''"#) || script.contains("exec claude -p"), "{script}");
         assert!(script.ends_with(r#"exit "$(cat "$f.code" 2>/dev/null || echo 1)""#), "{script}");
     }
@@ -1143,7 +1278,19 @@ mod tests {
         assert!(!status.success(), "the follower ends with the turn");
         let late = ssh.script_text(&format!("cat \"$HOME/.cache/bowyer/runs/{run}.out\"")).unwrap();
         assert!(!late.contains("late"));
-        let _ = ssh.script_text(&format!("rm -f \"$HOME/.cache/bowyer/runs/\"test-* \"$HOME/.cache/bowyer/runs/\"stop-*"));
+        // The same stop where the shell is `dash`.
+        if ssh.script_text("command -v dash").is_ok_and(|found| !found.trim().is_empty()) {
+            let run = format!("dash-{}", std::process::id());
+            let mut third = ssh.detached("sh", &["-c", "sleep 30; echo late"], None, &run);
+            third.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+            let mut child = third.spawn().unwrap();
+            drop(child.stdin.take());
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            ssh.run("dash", &["-c", &stop_script(&run)], None).unwrap();
+            assert!(!child.wait().unwrap().success(), "dash stops the group too");
+            let _ = ssh.script_text(&format!("rm -f \"$HOME/.cache/bowyer/runs/{run}\".*"));
+        }
+        let _ = ssh.script_text("rm -f \"$HOME/.cache/bowyer/runs/\"test-* \"$HOME/.cache/bowyer/runs/\"stop-*");
     }
 
     /// A password host whose server takes keys only, signed in by a key with a passphrase:

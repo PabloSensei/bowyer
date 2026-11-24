@@ -16,6 +16,8 @@ mod codex;
 mod dsh;
 mod memory_files;
 mod opencode;
+#[cfg(test)]
+mod test_env;
 mod time;
 mod trash;
 

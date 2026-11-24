@@ -24,7 +24,9 @@ pub(super) struct SshForm {
     /// The ways to sign in the chip goes through, and the chosen one.
     pub ways: Vec<SignIn>,
     pub way: usize,
-    pub busy: bool,
+    /// The probe running, by its number: its answer counts only while this form still
+    /// waits for that very probe (not after Cancel, nor in a form opened again).
+    pub busy: Option<u64>,
     pub message: Option<(bool, String)>,
     /// The keys of a host ssh does not know, waiting for the user to trust them.
     pub unknown_keys: Option<HostKeys>,
@@ -37,6 +39,9 @@ pub(super) struct SshForm {
     pub ways_open: bool,
     pub ways_anchor: MenuAnchor,
 }
+
+/// Numbers the probes of the form.
+static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// How a new host signs in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,7 +149,7 @@ impl Shell {
                 in_password: false,
                 ways,
                 way: 0,
-                busy: false,
+                busy: None,
                 message: None,
                 unknown_keys: None,
                 key_changed: false,
@@ -172,6 +177,9 @@ impl Shell {
         }
         self.ssh_hosts.retain(|ssh| ssh.host != host);
         self.envs.retain(|env| env.id() != id);
+        // Its terminals and the memory's tunnel go with it, and its token stops working.
+        self.close_terminals_of(|owner| owner.env == id, cx);
+        self.drop_memory_link(host);
         if self.open.as_ref().is_some_and(|open| open.summary.key.env == id) {
             self.open = None;
             self.selected = None;
@@ -216,7 +224,7 @@ impl Shell {
     fn connect_ssh(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &mut self.ssh_form else { return };
         let host = form.host.text.trim().to_owned();
-        if host.is_empty() || form.busy {
+        if host.is_empty() || form.busy.is_some() {
             return;
         }
         let password = form.uses_secret().then(|| form.password.text.clone());
@@ -243,7 +251,8 @@ impl Shell {
             cx.notify();
             return;
         }
-        form.busy = true;
+        let attempt = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        form.busy = Some(attempt);
         form.message = Some((true, t("ssh.probing").to_owned()));
         let ssh = SshEnvironment::new(&host).with_identity(identity.clone()).with_password(password.is_some());
         let probe = ssh.clone();
@@ -261,7 +270,7 @@ impl Shell {
                         // A host that signs in with a key keeps no password.
                         let _ = envs::secret::remove(&probe.host);
                     }
-                    Ok(answer)
+                    Ok((answer, before))
                 }
                 Err(error) => {
                     if password.is_some() {
@@ -280,8 +289,23 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
+                if this.ssh_form.as_ref().and_then(|form| form.busy) != Some(attempt) {
+                    // Cancelled while probing: the host is not added, and the store keeps
+                    // what it kept before.
+                    if let Ok((_, before)) = result {
+                        let host = host.clone();
+                        cx.background_spawn(async move {
+                            let _ = match before {
+                                Some(old) => envs::secret::store(&host, &old),
+                                None => envs::secret::remove(&host),
+                            };
+                        })
+                        .detach();
+                    }
+                    return;
+                }
                 match result {
-                    Ok(answer) => {
+                    Ok((answer, _)) => {
                         let identity_text = identity.as_ref().map(|p| p.to_string_lossy().into_owned());
                         let _ = this.lib().add_ssh_environment(&host, &host, identity_text.as_deref());
                         // A host added again drops its old sessions to the host, which may
@@ -299,7 +323,7 @@ impl Shell {
                     }
                     Err((error, keys)) => {
                         if let Some(form) = &mut this.ssh_form {
-                            form.busy = false;
+                            form.busy = None;
                             let changed = envs::changed_key_is_own(&error);
                             match keys {
                                 Some(Ok(keys)) => {
@@ -469,7 +493,7 @@ impl Shell {
         let fingerprints: Vec<String> = form.unknown_keys.as_ref().map(|keys| keys.fingerprints.clone()).unwrap_or_default();
         let trusting = form.unknown_keys.is_some();
         let replacing = trusting && form.key_changed;
-        let busy = form.busy;
+        let busy = form.busy.is_some();
         let known: Vec<(String, Option<String>)> = self
             .ssh_hosts
             .iter()

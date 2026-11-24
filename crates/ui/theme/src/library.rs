@@ -2,12 +2,15 @@
 //! `themes` folder of the settings. A broken file is left out and named, so that one
 //! theme of a user cannot stop the program.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::format::{ThemeError, ThemeFile};
 use crate::{Color, Tokens, builtin};
+
+/// A theme of the folder resolved over its parent, with its warnings, or why it cannot be.
+type Resolved = Result<(Tokens<Color>, Vec<String>), String>;
 
 /// The folder of the settings that holds the themes of the user.
 pub fn themes_folder(settings_dir: &Path) -> PathBuf {
@@ -64,72 +67,101 @@ impl ThemeLibrary {
             })
             .collect();
         files.sort();
-        for path in files {
-            library.add_file(&path);
+        // Read every file first: a theme may name as its parent a file read after it.
+        let mut seen = HashSet::new();
+        let read: Vec<(PathBuf, Option<(String, ThemeFile)>)> = files
+            .into_iter()
+            .map(|path| {
+                let file = library.read_file(&path, &mut seen);
+                (path, file)
+            })
+            .collect();
+        let mut done: HashMap<String, Resolved> = HashMap::new();
+        // Each pass resolves the themes whose parent is known by then; a pass that resolves
+        // none leaves the rest to a missing parent or a loop of parents.
+        loop {
+            let mut progress = false;
+            for (_, file) in &read {
+                let Some((id, file)) = file else { continue };
+                if done.contains_key(id) {
+                    continue;
+                }
+                let parent = match file.parent.as_deref() {
+                    None => None,
+                    Some(parent) => match (library.get(parent), done.get(parent)) {
+                        (Some(theme), _) => Some(theme.tokens),
+                        (None, Some(Ok((tokens, _)))) => Some(*tokens),
+                        (None, Some(Err(_))) => {
+                            done.insert(id.clone(), Err(format!("the parent theme {parent} cannot be used")));
+                            progress = true;
+                            continue;
+                        }
+                        (None, None) => continue,
+                    },
+                };
+                done.insert(id.clone(), file.resolve(parent).map_err(|error| error.message));
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        // The settings list the themes by file name, as before.
+        for (path, file) in read {
+            let Some((id, file)) = file else { continue };
+            match done.remove(&id) {
+                Some(Ok((tokens, warnings))) => {
+                    for warning in warnings {
+                        library.errors.push(ThemeError::at(&path, warning));
+                    }
+                    library.themes.push(ThemeDefinition {
+                        id,
+                        name: file.name,
+                        dark: file.dark,
+                        tokens,
+                        builtin: false,
+                        path: Some(path),
+                    });
+                }
+                Some(Err(error)) => library.errors.push(ThemeError::at(&path, error)),
+                None => {
+                    let parent = file.parent.unwrap_or_default();
+                    library.errors.push(ThemeError::at(&path, format!("the parent theme {parent} is not there, or the parents make a loop")));
+                }
+            }
         }
         library
     }
 
-    /// Reads one file into the library, or records why it cannot be used.
-    fn add_file(&mut self, path: &Path) {
+    /// Reads one file of the folder, or records why it cannot be used. A theme of the
+    /// binary keeps its name; the first file of a name keeps it among the files.
+    fn read_file(&mut self, path: &Path, seen: &mut HashSet<String>) -> Option<(String, ThemeFile)> {
         let Some(id) = theme_id(path) else {
-            self.errors
-                .push(ThemeError::at(path, "the file name gives no theme name"));
-            return;
+            self.errors.push(ThemeError::at(path, "the file name gives no theme name"));
+            return None;
         };
-        if self.get(&id).is_some() {
+        if self.get(&id).is_some() || seen.contains(&id) {
             self.errors.push(ThemeError::at(
                 path,
                 format!("a theme named {id} is already there, the file is skipped"),
             ));
-            return;
+            return None;
         }
+        seen.insert(id.clone());
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                self.errors
-                    .push(ThemeError::at(path, format!("not read: {error}")));
-                return;
+                self.errors.push(ThemeError::at(path, format!("not read: {error}")));
+                return None;
             }
         };
-        let file = match ThemeFile::parse(&text) {
-            Ok(file) => file,
+        match ThemeFile::parse(&text) {
+            Ok(file) => Some((id, file)),
             Err(error) => {
                 self.errors.push(ThemeError::at(path, error.message));
-                return;
+                None
             }
-        };
-        let parent = match file.parent.as_deref() {
-            Some(parent) => match self.get(parent) {
-                Some(theme) => Some(theme.tokens),
-                None => {
-                    self.errors.push(ThemeError::at(
-                        path,
-                        format!("the parent theme {parent} is not there"),
-                    ));
-                    return;
-                }
-            },
-            None => None,
-        };
-        let (tokens, warnings) = match file.resolve(parent) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                self.errors.push(ThemeError::at(path, error.message));
-                return;
-            }
-        };
-        for warning in warnings {
-            self.errors.push(ThemeError::at(path, warning));
         }
-        self.themes.push(ThemeDefinition {
-            id,
-            name: file.name,
-            dark: file.dark,
-            tokens,
-            builtin: false,
-            path: Some(path.to_path_buf()),
-        });
     }
 
     pub fn themes(&self) -> &[ThemeDefinition] {

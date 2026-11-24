@@ -14,7 +14,7 @@ use crate::i18n::t;
 use crate::launch;
 
 /// The harnesses a new session can run in, in this order.
-const HARNESSES: [HarnessKind; 4] = [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek];
+pub(super) const HARNESSES: [HarnessKind; 4] = [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek];
 
 /// How many projects of the environment the dialog lists.
 const PROJECTS_SHOWN: usize = 30;
@@ -36,6 +36,12 @@ fn small_button(id: &'static str, label: &str, theme: &Theme) -> Stateful<Div> {
         .child(label.to_owned())
 }
 
+/// The text a new folder starts with: the home folder and a separator.
+fn home_folder(home: &str) -> String {
+    let separator = if home.contains('\\') { "\\" } else { "/" };
+    format!("{}{separator}", home.trim_end_matches(['/', '\\']))
+}
+
 /// Where the session starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Place {
@@ -53,42 +59,30 @@ pub(super) struct NewSession {
     place: Option<Place>,
     /// The folder of `Folder` and `New`.
     path: TextField,
-    /// The harnesses found in each environment; `None` while looking.
-    installed: HashMap<EnvId, Option<Vec<HarnessKind>>>,
     error: Option<String>,
-    busy: bool,
+    /// The start being checked, by its number: its answer opens a draft only while this
+    /// dialog still waits for that very start (not after Cancel, nor in a dialog opened again).
+    busy: Option<u64>,
     focus: FocusHandle,
 }
 
+/// Numbers the starts of the dialog.
+static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The command that installs `harness` in an environment, by its system. The official
 /// ways: the native installers of Claude Code and OpenCode, npm for Codex and for OpenCode
-/// on Windows. DeepSeek Harness has none known.
+/// on Windows (its docs support no Windows package manager). OpenCode is OpenCode 2: its
+/// own package and installer, since `opencode-ai` and `opencode.ai/install` stay on 1.
+/// DeepSeek Harness has none known.
 fn install_command(harness: &HarnessKind, windows: bool) -> Option<&'static str> {
     Some(match (harness, windows) {
         (HarnessKind::Claude, true) => "irm https://claude.ai/install.ps1 | iex",
         (HarnessKind::Claude, false) => "curl -fsSL https://claude.ai/install.sh | bash",
-        (HarnessKind::OpenCode, true) => "npm i -g opencode-ai@latest",
-        (HarnessKind::OpenCode, false) => "curl -fsSL https://opencode.ai/install | bash",
+        (HarnessKind::OpenCode, true) => "npm install -g @opencode/cli",
+        (HarnessKind::OpenCode, false) => "curl -fsSL https://opencode.ai/v2/install | bash",
         (HarnessKind::Codex, _) => "npm install -g @openai/codex",
         _ => return None,
     })
-}
-
-/// The harnesses installed in `env`: on the PATH of this computer, or of the login shell
-/// of the host.
-fn installed_in(env: &dyn envs::Environment) -> Vec<HarnessKind> {
-    let program = |harness: &HarnessKind| launch::harness_command(harness, None).0;
-    if env.id().is_local() {
-        return HARNESSES.iter().filter(|harness| live::resolve_program(&program(harness)).is_some()).cloned().collect();
-    }
-    let names: Vec<String> = HARNESSES.iter().map(program).collect();
-    let script = format!(
-        "exec \"${{SHELL:-sh}}\" -lc 'for p in {}; do command -v \"$p\" >/dev/null 2>&1 && echo \"$p\"; done; true'",
-        names.join(" ")
-    );
-    let found = env.run("sh", &["-c", &script], None).unwrap_or_default();
-    let found: Vec<&str> = found.lines().map(str::trim).collect();
-    HARNESSES.iter().filter(|harness| found.contains(&program(harness).as_str())).cloned().collect()
 }
 
 impl Shell {
@@ -100,31 +94,15 @@ impl Shell {
         let place = self.open.as_ref().and_then(|open| open.summary.cwd.as_deref()).map(|cwd| Place::Project(library::project_root(cwd).0.to_owned()));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        self.new_session = Some(NewSession { env: env.clone(), harness, place, path: TextField::from_text(""), installed: HashMap::new(), error: None, busy: false, focus });
+        self.new_session = Some(NewSession { env: env.clone(), harness, place, path: TextField::from_text(""), error: None, busy: None, focus });
         self.look_for_harnesses(env, cx);
         cx.notify();
     }
 
-    /// Finds the harnesses of `env` in the background, once per opening of the dialog.
+    /// Finds the harnesses of `env` and their versions in the background, unless the window
+    /// knows them already.
     fn look_for_harnesses(&mut self, env_id: EnvId, cx: &mut Context<Self>) {
-        let Some(dialog) = &mut self.new_session else { return };
-        if dialog.installed.contains_key(&env_id) {
-            return;
-        }
-        dialog.installed.insert(env_id.clone(), None);
-        let Some(env) = self.env_for(&env_id) else { return };
-        let task = cx.background_spawn(async move { installed_in(&*env) });
-        cx.spawn(async move |this, cx| {
-            let found = task.await;
-            this.update(cx, |this, cx| {
-                if let Some(dialog) = &mut this.new_session {
-                    dialog.installed.insert(env_id, Some(found));
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.want_versions(&env_id, false, cx);
     }
 
     fn choose_env(&mut self, env: EnvId, cx: &mut Context<Self>) {
@@ -142,10 +120,9 @@ impl Shell {
 
     /// Looks for the harnesses of the chosen environment again: after an install.
     fn look_again(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = &mut self.new_session else { return };
+        let Some(dialog) = &self.new_session else { return };
         let env = dialog.env.clone();
-        dialog.installed.remove(&env);
-        self.look_for_harnesses(env, cx);
+        self.want_versions(&env, true, cx);
     }
 
     /// The projects of an environment, the most recent first: the folder each session began
@@ -217,7 +194,7 @@ impl Shell {
     /// Starts the session: the folder is checked (or made), then a draft opens there.
     fn start_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = &mut self.new_session else { return };
-        if dialog.busy {
+        if dialog.busy.is_some() {
             return;
         }
         let (env_id, harness) = (dialog.env.clone(), dialog.harness.clone());
@@ -237,8 +214,9 @@ impl Shell {
             return;
         }
         let Some(env) = self.env_for(&env_id) else { return };
+        let attempt = STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(dialog) = &mut self.new_session {
-            dialog.busy = true;
+            dialog.busy = Some(attempt);
             dialog.error = None;
         }
         let task = cx.background_spawn(async move {
@@ -267,13 +245,15 @@ impl Shell {
             let result = task.await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 this.update(cx, |this, cx| match result {
+                    // Cancelled while the folder was checked: nothing opens.
+                    _ if this.new_session.as_ref().and_then(|dialog| dialog.busy) != Some(attempt) => {}
                     Ok(cwd) => {
                         this.new_session = None;
                         this.start_draft_at(library::SessionStart { env: env_id, harness, cwd }, window, cx);
                     }
                     Err(error) => {
                         if let Some(dialog) = &mut this.new_session {
-                            dialog.busy = false;
+                            dialog.busy = None;
                             dialog.error = Some(error);
                             cx.notify();
                         }
@@ -310,13 +290,23 @@ impl Shell {
 
     pub(super) fn render_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.global::<Theme>();
+        let env_id = self.new_session.as_ref()?.env.clone();
+        // Each installed harness with its version and, when a newer one is out, its update.
+        let mut marks: HashMap<HarnessKind, AnyElement> = HashMap::new();
+        for harness in HARNESSES.iter() {
+            let id = SharedString::from(format!("new-update-{}", harness.id()));
+            if let Some(mark) = self.version_mark(&env_id, harness, id, true, true, cx) {
+                marks.insert(harness.clone(), mark);
+            }
+        }
+        let installed: Option<Vec<HarnessKind>> = self.harness_versions.found(&env_id).map(|found| found.keys().cloned().collect());
         let dialog = self.new_session.as_ref()?;
         let focused = dialog.focus.is_focused(window);
-        let env_id = dialog.env.clone();
         let chosen_harness = dialog.harness.clone();
-        let installed = dialog.installed.get(&env_id).cloned().flatten();
-        let checking = installed.is_none();
-        let harness_ready = installed.as_ref().is_some_and(|list| list.contains(&chosen_harness));
+        // A host that did not answer is not stopped at: the turn says what it finds there.
+        let unknown = self.harness_versions.unknown(&env_id);
+        let checking = installed.is_none() && !unknown;
+        let harness_ready = unknown || installed.as_ref().is_some_and(|list| list.contains(&chosen_harness));
         let local = env_id.is_local();
 
         let section = |title: &'static str| div().mt(px(6.)).text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_secondary).child(t(title));
@@ -357,15 +347,18 @@ impl Shell {
         let harness_row = div().flex().flex_wrap().gap(px(6.)).children(HARNESSES.iter().map(|harness| {
             let chosen = *harness == chosen_harness;
             let state = match &installed {
+                None if unknown => t("new.unchecked"),
                 None => t("new.checking"),
                 Some(list) if list.contains(harness) => "",
                 Some(_) => t("new.not_installed"),
             };
             let target = harness.clone();
+            let mark = marks.remove(harness);
             option(SharedString::from(format!("new-harness-{}", harness.id())), chosen)
                 .child(div().size(px(8.)).rounded_full().bg(harness_color(harness)))
                 .child(harness.label().to_owned())
                 .when(!state.is_empty(), |this| this.child(div().text_size(px(11.)).text_color(theme.text_muted).child(state)))
+                .children(mark)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(dialog) = &mut this.new_session {
                         dialog.harness = target.clone();
@@ -439,19 +432,32 @@ impl Shell {
         let other = |id: &'static str, label: &'static str, kind: Place| {
             let chosen = place.as_ref() == Some(&kind);
             option(SharedString::from(id), chosen).child(t(label)).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                // A new folder starts in the home folder (asked of the host on the click,
-                // never while drawing).
-                let home = match &this.new_session {
+                // A new folder starts in the home folder: asked of the host on the click and
+                // in the background (a slow host would freeze the window), never while drawing.
+                let asks_home = match &this.new_session {
                     Some(dialog) if matches!(kind, Place::New) && dialog.path.text.is_empty() => {
-                        this.env_for(&dialog.env).and_then(|env| env.home().ok())
+                        this.env_for(&dialog.env).map(|env| (dialog.env.clone(), env))
                     }
                     _ => None,
                 };
+                if let Some((env_id, env)) = asks_home {
+                    let task = cx.background_spawn(async move { env.home().ok() });
+                    cx.spawn(async move |this, cx| {
+                        let Some(home) = task.await else { return };
+                        this.update(cx, |this, cx| {
+                            let Some(dialog) = &mut this.new_session else { return };
+                            // The user went on meanwhile: what they did stays.
+                            if dialog.env != env_id || dialog.place != Some(Place::New) || !dialog.path.text.is_empty() {
+                                return;
+                            }
+                            dialog.path = TextField::from_text(home_folder(&home));
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
                 if let Some(dialog) = &mut this.new_session {
-                    if let Some(home) = home {
-                        let separator = if home.contains('\\') { "\\" } else { "/" };
-                        dialog.path = TextField::from_text(format!("{}{separator}", home.trim_end_matches(['/', '\\'])));
-                    }
                     dialog.place = Some(kind.clone());
                     dialog.error = None;
                     dialog.focus.focus(window, cx);
@@ -491,7 +497,7 @@ impl Shell {
         });
 
         let error = dialog.error.clone();
-        let busy = dialog.busy;
+        let busy = dialog.busy.is_some();
         let can_start = harness_ready && place.is_some() && !busy;
         let start = div()
             .id("new-start")
@@ -570,7 +576,8 @@ mod tests {
         assert_eq!(install_command(&HarnessKind::Claude, true), Some("irm https://claude.ai/install.ps1 | iex"));
         assert_eq!(install_command(&HarnessKind::Claude, false), Some("curl -fsSL https://claude.ai/install.sh | bash"));
         assert_eq!(install_command(&HarnessKind::Codex, false), Some("npm install -g @openai/codex"));
-        assert_eq!(install_command(&HarnessKind::OpenCode, true), Some("npm i -g opencode-ai@latest"));
+        assert_eq!(install_command(&HarnessKind::OpenCode, true), Some("npm install -g @opencode/cli"));
+        assert_eq!(install_command(&HarnessKind::OpenCode, false), Some("curl -fsSL https://opencode.ai/v2/install | bash"), "OpenCode 2, not 1");
         assert_eq!(install_command(&HarnessKind::DeepSeek, false), None, "no known installer: the docs say how");
     }
 }

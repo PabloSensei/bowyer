@@ -67,7 +67,7 @@ fn app_id() -> &'static str {
 fn command(title: &str, body: &str) -> Option<Command> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(envs::system_program("powershell.exe"));
     command
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &crate::launch::powershell_encoded(&toast_script(app_id(), title, body))])
         .creation_flags(CREATE_NO_WINDOW);

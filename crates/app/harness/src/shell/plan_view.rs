@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use live::usage::{Plan, WindowKind};
-use model::{EnvId, HarnessKind, SessionKey, Usage, pricing};
+use model::{EnvId, HarnessKind, SessionKey, pricing};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
@@ -43,7 +43,7 @@ pub(super) struct MonthSum {
 
 /// The tokens of this month per session, with the stamp of the history they came from:
 /// another look reads only the sessions that changed.
-pub(super) type MonthCache = Arc<Mutex<HashMap<SessionKey, (i64, i64, Vec<(String, Usage)>)>>>;
+pub(super) type MonthCache = Arc<Mutex<HashMap<SessionKey, (i64, i64, model::SpentSince)>>>;
 
 type Account = (EnvId, HarnessKind);
 
@@ -89,19 +89,18 @@ impl Shell {
             return;
         };
         let local = account.0.is_local();
+        // An empty folder of the user's own: no project settings, no hooks of a project. A
+        // host's is made by the command itself.
+        let own = self.cache_dir.join("usage");
         let task = cx.background_spawn(async move {
-            // An empty folder: no project settings, no hooks of a project.
-            let folder = if local {
-                let folder = std::env::temp_dir().join("bowyer-usage");
-                let _ = std::fs::create_dir_all(&folder);
-                folder.to_string_lossy().into_owned()
-            } else {
-                "/tmp".to_owned()
-            };
+            let folder = local.then(|| {
+                let _ = std::fs::create_dir_all(&own);
+                own.to_string_lossy().into_owned()
+            });
             let request = live::usage::claude_request();
             let (program, args) = live::usage::claude_command(local);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            match env.run_with_input(&program, &args, Some(&folder), request.as_bytes()) {
+            match env.run_with_input(&program, &args, folder.as_deref(), request.as_bytes()) {
                 Ok(output) => live::usage::parse_claude(&output),
                 Err(error) => Plan::Unknown(model::shorten(&error.to_string(), 200)),
             }
@@ -141,7 +140,8 @@ impl Shell {
         let harness = account.1.clone();
         let task = cx.background_spawn(async move {
             let source = history::source_for(&harness)?;
-            let mut buckets: Vec<(String, Usage)> = Vec::new();
+            // A session resumed into a new file repeats the calls before it: each counts once.
+            let mut sum = model::UsageSum::default();
             let mut counted = 0;
             for summary in &sessions {
                 let stamp = summary.updated_ms;
@@ -152,7 +152,7 @@ impl Shell {
                     Some(usage) => usage,
                     None => {
                         let Ok(transcript) = source.load(&*env, summary, &remote) else { continue };
-                        let usage = transcript.usage_since(start);
+                        let usage = transcript.spent_since(start);
                         if let Ok(mut cache) = cache.lock() {
                             cache.insert(summary.key.clone(), (start, stamp, usage.clone()));
                         }
@@ -162,14 +162,9 @@ impl Shell {
                 if !usage.is_empty() {
                     counted += 1;
                 }
-                for (bucket, tokens) in usage {
-                    match buckets.iter_mut().find(|(name, _)| *name == bucket) {
-                        Some((_, sum)) => sum.add(&tokens),
-                        None => buckets.push((bucket, tokens)),
-                    }
-                }
+                sum.add_session(&usage);
             }
-            let (usd, complete) = pricing::session_cost(&buckets);
+            let (usd, complete) = pricing::session_cost(&sum.buckets);
             Some(MonthSum { usd, complete, sessions: counted })
         });
         cx.spawn(async move |this, cx| {

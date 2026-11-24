@@ -4,6 +4,10 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=bowyer.ico");
+    // When this program was built: an update signed before it is an older release. A build
+    // that did not run this script again keeps an older time, which only lets more through.
+    let built_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs());
+    println!("cargo:rustc-env=BOWYER_BUILT_AT={built_at}");
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }

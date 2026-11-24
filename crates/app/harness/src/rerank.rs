@@ -56,6 +56,25 @@ pub fn read_answer(json: &str) -> Option<(String, Option<f64>)> {
     Some((text, value.get("total_cost_usd").and_then(Value::as_f64)))
 }
 
+/// Runs Claude Code of this computer with `args`, `input` on its standard input. Found as
+/// turns find it: on Windows npm installs a `.cmd` shim, which a plain `claude` misses.
+pub fn run_claude(args: &[&str], cwd: Option<&str>, input: &[u8]) -> io::Result<String> {
+    let (program, args) = claude_command(live::resolve_program("claude"), args);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    envs::LocalEnvironment::new().run_with_input(&program, &args, cwd, input)
+}
+
+/// The program and arguments that run Claude Code with `args`: what the PATH resolved to
+/// (with the script of a Node shim first), or plain `claude`.
+fn claude_command(resolved: Option<(std::path::PathBuf, Vec<String>)>, args: &[&str]) -> (String, Vec<String>) {
+    let (program, mut all) = match resolved {
+        Some((program, before)) => (program.to_string_lossy().into_owned(), before),
+        None => ("claude".to_owned(), Vec::new()),
+    };
+    all.extend(args.iter().map(|arg| (*arg).to_owned()));
+    (program, all)
+}
+
 /// The arguments of the call: Haiku, no tools, no MCP servers, nothing saved.
 pub fn arguments() -> Vec<&'static str> {
     arguments_with(SYSTEM)
@@ -96,9 +115,8 @@ impl mcp::digest::Summarizer for DigestModel {
     fn summarize(&self, prompt: &str) -> Result<String, String> {
         match &self.ranker {
             Ranker::Haiku => {
-                let env = envs::LocalEnvironment::new();
                 let folder = std::env::temp_dir();
-                let out = env.run_with_input("claude", &arguments_with(mcp::digest::SYSTEM), folder.to_str(), prompt.as_bytes()).map_err(|e| e.to_string())?;
+                let out = run_claude(&arguments_with(mcp::digest::SYSTEM), folder.to_str(), prompt.as_bytes()).map_err(|e| e.to_string())?;
                 let (text, cost) = read_answer(&out).ok_or_else(|| model::shorten(out.trim(), 200))?;
                 self.cost.set(self.cost.get() + cost.unwrap_or(0.0));
                 Ok(text)
@@ -310,6 +328,14 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>, timeout: Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An npm install on Windows runs as `node <script>`: the call's own arguments follow.
+    #[test]
+    fn claude_runs_as_the_path_found_it() {
+        let shim = Some((std::path::PathBuf::from("node"), vec!["cli.js".to_owned()]));
+        assert_eq!(claude_command(shim, &["-p", "--model", "haiku"]), ("node".to_owned(), vec!["cli.js".into(), "-p".into(), "--model".into(), "haiku".into()]));
+        assert_eq!(claude_command(None, &["-p"]), ("claude".to_owned(), vec!["-p".into()]));
+    }
 
     /// A server on a free port that answers one request with `response`, and the request.
     fn serve_once(response: impl Into<String>) -> (u16, std::thread::JoinHandle<String>) {

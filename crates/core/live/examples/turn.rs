@@ -43,6 +43,7 @@ fn main() {
             let (kept, prompt) = value.split_once(' ')?;
             Some((kept.to_owned(), prompt.to_owned()))
         }),
+        mcp_config: None,
     };
     let started = Instant::now();
     let mut turn = start(spec).expect("start");

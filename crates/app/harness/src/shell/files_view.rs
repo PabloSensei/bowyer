@@ -15,7 +15,12 @@ use crate::i18n::t;
 
 /// Bytes of a file the preview reads at most.
 const PREVIEW_BYTES: u64 = 2 << 20;
+/// Bytes of a picture the preview reads at most: a picture shows only whole.
+const PICTURE_BYTES: u64 = 32 << 20;
 const FILE_ROW: f32 = 24.;
+/// Characters of a line the preview and the diff show: one line of megabytes (minified
+/// code, a data file) would take the window seconds to lay out at every frame.
+const LONG_LINE: usize = 2_000;
 const LINE_HEIGHT: f32 = 19.;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -120,9 +125,23 @@ fn name_of(path: &str) -> &str {
     path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// A line as the preview and the diff show it: tabs as spaces, and a line too long cut
+/// with an ellipsis.
+pub(super) fn shown_line(line: &str) -> String {
+    let line = line.replace('\t', "    ");
+    match line.char_indices().nth(LONG_LINE) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line,
+    }
+}
+
 /// What a preview shows for the first bytes of a file of `size` bytes.
 fn body_of(path: &str, bytes: Vec<u8>, size: u64) -> PreviewBody {
     if let Some(media) = live::image_type(path) {
+        // A picture cut short decodes to nothing: an empty frame.
+        if (bytes.len() as u64) < size {
+            return PreviewBody::Error(t("files.picture_too_big").replace("{size}", &bytes_text(size)));
+        }
         return match composer::picture_of(media, bytes) {
             Some((image, w, h)) => PreviewBody::Picture(image, w, h),
             None => PreviewBody::Error(t("files.bad_picture").to_owned()),
@@ -132,7 +151,7 @@ fn body_of(path: &str, bytes: Vec<u8>, size: u64) -> PreviewBody {
         return PreviewBody::Binary(size);
     }
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<SharedString> = text.lines().map(|line| SharedString::from(line.replace('\t', "    "))).collect();
+    let lines: Vec<SharedString> = text.lines().map(|line| SharedString::from(shown_line(line))).collect();
     let spans = highlight::highlight_lines(path, &lines).map(Arc::new);
     PreviewBody::Text { lines: Arc::new(lines), spans, truncated: size > bytes.len() as u64 }
 }
@@ -146,13 +165,15 @@ impl Shell {
 
     /// Asks git once what the folder's repository ignores, for the dim rows of the tree.
     fn load_ignored(&mut self, cx: &mut Context<Self>) {
-        let Some((env_id, root)) = self.files.root.clone() else { return };
-        let Some(env) = self.env_for(&env_id) else { return };
+        let Some(asked) = self.files.root.clone() else { return };
+        let Some(env) = self.env_for(&asked.0) else { return };
+        let root = asked.1.clone();
         let task = cx.background_spawn(async move { vcs::ignored(&*env, &root) });
         cx.spawn(async move |this, cx| {
             let Ok(list) = task.await else { return };
             this.update(cx, |this, cx| {
-                if this.files.root.as_ref().map(|r| &r.0) != Some(&env_id) {
+                // The answer of another folder, even of the same environment, is not this one's.
+                if this.files.root.as_ref() != Some(&asked) {
                     return;
                 }
                 this.files.ignored = Arc::new(list.iter().map(|path| same_path(path)).collect());
@@ -164,8 +185,8 @@ impl Shell {
     }
 
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some((env_id, _)) = self.files.root.clone() else { return };
-        let Some(env) = self.env_for(&env_id) else { return };
+        let Some(asked) = self.files.root.clone() else { return };
+        let Some(env) = self.env_for(&asked.0) else { return };
         if !self.files.loading.insert(path.clone()) {
             return;
         }
@@ -174,7 +195,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let listing = task.await;
             this.update(cx, |this, cx| {
-                if this.files.root.as_ref().map(|r| &r.0) != Some(&env_id) {
+                if this.files.root.as_ref() != Some(&asked) {
                     return;
                 }
                 this.files.loading.remove(&path);
@@ -235,7 +256,12 @@ impl Shell {
         let file = path.clone();
         let task = cx.background_spawn(async move {
             let size = env.stat(&file).map(|meta| meta.size).unwrap_or(0);
-            env.read(&file, ReadRange::Head(PREVIEW_BYTES)).map(|bytes| body_of(&file, bytes, size))
+            let picture = live::image_type(&file).is_some();
+            if picture && size > PICTURE_BYTES {
+                return Ok(body_of(&file, Vec::new(), size));
+            }
+            let limit = if picture { PICTURE_BYTES } else { PREVIEW_BYTES };
+            env.read(&file, ReadRange::Head(limit)).map(|bytes| body_of(&file, bytes, size))
         });
         cx.spawn(async move |this, cx| {
             let body = task.await.unwrap_or_else(|error| PreviewBody::Error(error.to_string()));
@@ -529,7 +555,22 @@ fn bytes_text(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewBody, body_of, name_of};
+    use super::{LONG_LINE, PreviewBody, body_of, name_of, shown_line};
+
+    #[test]
+    fn a_long_line_is_cut() {
+        assert_eq!(shown_line("a\tb"), "a    b");
+        let long = "é".repeat(LONG_LINE + 5);
+        let shown = shown_line(&long);
+        assert_eq!(shown.chars().count(), LONG_LINE + 1);
+        assert!(shown.ends_with('…'));
+        assert!(matches!(body_of("min.js", long.into_bytes(), 0), PreviewBody::Text { ref lines, .. } if lines[0].chars().count() == LONG_LINE + 1));
+    }
+
+    #[test]
+    fn a_picture_cut_short_says_so() {
+        assert!(matches!(body_of("big.png", vec![0x89, b'P', b'N', b'G'], 40 << 20), PreviewBody::Error(_)));
+    }
 
     #[test]
     fn previews_tell_text_from_binary() {

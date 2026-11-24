@@ -23,6 +23,9 @@ use crate::session::{Control, SearchQuery, Shared, TerminalEvent};
 /// How often a stream of output turns into a new picture.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_WAIT: Duration = Duration::from_secs(1);
+/// How often a search runs again while output streams: each run reads the whole
+/// scrollback, which at every publish would take the engine's time from the output.
+const SEARCH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Answers to color queries, the theme of the panel takes over when it exists.
 const FOREGROUND: Rgb = Rgb {
@@ -190,6 +193,9 @@ pub(crate) struct Engine {
     search_dirty: bool,
     /// The latest answer of the search, for the view that scrolls to a match.
     results: SearchResults,
+    /// When the rows were last searched; a new query is searched at once.
+    last_search: Instant,
+    search_fresh: bool,
 }
 
 impl Engine {
@@ -230,6 +236,8 @@ impl Engine {
             search_generation: 0,
             search_dirty: false,
             results: SearchResults::default(),
+            last_search: Instant::now(),
+            search_fresh: false,
         }
     }
 
@@ -252,6 +260,8 @@ impl Engine {
             if self.dirty && self.last_publish.elapsed() >= PUBLISH_INTERVAL {
                 self.publish();
             }
+            // Output that came while a search waited its turn is searched when the turn comes.
+            self.update_search(false);
         }
         self.flush_sync();
         // Close before the last publish: a panel that reads the new version must also
@@ -273,7 +283,10 @@ impl Engine {
         let sync = self
             .sync_deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let shortest = [publish, sync].into_iter().flatten().min();
+        let search = self
+            .search_dirty
+            .then(|| SEARCH_INTERVAL.saturating_sub(self.last_search.elapsed()));
+        let shortest = [publish, sync, search].into_iter().flatten().min();
         shortest.unwrap_or(IDLE_WAIT)
     }
 
@@ -345,7 +358,7 @@ impl Engine {
                 self.dirty = true;
             }
             Control::RevealMatch(index) => {
-                self.update_search();
+                self.update_search(true);
                 let Some(line) = self.results.matches.get(index).map(|found| found.line) else {
                     return;
                 };
@@ -359,6 +372,7 @@ impl Engine {
                 self.search = Some(query);
                 self.search_generation = generation;
                 self.search_dirty = true;
+                self.search_fresh = true;
                 self.results = SearchResults::default();
                 // A quiet terminal publishes nothing of itself, and the answer of the
                 // search would wait for the next output.
@@ -399,20 +413,26 @@ impl Engine {
     fn publish(&mut self) {
         self.version += 1;
         self.shared.screen.set(self.screen());
-        self.update_search();
+        self.update_search(false);
         self.dirty = false;
         self.last_publish = Instant::now();
     }
 
     /// Searches the rows again when output arrived or a query is new, and hands the
-    /// answer to the view.
-    fn update_search(&mut self) {
+    /// answer to the view: a new query (or `now`) at once, new output at most every
+    /// [`SEARCH_INTERVAL`].
+    fn update_search(&mut self, now: bool) {
         let Some(query) = &self.search else {
             return;
         };
         if !self.search_dirty {
             return;
         }
+        if !now && !self.search_fresh && self.last_search.elapsed() < SEARCH_INTERVAL {
+            return;
+        }
+        self.last_search = Instant::now();
+        self.search_fresh = false;
         let rows = self.row_texts();
         let results = search_rows(&rows, query, self.search_generation);
         self.results = results;
@@ -437,8 +457,11 @@ impl Engine {
                     return None;
                 }
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                Some((column, ch, cell.flags.contains(Flags::WIDE_CHAR)))
-            });
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
+                // A combining accent belongs to its cell: a search for `café` finds it.
+                let marks = cell.zerowidth().unwrap_or_default().iter().map(move |mark| (column, *mark, wide));
+                Some(std::iter::once((column, ch, wide)).chain(marks))
+            }).flatten();
             texts.push(RowText::new(line, cells));
         }
         texts
@@ -448,6 +471,7 @@ impl Engine {
         let size = self.notes.borrow().size;
         let (cols, rows) = (size.cols, size.rows);
         let mut cells = vec![Cell::default(); cols * rows];
+        let mut marks = Vec::new();
         let mut links = Links::default();
         let content = self.term.renderable_content();
         let offset = content.display_offset;
@@ -459,6 +483,9 @@ impl Engine {
             }
             let row = row as usize;
             cells[row * cols + col] = convert(&indexed);
+            if let Some(zerowidth) = indexed.zerowidth() {
+                marks.push(((row * cols + col) as u32, zerowidth.iter().collect::<String>()));
+            }
             if let Some(link) = indexed.hyperlink() {
                 links.push(row as u16, col as u16, link.uri());
             }
@@ -471,6 +498,7 @@ impl Engine {
             cols: cols as u16,
             rows: rows as u16,
             cells,
+            marks,
             cursor: visible.then_some((on_screen as u16, cursor.column.0 as u16)),
             display_offset: offset,
             history: self.term.grid().history_size(),
