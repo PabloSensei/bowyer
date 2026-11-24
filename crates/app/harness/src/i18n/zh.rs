@@ -147,6 +147,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("live.queue", "随后发送"),
     ("terminal.new", "新建终端"),
     ("terminal.hide", "隐藏终端"),
+    ("terminal.pick", "打开本机的 shell"),
     ("drop.failed", "最后一个提示从未到达模型：只返回了 API 错误。"),
     ("drop.action", "删除提示"),
     ("drop.tip", "下一回合从它之前的回答继续；Claude Code 会去掉该提示，如果还会丢失其他内容则拒绝。不编辑历史文件。"),

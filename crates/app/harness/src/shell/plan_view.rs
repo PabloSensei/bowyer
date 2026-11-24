@@ -256,13 +256,18 @@ fn muted(text: impl Into<SharedString>, theme: &Theme) -> AnyElement {
     div().text_size(px(12.)).text_color(theme.text_muted).child(text.into()).into_any_element()
 }
 
-/// A window of the plan: its name, the share used and when it starts again.
-fn meter(label: String, percent: f64, resets: Option<String>, theme: &Theme) -> impl IntoElement {
-    let color = match percent {
+/// The colour of a share used: calm, then a warning from 70%, an error from 90%.
+pub(super) fn fill_color(percent: f64, theme: &Theme) -> Hsla {
+    match percent {
         p if p >= 90.0 => theme.error,
         p if p >= 70.0 => theme.warning_mark,
         _ => theme.accent,
-    };
+    }
+}
+
+/// A window of the plan: its name, the share used and when it starts again.
+fn meter(label: String, percent: f64, resets: Option<String>, theme: &Theme) -> impl IntoElement {
+    let color = fill_color(percent, theme);
     div()
         .flex()
         .flex_col()

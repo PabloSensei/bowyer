@@ -56,11 +56,21 @@ pub fn shells_in(path: &OsStr) -> Vec<Shell> {
     ];
     let mut shells = Vec::new();
     for (program, name) in candidates {
-        if let Some(found) = find_in(path, program) {
+        // The first `bash.exe` on PATH is often the one of System32, which starts WSL:
+        // Git Bash is the one inside a Git folder.
+        let found = if program == "bash.exe" { git_bash_in(path) } else { find_in(path, program) };
+        if let Some(found) = found {
             push_unique(&mut shells, Shell::new(name, &found));
         }
     }
     shells
+}
+
+/// The `bash.exe` of a Git for Windows that `path` names: one under a folder called Git.
+fn git_bash_in(path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).map(|folder| folder.join("bash.exe")).find(|bash| {
+        bash.is_file() && bash.components().any(|part| part.as_os_str().eq_ignore_ascii_case("git"))
+    })
 }
 
 fn command_line(shell: &Path) -> String {
@@ -133,6 +143,23 @@ mod tests {
         let shells = shells_in(&path);
         let names: Vec<&str> = shells.iter().map(|shell| shell.name.as_str()).collect();
         assert_eq!(names, ["PowerShell", "Command Prompt", "WSL"]);
+    }
+
+    #[test]
+    fn the_bash_of_wsl_is_no_git_bash() {
+        let root = test_support::scratch("shells-bash");
+        let (system, git) = (root.join("System32"), root.join("Git").join("bin"));
+        for folder in [&system, &git] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("bash.exe"), "").unwrap();
+        }
+        let only_system = std::env::join_paths([&system]).unwrap();
+        assert!(shells_in(&only_system).is_empty(), "the bash of System32 starts WSL");
+        let both = std::env::join_paths([&system, &git]).unwrap();
+        let shells = shells_in(&both);
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].name, "Git Bash");
+        assert!(shells[0].command_line.contains(&git.join("bash.exe").display().to_string()), "{}", shells[0].command_line);
     }
 
     #[test]

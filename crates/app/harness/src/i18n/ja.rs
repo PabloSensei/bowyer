@@ -147,6 +147,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("live.queue", "次に送信"),
     ("terminal.new", "新しいターミナル"),
     ("terminal.hide", "ターミナルを隠す"),
+    ("terminal.pick", "このコンピューターのシェルを開く"),
     ("drop.failed", "最後のプロンプトはモデルに届きませんでした。API エラーだけが返りました。"),
     ("drop.action", "プロンプトを削除"),
     ("drop.tip", "次のターンはその前の回答から続きます。Claude Code はプロンプトを除外し、ほかに失われるものがあれば拒否します。履歴ファイルは編集しません。"),

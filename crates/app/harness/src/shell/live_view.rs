@@ -1091,8 +1091,11 @@ impl Shell {
                     && open.run == Some(run)
                     && open.summary.key.id.is_empty()
                 {
+                    let draft = open.summary.key.clone();
                     open.summary.key.id = id;
-                    self.selected = Some(open.summary.key.clone());
+                    let named = open.summary.key.clone();
+                    self.selected = Some(named.clone());
+                    self.rename_terminal_owner(&draft, &named, cx);
                 }
                 self.keep_choice(&key, model.as_deref(), effort.as_deref());
             }

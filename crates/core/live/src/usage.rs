@@ -33,11 +33,38 @@ pub fn claude_command(local: bool) -> (String, Vec<String>) {
     }
 }
 
-/// The line to send on standard input.
+/// The lines to send on standard input: the plan, and the status that tells whether anyone
+/// is signed in (without a login the plan reads like an API key's).
 pub fn claude_request() -> String {
-    json!({"type": "control_request", "request_id": "bowyer-usage", "request": {"subtype": "get_usage", "skip_behaviors": true}})
-        .to_string()
-        + "\n"
+    [
+        json!({"type": "control_request", "request_id": USAGE, "request": {"subtype": "get_usage", "skip_behaviors": true}}),
+        json!({"type": "control_request", "request_id": STATUS, "request": {"subtype": "get_status"}}),
+    ]
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect()
+}
+
+const USAGE: &str = "bowyer-usage";
+const STATUS: &str = "bowyer-status";
+
+/// The answer to the request `id`, or to the only request of an older reader.
+fn response_to<'a>(events: &'a [Value], id: &str) -> Option<&'a Value> {
+    let responses = || events.iter().filter(|event| event.get("type").and_then(Value::as_str) == Some("control_response"));
+    responses()
+        .find(|event| event.pointer("/response/request_id").and_then(Value::as_str) == Some(id))
+        .or_else(|| (id == USAGE).then(|| responses().next()).flatten())
+        .and_then(|event| event.get("response"))
+}
+
+/// Whether the status names a way of signing in: a login method, an API key, a provider.
+/// `None` when the status did not come (an older Claude Code).
+fn signed_in(status: Option<&Value>) -> Option<bool> {
+    let status = status.filter(|status| status.get("subtype").and_then(Value::as_str) == Some("success"))?;
+    let sections = status.pointer("/response/sections")?.as_array()?;
+    let labels = sections.iter().filter_map(|section| section.get("rows")?.as_array()).flatten().filter_map(|row| row.get("label")?.as_str());
+    let words = ["login", "auth", "api key", "account", "organization", "email", "provider", "token"];
+    Some(labels.map(str::to_ascii_lowercase).any(|label| words.iter().any(|word| label.contains(word))))
 }
 
 /// What an account's plan is.
@@ -78,12 +105,8 @@ pub struct Spend {
 
 /// Reads Claude Code's output for [`claude_request`].
 pub fn parse_claude(output: &str) -> Plan {
-    let response = output
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .find(|event| event.get("type").and_then(Value::as_str) == Some("control_response"))
-        .and_then(|event| event.get("response").cloned());
-    let Some(response) = response else {
+    let events: Vec<Value> = output.lines().filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok()).collect();
+    let Some(response) = response_to(&events, USAGE) else {
         return Plan::Unknown(model::shorten(output.trim(), 200));
     };
     if response.get("subtype").and_then(Value::as_str) != Some("success") {
@@ -95,8 +118,10 @@ pub fn parse_claude(output: &str) -> Plan {
         // Without limits and without a subscription the account pays by API; a subscriber
         // can lack them too (a login without the profile scope).
         return match body.get("subscription_type") {
-            None | Some(Value::Null) => Plan::Api,
-            Some(_) => Plan::Unknown("rate limits unavailable".into()),
+            Some(Value::String(_)) => Plan::Unknown("rate limits unavailable".into()),
+            // Nobody signed in reads like an API key: the status tells them apart.
+            _ if signed_in(response_to(&events, STATUS)) == Some(false) => Plan::Unknown("Claude Code is not signed in".into()),
+            _ => Plan::Api,
         };
     }
     let Some(limits) = body.get("rate_limits").filter(|limits| limits.is_object()) else {
@@ -214,7 +239,15 @@ mod tests {
     #[test]
     fn an_api_key_and_failures_read_apart() {
         let api = answer(json!({"subscription_type": null, "rate_limits_available": false, "rate_limits": null}));
-        assert_eq!(parse_claude(&api), Plan::Api);
+        assert_eq!(parse_claude(&api), Plan::Api, "an older Claude Code without the status");
+        let status = |labels: &[&str]| {
+            let rows: Vec<Value> = labels.iter().map(|label| json!({"label": label, "value": "x"})).collect();
+            json!({"type": "control_response", "response": {"subtype": "success", "request_id": "bowyer-status", "response": {"sections": [{"title": "Session", "rows": rows}]}}}).to_string()
+        };
+        let keyed = format!("{api}{}\n", status(&["Version", "Session ID", "API key"]));
+        assert_eq!(parse_claude(&keyed), Plan::Api);
+        let nobody = format!("{api}{}\n", status(&["Version", "Session ID", "Session kind", "Peer address", "cwd"]));
+        assert_eq!(parse_claude(&nobody), Plan::Unknown("Claude Code is not signed in".into()), "nobody signed in is no API account");
         let scopeless = answer(json!({"subscription_type": "max", "rate_limits_available": false, "rate_limits": null}));
         assert!(matches!(parse_claude(&scopeless), Plan::Unknown(_)), "a subscriber without limits is no API account");
         let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"bowyer-usage","error":"Unsupported control request subtype: get_usage"}}"#;

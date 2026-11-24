@@ -256,6 +256,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("live.queue", "Send next", "Отправить следом"),
     ("terminal.new", "New terminal", "Новый терминал"),
     ("terminal.hide", "Hide terminals", "Скрыть терминалы"),
+    ("terminal.pick", "Open a shell of this computer", "Открыть оболочку этого компьютера"),
     ("drop.failed", "The last prompt never reached the model: only an API error came back.", "Последний промпт не дошёл до модели: вернулась только ошибка API."),
     ("drop.action", "Delete prompt", "Удалить промпт"),
     ("drop.tip", "The next turn goes on from the answer before it; Claude Code leaves the prompt out and refuses if anything else would go. The history file is not edited.", "Следующий ход продолжит сессию с ответа перед ним: Claude Code оставит промпт за бортом и откажется, если пропало бы что-то ещё. Файл истории не правится."),

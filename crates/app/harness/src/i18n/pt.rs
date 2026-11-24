@@ -147,6 +147,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("live.queue", "Enviar depois"),
     ("terminal.new", "Novo terminal"),
     ("terminal.hide", "Ocultar terminais"),
+    ("terminal.pick", "Abrir um shell deste computador"),
     ("drop.failed", "O último prompt nunca chegou ao modelo: só voltou um erro da API."),
     ("drop.action", "Excluir prompt"),
     ("drop.tip", "O próximo turno continua da resposta anterior; o Claude Code deixa o prompt de fora e recusa se mais alguma coisa se perdesse. O arquivo do histórico não é editado."),

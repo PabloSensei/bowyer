@@ -77,13 +77,13 @@
     </td>
     <td width="50%" valign="top">
       <h3>A chat, not a terminal dump</h3>
-      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line. Paste screenshots, drop files, <code>/</code> for commands and skills, <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next; <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag. A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
+      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so does the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills, <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next; <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag. A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h3>What a session holds</h3>
-      Environment, folder, Git branch (worktrees too) and model. The context window split by what fills it: for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages. The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month. Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache. Every file the session changed as a tree, and every command and sub-agent it ran, the latest ten first. Each section folds by its title.
+      Environment, folder, Git branch (worktrees too) and model. The context window split by what fills it: for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages. The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month. Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache. Every file the session changed as a tree, and every command and sub-agent it ran, the latest ten first. Each section folds by its title; the context title keeps a small gauge of how full the window is.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/session.png" alt="The Session panel with folding sections: context 51k of 1M split into six parts, plan limits folded, session cost $0.227, token totals, changed files and commands" width="60%">
@@ -95,7 +95,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>Files, Git and a terminal</h3>
-      A Files tab with the folder's tree and a preview of text and pictures, locally or over SSH. A Changes tab with staged and unstaged files, diffs by hunk with Stage, Unstage and Discard, commit, fetch, pull, push and branch switching. Built-in terminals (<code>Ctrl+`</code>) open as tabs in a panel under the conversation, in the session's folder, here or on the SSH host, so you never hunt for the right window to resume a session. Claude Code sessions here connect to the IDE that has their folder open (Arro, VS Code, JetBrains).
+      A Files tab with the folder's tree and a preview of text and pictures, locally or over SSH. A Changes tab with staged and unstaged files, diffs by hunk with Stage, Unstage and Discard, commit, fetch, pull, push and branch switching. Built-in terminals (<code>Ctrl+`</code>) open as tabs in a panel under the conversation, in the session's folder, here or on the SSH host, so you never hunt for the right window to resume a session. Each session keeps its own terminals, and on Windows the list next to <b>+</b> opens PowerShell, Command Prompt, Git Bash or WSL. Claude Code sessions here connect to the IDE that has their folder open (Arro, VS Code, JetBrains).
     </td>
   </tr>
 </table>

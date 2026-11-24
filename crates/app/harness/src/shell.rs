@@ -459,6 +459,8 @@ pub struct Shell {
     open_runs: HashSet<(usize, usize)>,
     open_calls: HashSet<(usize, usize, usize)>,
     open_thinking: HashSet<(usize, usize)>,
+    /// Compaction summaries the reader unfolded; the rest show only their title.
+    open_summaries: HashSet<usize>,
     show_tools: bool,
     info_scroll: ScrollHandle,
 
@@ -532,12 +534,17 @@ pub struct Shell {
     statuses_seeded: bool,
     /// The terminals of the window, as tabs of the panel under the conversation.
     terminals: Vec<Entity<terminal_view::TermView>>,
-    active_terminal: usize,
+    /// The tab each session's panel shows, and the sessions whose panel is open: switching
+    /// sessions switches the terminals with them.
+    active_terminal: HashMap<Option<SessionKey>, EntityId>,
     /// The height of the terminal panel, kept between runs.
     terminal_height: f32,
     /// The edge between the conversation and the terminal panel is being dragged.
     resizing_terminal: bool,
-    terminal_shown: bool,
+    terminal_shown: HashSet<Option<SessionKey>>,
+    /// The list of shells under the ▾ of the terminal panel, and where its button is.
+    terminal_menu: bool,
+    terminal_anchor: MenuAnchor,
     /// The sections of the right pane folded to their titles, by id, kept between runs.
     folded: HashSet<&'static str>,
     /// How many of the open session's commands and agents the right pane lists, newest first;
@@ -670,6 +677,7 @@ impl Shell {
             open_runs: HashSet::new(),
             open_calls: HashSet::new(),
             open_thinking: HashSet::new(),
+            open_summaries: HashSet::new(),
             show_tools: false,
             info_scroll: ScrollHandle::new(),
             composer: TextField::from_text(""),
@@ -715,10 +723,12 @@ impl Shell {
             statuses_seeded: false,
             attention: None,
             terminals: Vec::new(),
-            active_terminal: 0,
+            active_terminal: HashMap::new(),
             terminal_height,
             resizing_terminal: false,
-            terminal_shown: false,
+            terminal_shown: HashSet::new(),
+            terminal_menu: false,
+            terminal_anchor: Default::default(),
             folded,
             tasks_shown: None,
             plans: HashMap::new(),
@@ -1692,6 +1702,7 @@ impl Shell {
                         this.open_runs.clear();
                         this.open_calls.clear();
                         this.open_thinking.clear();
+                        this.open_summaries.clear();
                         this.open = Some(OpenSession {
                             summary,
                             model: loaded.transcript.model.clone(),
@@ -2675,7 +2686,8 @@ impl Shell {
             .h(px(TREE_ROW))
             .w_full()
             .pl(px(6. + row.depth as f32 * 14.))
-            .pr(px(8.))
+            // Room for the scrollbar, which widens over the right edge under the mouse.
+            .pr(px(TREE_ROW_END))
             .rounded(px(6.))
             .text_size(px(if is_group { 12. } else { 13. }))
             .when(is_group, |this| this.text_color(theme.text_secondary).font_weight(FontWeight::MEDIUM))
@@ -2928,9 +2940,13 @@ impl Shell {
             },
         };
         let user = item.role == Role::User && !item.compact_summary;
+        // A compaction summary is long and repeats what came before: folded until asked.
+        let summary_open = item.compact_summary && self.open_summaries.contains(&ix);
         let mut column = div().flex().flex_col().gap(px(8.)).min_w_0();
-        for (pi, piece) in item.pieces.iter().enumerate() {
-            column = column.child(self.render_piece(ix, pi, piece, user, cx));
+        if !item.compact_summary || summary_open {
+            for (pi, piece) in item.pieces.iter().enumerate() {
+                column = column.child(self.render_piece(ix, pi, piece, user, cx));
+            }
         }
         let content = if user {
             div()
@@ -2972,8 +2988,28 @@ impl Shell {
                         .flex_1()
                         .min_w_0()
                         .when(item.compact_summary, |this| {
-                            this.p(px(10.)).rounded(px(10.)).border_1().border_color(theme.border).child(
-                                div().text_size(px(12.)).text_color(theme.text_muted).mb(px(6.)).child(t("compacted")),
+                            this.px(px(10.)).py(px(6.)).rounded(px(10.)).border_1().border_color(theme.border).child(
+                                div()
+                                    .id(("compact-summary", ix))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_muted)
+                                    .hover(|style| style.text_color(theme.text_secondary))
+                                    .when(summary_open, |this| this.mb(px(6.)))
+                                    .child(icon_sized(if summary_open { "general/chevronDown" } else { "general/chevronRight" }, 12., &theme))
+                                    .child(t("compacted"))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        if !this.open_summaries.remove(&ix) {
+                                            this.open_summaries.insert(ix);
+                                        }
+                                        if let Some(open) = &this.open {
+                                            open.list.pause_following_tail();
+                                            open.list.remeasure_items(ix..ix + 1);
+                                        }
+                                        cx.notify();
+                                    })),
                             )
                         })
                         .child(column),
@@ -3302,7 +3338,29 @@ impl Shell {
             .child(bar)
             .child(legend)
             .children(exact_note);
-        let context = self.fold("context", t("context"), None, context, cx);
+        // How full the context is, in the title, so it shows with the section folded too.
+        let fill = match window_size {
+            Some(size) if size > 0 => {
+                let percent = total as f64 * 100.0 / size as f64;
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().text_size(px(11.)).font_family(MONO).text_color(theme.text_muted).child(format!("{:.0}%", percent)))
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .h(px(6.))
+                            .rounded(px(3.))
+                            .overflow_hidden()
+                            .bg(theme.hover)
+                            .child(div().h_full().w(relative((percent / 100.0).clamp(0.0, 1.0) as f32)).bg(plan_view::fill_color(percent, &theme))),
+                    )
+                    .into_any_element()
+            }
+            _ => div().text_size(px(11.)).font_family(MONO).text_color(theme.text_muted).child(tokens_text(total)).into_any_element(),
+        };
+        let context = self.fold("context", t("context"), Some(fill), context, cx);
 
         let cost = self.render_cost(cx);
         let plan = self.render_plan(cx);
@@ -3452,6 +3510,9 @@ fn badge(label: &str, color: Hsla) -> impl IntoElement {
         .font_weight(FontWeight::SEMIBOLD)
         .child(label.to_owned())
 }
+
+/// The space at the end of a tree row: the counts and times stay clear of the scrollbar.
+const TREE_ROW_END: f32 = 18.;
 
 fn chip(id: &'static str, label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
     let hover = theme.hover;
