@@ -64,7 +64,7 @@
 ## Why Bowyer
 
 - **Every agent, one place.** Claude Code, Codex, OpenCode and DeepSeek each keep their history in their own folder, format and terminal. Bowyer reads all of them and shows every session you ever ran, on this machine and on your servers, in one searchable tree.
-- **Native and fast.** Rust from top to bottom and a GPU-rendered UI on GPUI. No Electron, no web view. Hundreds of sessions load in a moment and search as you type.
+- **Native and fast.** Rust from top to bottom and a GPU-rendered UI on GPUI. No Electron, no web view. Hundreds of sessions load in a moment, a session of hundreds of megabytes opens in about a second, and search answers as you type.
 - **Watch them all at once.** Mission control lays every running agent out in a grid of live cards and lets you answer a permission question without opening the session.
 - **Your files stay yours.** Bowyer only reads what the harnesses write. Folders, pins, names and notes live in Bowyer's own database; your agents keep working exactly as before, with or without the window open.
 - **See what a session really costs.** The context window split by what fills it, token totals, cost at API prices, and whether the prompt cache is still warm, so you know when compacting pays off.
@@ -77,37 +77,64 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Every session in one tree</h3>
-      Sessions grouped by environment, harness and project (or any one of them), with your own folders, drag and drop, pins, renames and four sort orders, picked from lists at the bottom. Sub-agent and worktree sessions fold under the session that started them, and so do sessions Claude's desktop app started in a separate session. Long projects show the latest ten with <i>Show more</i>, and one button collapses everything. <i>Delete session</i> moves a Claude Code or Codex session into <code>~/.bowyer-trash</code> on its machine. Both side panels hide into thin stripes at the window's edges (<code>Ctrl+B</code>, <code>Ctrl+Alt+B</code>). Each harness has a pixel critter of its own, so a glance tells Claude Code from Codex or OpenCode. Live state for sessions running in a terminal elsewhere: <i>working</i>, <i>waiting</i> or <i>your turn</i>, with a taskbar flash when one needs you. <code>Ctrl+K</code> searches titles, prompts, folders and the whole conversation text (SQLite FTS5); each result shows the sentence where the words matched, with the words lit.
+      <ul>
+        <li>Grouped by environment, harness and project, or by any one of them, with your own folders, drag and drop, pins, renames and four sort orders.</li>
+        <li>Sub-agent and worktree sessions fold under the session that started them, and so do sessions Claude's desktop app started separately. Long projects show the latest ten with <i>Show more</i>, and one button collapses everything.</li>
+        <li>Each harness has a pixel critter of its own, so a glance tells Claude Code from Codex or OpenCode.</li>
+        <li>Sessions running in a terminal elsewhere show <i>working</i>, <i>waiting</i> or <i>your turn</i>, and the taskbar flashes when one needs you.</li>
+        <li><code>Ctrl+K</code> searches titles, prompts, folders and the whole conversation text (SQLite FTS5); each result shows the sentence where the words matched.</li>
+        <li><i>Delete session</i> moves a Claude Code or Codex session into <code>~/.bowyer-trash</code> on its machine. Both side panels hide into thin stripes at the window's edges (<code>Ctrl+B</code>, <code>Ctrl+Alt+B</code>).</li>
+      </ul>
     </td>
     <td width="50%" valign="top">
-      <img src=".github/readme/tree.png" alt="The session tree: This computer, then Claude Code, OpenCode and Codex, then projects; under shop-api a Claude Code session with three agent sessions nested under it">
+      <img src=".github/readme/tree.png" alt="The session tree in the Nightfall theme: This computer, then Claude Code, OpenCode and Codex, then projects, each session with its harness's pixel critter; under shop-api a Claude Code session marked your turn with three agent sessions nested under it">
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <img src=".github/readme/chat-light.png" alt="A conversation in the Light theme with folded thinking, a one-line summary of seven tool calls, highlighted code and a follow-up turn">
+      <img src=".github/readme/chat-light.png" alt="A conversation in the Light theme with folded thinking, a one-line summary of seven tool calls, highlighted Rust code and a follow-up turn">
     </td>
     <td width="50%" valign="top">
       <h3>A chat, not a terminal dump</h3>
-      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so do what a hook told the model and the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills (the user's, the project's and those of plugins turned on, with their descriptions), <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next, or straight in while Claude Code waits for a command it left in the background (shown above the composer, each with its own stop); <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag and a button that takes you back to the end. <i>Branch from here</i> under a prompt of a Claude Code session starts a new session from the conversation before it, and <i>Changes of this turn</i> shows what the answer did to each file, from Claude Code's own backups, with an undo of the whole turn (what the files were goes to the trash first). A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
+      <ul>
+        <li>Markdown, highlighted code with Copy and Run, folded thinking, and tool calls folded into one line per run that opens into the commands, their output and the diffs.</li>
+        <li>Background task notices, what a hook told the model and the summary a harness writes when it compacts the context each shrink to one short line.</li>
+        <li>Paste screenshots, drop files, <code>/</code> for commands and skills (yours, the project's and those of plugins turned on, with their descriptions), <code>@</code> for files of the session's folder. Select text across messages and ask about it.</li>
+        <li>Claude Code and OpenCode ask before a command or an edit their settings don't allow, right in the window; Claude's questions come with their choices and a field for your own answer.</li>
+        <li>Send another prompt while a turn runs and it goes next, or straight in while Claude Code waits for a command it left in the background (listed above the composer, each with its own stop).</li>
+        <li><i>Branch from here</i> under a prompt of a Claude Code session starts a new session from the conversation before it. <i>Changes of this turn</i> shows what the answer did to each file, from Claude Code's own backups, and undoes the whole turn (the files as they are go to the trash first).</li>
+        <li>The view stays where you read while new text arrives, with a scrollbar you can drag and a button back to the end. A prompt that never reached the model can be deleted, and Claude Code resumes from the answer before it.</li>
+      </ul>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h3>What a session holds</h3>
-      Environment, folder, Git branch (worktrees too) and model. The context window split by what fills it: for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages. The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month. Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache. Every file the session changed as a tree, every command it ran, and the sub-agents it started in a list of their own, the latest ten first. Each section folds by its title; the context title keeps a small gauge of how full the window is.
+      <ul>
+        <li>Environment, folder, Git branch (worktrees too) and model.</li>
+        <li>The context window split by what fills it; for Claude Code exactly as Claude counts it, with system prompt, tools, MCP servers, skills and messages.</li>
+        <li>The plan's five-hour and weekly limits, asked from Claude Code without a model call, or an API account's spending this month, with 30 days of history.</li>
+        <li>Token totals, cost at API prices per call, the price of the next turn and of a compaction at the current cache state, and a countdown for the prompt cache.</li>
+        <li>Every file the session changed as a tree, every command it ran, and the sub-agents it started, the latest ten first.</li>
+        <li>Each section folds by its title; the context title keeps a small gauge of how full the window is.</li>
+      </ul>
     </td>
     <td width="50%" valign="top">
-      <img src=".github/readme/session.png" alt="The Session panel with folding sections: context 51k of 1M split into six parts, plan limits folded, session cost $0.227, token totals, changed files and commands" width="60%">
+      <img src=".github/readme/session.png" alt="The Session panel in the Nightfall theme with folding sections: context 51k of 1M split into six parts, plan limits folded, session cost $0.227 with a warm prompt cache, token totals, changed files and commands" width="60%">
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <img src=".github/readme/diff.png" alt="A diff of checkout.rs from the Changes tab with Stage and Discard for the hunk">
+      <img src=".github/readme/diff.png" alt="A diff of checkout.rs from the Changes tab in the Nightfall theme, with Stage and Discard for the hunk and Stage file for the whole file">
     </td>
     <td width="50%" valign="top">
       <h3>Files, Git and a terminal</h3>
-      A Files tab with the folder's tree and a preview of text and pictures, locally or over SSH. A Changes tab with staged and unstaged files, diffs by hunk with Stage, Unstage and Discard, commit, fetch, pull, push and branch switching. Built-in terminals (<code>Ctrl+`</code>) open as tabs in a panel under the conversation, in the session's folder, here or on the SSH host, so you never hunt for the right window to resume a session. Each session keeps its own terminals, and on Windows the list next to <b>+</b> opens PowerShell, Command Prompt, Git Bash or WSL. Claude Code sessions here connect to the IDE that has their folder open (Arro, VS Code, JetBrains).
+      <ul>
+        <li>A Files tab with the folder's tree and a preview of text and pictures, locally or over SSH.</li>
+        <li>A Changes tab with staged and unstaged files, diffs by hunk with Stage, Unstage and Discard, commit, fetch, pull, push and branch switching.</li>
+        <li>Built-in terminals (<code>Ctrl+`</code>) open as tabs under the conversation, in the session's folder, here or on the SSH host. Each session keeps its own, and on Windows the list next to <b>+</b> opens PowerShell, Command Prompt, Git Bash or WSL.</li>
+        <li>Claude Code sessions here connect to the IDE that has their folder open (Arro, VS Code, JetBrains).</li>
+      </ul>
     </td>
   </tr>
 </table>
@@ -197,7 +224,7 @@ The binary is `bowyer`. `--data-dir <folder>` keeps the database somewhere else,
 | SSH hosts: sessions, files, Git, terminal, live turns | ✅ Works |
 | Git changes, built-in terminal | ✅ Works |
 | Memory MCP server | 🚧 New |
-| Plan limits and monthly spending | 🚧 New |
+| Plan limits, spending and its 30-day history | 🚧 New |
 | Updates from a signed feed | 🚧 New |
 | Windows 11 x86-64 | ✅ Supported |
 | Linux x86-64 | 🚧 Preview release |
