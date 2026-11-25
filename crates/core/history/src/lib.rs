@@ -12,22 +12,28 @@ use envs::Environment;
 use model::{HarnessKind, SessionSummary, Transcript};
 
 mod claude;
+mod commands;
 mod codex;
 mod dsh;
+mod export;
 mod memory_files;
 mod opencode;
 #[cfg(test)]
 mod test_env;
 mod time;
 mod trash;
+mod turns;
 
 pub use claude::{ClaudeFollower, ClaudeParser, ClaudeSource, turn_of_tail};
+pub use commands::{CommandSource, HarnessCommand, claude_commands};
 pub use codex::{CodexSource, codex_turn_of_tail};
 pub use dsh::DshSource;
+pub use export::{ExportLabels, export_file_name, export_markdown};
 pub use memory_files::{memory_file_paths, memory_tokens};
 pub use opencode::OpenCodeSource;
 pub use time::parse_rfc3339_ms;
 pub use trash::{TRASH_DIR, move_to_trash, session_files};
+pub use turns::{TurnFileState, file_history_dir, read_turn, undo_turn};
 
 /// Summaries already known, by the path of their source, so a scan reads only what changed.
 pub trait KnownSummaries {

@@ -83,6 +83,9 @@ pub struct TurnSpec {
     /// A failed turn of the Claude Code session to leave out: the line the session goes on
     /// from and the prompt dropped (`--resume-session-at`, `--resume-drops-turn`).
     pub drop_turn: Option<(String, String)>,
+    /// A new Claude Code session from the line `fork_at` of `session`, which stays as it is
+    /// (`--resume-session-at` with `--fork-session`).
+    pub fork_at: Option<String>,
     /// Claude Code on a host: the MCP config of Bowyer's memory, reached through a tunnel.
     /// It holds a token, so it goes into a file only the user can read, never into the
     /// command line every user of the host can see.
@@ -143,10 +146,20 @@ pub enum LiveEvent {
     /// The harness answered (`true`) but goes on running for what it left in the background
     /// (a command, an agent, a wakeup); `false` once that brings it back to work.
     Resting(bool),
-    /// What the harness runs in the background now, by description: commands and agents it
-    /// started and has not heard the end of (Claude's `background_tasks_changed`).
-    Background(Vec<String>),
+    /// What the harness runs in the background now: commands and agents it started and has
+    /// not heard the end of (Claude's `background_tasks_changed`).
+    Background(Vec<BackgroundTask>),
+    /// The harness took a prompt sent while the turn ran ([`StopHandle::say`]); one event per
+    /// prompt, in the order they were sent.
+    Heard,
     Finished { ok: bool, error: Option<String> },
+}
+
+/// A command or an agent a harness runs in the background.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub description: String,
 }
 
 pub struct Turn {
@@ -202,6 +215,19 @@ impl StopHandle {
         }
     }
 
+    /// Sends one more prompt to a turn whose harness still reads its input: Claude past its
+    /// answer while a command or an agent of it runs in the background. False when the
+    /// input is closed; [`LiveEvent::Heard`] says the harness took it. `spec` names the
+    /// prompt and its files as for a turn of its own. Blocks for a round trip to a host.
+    pub fn say(&self, spec: &TurnSpec) -> bool {
+        self.claude.as_ref().is_some_and(|(input, _)| input.send(&stdin_payload(spec)))
+    }
+
+    /// Stops a command or an agent the turn runs in the background, by its task id.
+    pub fn stop_background(&self, task: &str) -> bool {
+        self.claude.as_ref().is_some_and(|(input, _)| claude_ask::stop_task_id(input, task))
+    }
+
     /// Whether single commands of this turn can be stopped.
     pub fn stops_commands(&self) -> bool {
         self.claude.is_some() || self.processes
@@ -249,20 +275,27 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
     // Ids come from files and transcripts: one that starts with `-` would be read as an
     // option of the harness.
     let option_like = |value: &str| value.starts_with('-');
-    if spec.session.as_deref().is_some_and(option_like) || spec.drop_turn.as_ref().is_some_and(|(kept, prompt)| option_like(kept) || option_like(prompt)) {
+    if spec.session.as_deref().is_some_and(option_like)
+        || spec.drop_turn.as_ref().is_some_and(|(kept, prompt)| option_like(kept) || option_like(prompt))
+        || spec.fork_at.as_deref().is_some_and(option_like)
+    {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "a session id that reads as an option"));
     }
     let mut args: Vec<String> = Vec::new();
     let program = match spec.harness {
         HarnessKind::Claude => {
             args.extend(
-                ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+                // Prompts sent while it runs come back as it takes them: the window shows
+                // them where they went in, and knows they arrived.
+                ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages"]
                     .map(String::from),
             );
             if let Some(session) = &spec.session {
                 args.extend(["--resume".into(), session.clone()]);
                 // Claude Code checks that only the dropped turn goes, and refuses otherwise.
-                if let Some((kept, prompt)) = &spec.drop_turn {
+                if let Some(at) = &spec.fork_at {
+                    args.extend(["--resume-session-at".into(), at.clone(), "--fork-session".into()]);
+                } else if let Some((kept, prompt)) = &spec.drop_turn {
                     args.extend(["--resume-session-at".into(), kept.clone(), "--resume-drops-turn".into(), prompt.clone()]);
                 }
             }
@@ -343,10 +376,11 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
     Ok((program.to_owned(), args))
 }
 
-/// Whether a Claude turn asks the window before an action. Everywhere but a turn on an SSH
-/// host that allows everything: that one keeps the plain detached run, nothing to answer.
+/// Whether a Claude turn keeps its input open while it runs: for the questions it asks
+/// before an action (and `AskUserQuestion`, which comes even when everything is allowed),
+/// and for prompts sent while a command of it runs in the background.
 fn claude_answered(spec: &TurnSpec) -> bool {
-    spec.harness == HarnessKind::Claude && !(spec.ssh.is_some() && spec.permission == Permission::Bypass)
+    spec.harness == HarnessKind::Claude
 }
 
 /// The prompt with the paths of the files the harness reads from disk: every attachment
@@ -744,6 +778,18 @@ fn read_claude(
     // Past a result Claude still runs while a command, an agent or a wakeup it left in the
     // background is pending; what it finishes comes back as a turn of its own.
     let mut resting = false;
+    // Its input stays open past a result while something runs in the background, so a
+    // prompt can still go in; it closes once nothing does (Claude ends after the turn the
+    // last one's notice starts). The host of a detached run follows the same rule.
+    let mut answered = false;
+    let mut background = 0usize;
+    // The prompt the turn began with comes back too: it shows already. A slash command may
+    // not come back, so it is known by its text, not by coming first.
+    let own_prompt = prompt.iter().find_map(|block| match block {
+        Block::Text { text } => Some(text.trim().to_owned()),
+        _ => None,
+    });
+    let mut own_seen = false;
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
         if !named && let Some(id) = value.get("session_id").and_then(Value::as_str) {
@@ -766,15 +812,35 @@ fn read_claude(
         if kind == "system" {
             claude_ask::take_task(&value, tasks);
             if value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed") {
-                let described = |task: &Value| task.get("description").and_then(Value::as_str).unwrap_or_default().to_owned();
-                let running = value.get("tasks").and_then(Value::as_array).map(|tasks| tasks.iter().map(described).collect()).unwrap_or_default();
+                let field = |task: &Value, name: &str| task.get(name).and_then(Value::as_str).unwrap_or_default().to_owned();
+                let running: Vec<BackgroundTask> = value
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(|tasks| tasks.iter().map(|task| BackgroundTask { id: field(task, "task_id"), description: field(task, "description") }).collect())
+                    .unwrap_or_default();
+                background = running.len();
+                if answered && background == 0 {
+                    answers.close();
+                }
                 let _ = sender.unbounded_send(LiveEvent::Background(running));
             }
         }
         if kind == "result" {
             // The turn is over: with its input closed, Claude ends instead of waiting for
-            // the next prompt.
-            answers.close();
+            // the next prompt, unless something of it still runs in the background.
+            answered = true;
+            if background == 0 {
+                answers.close();
+            }
+        }
+        if kind == "user"
+            && let Some(text) = replay_text(&value)
+        {
+            if !own_seen && own_prompt.as_deref().is_none_or(|own| own == text.trim()) {
+                own_seen = true;
+                continue;
+            }
+            let _ = sender.unbounded_send(LiveEvent::Heard);
         }
         if kind == "result" && value.get("is_error").and_then(Value::as_bool) == Some(true) {
             error = value
@@ -806,6 +872,25 @@ fn read_claude(
         let _ = sender.unbounded_send(LiveEvent::Update(turn));
     }
     error
+}
+
+/// The text of a prompt Claude took, when a `user` line of its output is one
+/// (`--replay-user-messages`): Claude Code 2.0.19 and later mark it `isReplay`, an older one
+/// only by its shape (text and pictures, not a tool's result, not a subagent's prompt).
+fn replay_text(line: &Value) -> Option<String> {
+    match line.get("isReplay") {
+        Some(Value::Bool(true)) => {}
+        Some(_) => return None,
+        None if line.get("parent_tool_use_id").is_some_and(|id| !id.is_null()) => return None,
+        None => {}
+    }
+    match line.pointer("/message/content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) if !blocks.is_empty() && blocks.iter().all(|block| matches!(block.get("type").and_then(Value::as_str), Some("text" | "image"))) => {
+            Some(blocks.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
+        }
+        _ => None,
+    }
 }
 
 /// One item of `codex exec --json` as a block: the message, the reasoning summary, or a
@@ -1104,6 +1189,7 @@ mod tests {
             attachments: Vec::new(),
             ide: None,
             drop_turn: None,
+            fork_at: None,
             mcp_config: None,
         }
     }
@@ -1243,13 +1329,13 @@ mod tests {
         while let Ok(Some(event)) = events.try_next() {
             match event {
                 LiveEvent::Resting(now) => seen.push(format!("resting {now}")),
-                LiveEvent::Background(tasks) => seen.push(format!("background {tasks:?}")),
+                LiveEvent::Background(tasks) => seen.push(format!("background {:?}", tasks.iter().map(|task| (task.id.as_str(), task.description.as_str())).collect::<Vec<_>>())),
                 _ => {}
             }
         }
         assert_eq!(
             seen,
-            [r#"background ["Build the app"]"#, "resting true", "background []", "resting false", "resting true"],
+            [r#"background [("b1", "Build the app")]"#, "resting true", "background []", "resting false", "resting true"],
             "system lines alone do not wake it"
         );
     }
@@ -1331,9 +1417,88 @@ mod tests {
         claude.permission = Permission::Bypass;
         assert!(asks(&claude), "a question to the user still comes here");
         claude.ssh = Some(envs::SshEnvironment::new("vm"));
-        assert!(!asks(&claude));
+        assert!(asks(&claude), "on a host too: prompts may go in while a command runs in the background");
         claude.permission = Permission::AcceptEdits;
         assert!(asks(&claude));
+        assert!(command_line(&claude).unwrap().1.iter().any(|arg| arg == "--replay-user-messages"));
+    }
+
+    /// A prompt sent while the turn runs is known as taken by its replay, not by coming
+    /// second: a turn whose own prompt (a slash command) does not come back still hears it,
+    /// and a text line that is no replay hears nothing.
+    #[test]
+    fn a_prompt_taken_is_known_by_its_replay() {
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation."},"isReplay":false}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"Later prompt"},"parent_tool_use_id":null,"isReplay":true}"#,
+        ]
+        .map(String::from);
+        let (sender, mut events) = unbounded();
+        read_claude(lines.into_iter(), &[Block::Text { text: "/compact".into() }], &sender, &claude_ask::Input::closed(), &claude_ask::Tasks::default());
+        let mut heard = 0;
+        while let Ok(Some(event)) = events.try_next() {
+            heard += matches!(event, LiveEvent::Heard) as usize;
+        }
+        assert_eq!(heard, 1, "the later prompt only");
+    }
+
+    /// As Claude Code 2.1.332 answered a real turn (Haiku, 2026-11-25): past its answer the
+    /// input stays open while a command runs in the background, a prompt sent then comes back
+    /// as it is taken, and the input closes once nothing runs in the background.
+    #[test]
+    fn claude_takes_a_prompt_while_a_command_runs_in_the_background() {
+        let written = Written::default();
+        let answers = claude_ask::Input::new(claude_ask::Sink::Pipe(Box::new(written.clone())));
+        let (line, lines) = std::sync::mpsc::channel::<String>();
+        let (sender, mut events) = unbounded();
+        let reader_answers = answers.clone();
+        let reader = thread::spawn(move || read_claude(lines.into_iter(), &[Block::Text { text: "Build it".into() }], &sender, &reader_answers, &claude_ask::Tasks::default()));
+        let wait_for = |events: &mut UnboundedReceiver<LiveEvent>, wanted: &dyn Fn(&LiveEvent) -> bool| loop {
+            match futures_executor_next(events) {
+                Some(event) if wanted(&event) => break event,
+                Some(_) => {}
+                None => panic!("the reader ended"),
+            }
+        };
+        for text in [
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Build it"}]},"parent_tool_use_id":null,"isReplay":true}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","description":"Build the app"}]}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"Command running in background"}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"STARTED"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"STARTED"}"#,
+        ] {
+            line.send(text.into()).unwrap();
+        }
+        wait_for(&mut events, &|event| matches!(event, LiveEvent::Resting(true)));
+        assert!(answers.send("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"PONG?\"}}\n"), "the input is open past the answer");
+        for text in [
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"PONG?"}]},"parent_tool_use_id":null,"isReplay":true}"#,
+            r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"PONG"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"PONG"}"#,
+        ] {
+            line.send(text.into()).unwrap();
+        }
+        wait_for(&mut events, &|event| matches!(event, LiveEvent::Heard));
+        let shown = loop {
+            if let LiveEvent::Update(turn) = wait_for(&mut events, &|event| matches!(event, LiveEvent::Update(_))) {
+                if turn.search_text(1000).contains("PONG?") && turn.search_text(1000).contains("PONG\n") || turn.entries.len() >= 4 {
+                    break turn;
+                }
+            }
+        };
+        let users: Vec<String> = shown.entries.iter().filter(|entry| entry.role == Role::User).map(|entry| format!("{:?}", entry.blocks)).collect();
+        assert_eq!(users.iter().filter(|blocks| blocks.contains("Build it")).count(), 1, "the first prompt shows once: {users:?}");
+        assert!(users.iter().any(|blocks| blocks.contains("PONG?")), "the prompt sent meanwhile shows where it went in: {users:?}");
+        assert!(answers.send("\n"), "still open: the command runs on");
+        line.send(r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#.into()).unwrap();
+        wait_for(&mut events, &|event| matches!(event, LiveEvent::Background(tasks) if tasks.is_empty()));
+        assert!(!answers.send("\n"), "closed once nothing runs in the background");
+        drop(line);
+        assert_eq!(reader.join().unwrap(), None);
     }
 
     #[test]
@@ -1439,6 +1604,21 @@ mod tests {
         dropping.session = None;
         let (_, args) = command_line(&dropping).unwrap();
         assert!(!args.iter().any(|arg| arg.starts_with("--resume")), "a new session has nothing to drop");
+    }
+
+    /// A branch is a new session from a line of another, which stays as it is: as Claude
+    /// Code 2.1.332 did it with Haiku (a new id, the conversation up to the line only, the
+    /// file it came from unchanged).
+    #[test]
+    fn a_branch_resumes_at_its_line_into_a_new_session() {
+        let mut branching = spec(HarnessKind::Claude);
+        branching.fork_at = Some("line-before".into());
+        branching.drop_turn = Some(("kept-line".into(), "failed-prompt".into()));
+        let (_, args) = command_line(&branching).unwrap();
+        assert!(args.windows(5).any(|w| w == ["--resume", "abc", "--resume-session-at", "line-before", "--fork-session"]), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--resume-drops-turn"), "a branch drops nothing of the session it leaves");
+        branching.fork_at = Some("-x".into());
+        assert!(command_line(&branching).is_err(), "a line that reads as an option");
     }
 
     #[test]

@@ -74,6 +74,37 @@ fn signed_in(status: Option<&Value>) -> Option<bool> {
     Some(labels.map(str::to_ascii_lowercase).any(|label| words.iter().any(|word| label.contains(word))))
 }
 
+/// Who Claude Code runs as on a machine, as its status says (`get_status`): the way it is
+/// signed in ("Claude Max account", an API key) and the account.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Account {
+    pub method: Option<String>,
+    pub email: Option<String>,
+    pub organization: Option<String>,
+}
+
+/// Reads who Claude Code runs as from its output for [`claude_request`]; `None` without a
+/// status (an older Claude Code) or with nothing in it about the login. A row about an API
+/// key gives only its label: its value may hold part of the key.
+pub fn parse_account(output: &str) -> Option<Account> {
+    let events: Vec<Value> = output.lines().filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok()).collect();
+    let status = response_to(&events, STATUS).filter(|status| status.get("subtype").and_then(Value::as_str) == Some("success"))?;
+    let sections = status.pointer("/response/sections")?.as_array()?;
+    let mut account = Account::default();
+    for row in sections.iter().filter_map(|section| section.get("rows")?.as_array()).flatten() {
+        let (Some(label), value) = (row.get("label").and_then(Value::as_str), row.get("value").and_then(Value::as_str)) else { continue };
+        let value = value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned);
+        match label.to_ascii_lowercase().as_str() {
+            "login method" | "auth method" | "authentication" => account.method = account.method.take().or(value),
+            "email" => account.email = value,
+            "organization" => account.organization = value,
+            other if other.contains("api key") || other.contains("auth token") => account.method = Some(label.to_owned()),
+            _ => {}
+        }
+    }
+    (account != Account::default()).then_some(account)
+}
+
 /// What an account's plan is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
@@ -260,6 +291,31 @@ mod tests {
         let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"bowyer-usage","error":"Unsupported control request subtype: get_usage"}}"#;
         assert_eq!(parse_claude(refused), Plan::Unknown("Unsupported control request subtype: get_usage".into()));
         assert!(matches!(parse_claude("Not logged in"), Plan::Unknown(text) if text == "Not logged in"));
+    }
+
+    /// The login, as Claude Code 2.1.332 answered `get_status` (values made up), and an API
+    /// key, whose value is never kept.
+    #[test]
+    fn the_status_says_who_claude_runs_as() {
+        let status = |rows: Value| {
+            json!({"type": "control_response", "response": {"subtype": "success", "request_id": "bowyer-status", "response": {"sections": [{"title": "Session", "rows": rows}, {"title": "Environment", "rows": [{"label": "Model", "value": "claude-opus-5-5"}]}]}}}).to_string()
+        };
+        let max = status(json!([
+            {"label": "Version", "value": "2.1.332"},
+            {"label": "Login method", "value": "Claude Max account"},
+            {"label": "Organization", "value": "Example Org"},
+            {"label": "Email", "value": "someone@example.com"},
+        ]));
+        assert_eq!(
+            parse_account(&max),
+            Some(Account { method: Some("Claude Max account".into()), email: Some("someone@example.com".into()), organization: Some("Example Org".into()) })
+        );
+        let keyed = status(json!([{"label": "Version", "value": "2.1.332"}, {"label": "API key", "value": "sk-ant-…abcd"}]));
+        let account = parse_account(&keyed).unwrap();
+        assert_eq!(account.method.as_deref(), Some("API key"));
+        assert!(!format!("{account:?}").contains("sk-ant"), "the key's value is not kept");
+        assert_eq!(parse_account(&status(json!([{"label": "Version", "value": "2.1.332"}]))), None, "nothing about the login");
+        assert_eq!(parse_account("Not logged in"), None);
     }
 
     /// On a host the request runs in a folder of the user's own, never in `/tmp`.

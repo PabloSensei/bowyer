@@ -43,6 +43,7 @@ fn main() {
             let (kept, prompt) = value.split_once(' ')?;
             Some((kept.to_owned(), prompt.to_owned()))
         }),
+        fork_at: None,
         mcp_config: None,
     };
     let started = Instant::now();
@@ -58,7 +59,12 @@ fn main() {
                 first_update.get_or_insert(started.elapsed().as_millis());
                 last = Some(t);
             }
-            Some(LiveEvent::Stderr(_) | LiveEvent::Resting(_) | LiveEvent::Background(_)) => {}
+            Some(LiveEvent::Stderr(_)) => {}
+            Some(LiveEvent::Resting(now)) => println!("{:>6}ms resting {now}", started.elapsed().as_millis()),
+            Some(LiveEvent::Background(tasks)) => {
+                println!("{:>6}ms background {:?}", started.elapsed().as_millis(), tasks.iter().map(|task| task.description.as_str()).collect::<Vec<_>>())
+            }
+            Some(LiveEvent::Heard) => println!("{:>6}ms heard", started.elapsed().as_millis()),
             Some(LiveEvent::Permission(ask)) => {
                 let wanted = std::env::var("BOWYER_ANSWER").unwrap_or_else(|_| "allow_once".into());
                 let choice = ask.options.iter().find(|(_, kind, _)| *kind == wanted).map(|(id, _, _)| id.clone());

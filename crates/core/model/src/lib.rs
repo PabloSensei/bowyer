@@ -387,6 +387,73 @@ pub struct Transcript {
     /// and a sum over sessions counts each of them once.
     #[serde(default)]
     pub named_calls: Vec<NamedCall>,
+    /// Each prompt of a Claude Code session with the line it hangs under: a new session
+    /// can start from that line (`--resume-session-at` with `--fork-session`) and leave this
+    /// one as it is.
+    #[serde(default)]
+    pub branch_points: Vec<(String, String)>,
+    /// Claude Code's file history, prompt by prompt: the files it tracks and their backups
+    /// as they were when the prompt came (what `/rewind` restores).
+    #[serde(default)]
+    pub file_snapshots: Vec<FileSnapshot>,
+}
+
+/// The files Claude Code's file history knew when a prompt came, with their backups.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileSnapshot {
+    /// The uuid of the prompt.
+    pub prompt: String,
+    pub files: Vec<SnapshotFile>,
+}
+
+/// A tracked file: its path on the machine of the session, and the name of its backup in
+/// the session's file history (`~/.claude/file-history/<session>/`); `None` when the file
+/// did not exist.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotFile {
+    pub path: String,
+    pub backup: Option<String>,
+}
+
+/// A file a turn changed: as it was before the turn, and after it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnFile {
+    pub path: String,
+    pub before: TurnBefore,
+    pub after: TurnAfter,
+}
+
+/// A file before a turn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TurnBefore {
+    /// A backup the history names for the prompt; `None` when the file did not exist.
+    Backup(Option<String>),
+    /// A file first changed during the turn that the history does not name: Claude Code
+    /// 2.1 writes no snapshot updates. Its first backup is still made, named by the path as
+    /// the edit gave it (`named`). Without that backup the file did not exist when the edit
+    /// `created` it; otherwise the backup is gone.
+    First { named: String, created: bool },
+}
+
+/// A file after a turn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TurnAfter {
+    /// The backup taken when the next prompt came; `None` when the file was not there.
+    Backup(Option<String>),
+    /// The file as it is now: no prompt came after the turn.
+    Current,
+    /// A prompt came after, and the history keeps no copy of the file from then.
+    Unknown,
+}
+
+/// A path to compare with another of the same machine: one kind of slash, and no case on
+/// Windows.
+fn same_path(a: &str, b: &str) -> bool {
+    let norm = |path: &str| {
+        let path = path.replace('\\', "/");
+        if path.as_bytes().get(1) == Some(&b':') { path.to_lowercase() } else { path }
+    };
+    norm(a) == norm(b)
 }
 
 /// A model call with the name the harness gave it.
@@ -438,6 +505,69 @@ impl SpentSince {
     pub fn is_empty(&self) -> bool {
         self.named.is_empty() && self.unnamed.is_empty()
     }
+}
+
+/// What one session spent, day by day, for a [`spend_report`].
+#[derive(Clone, Debug)]
+pub struct SpendInput {
+    pub key: SessionKey,
+    pub title: String,
+    /// The folder the session ran in.
+    pub project: String,
+    /// The UTC day number and what was spent that day.
+    pub days: Vec<(i64, SpentSince)>,
+}
+
+/// Spending of many sessions at API prices: per day, per project, per session.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpendReport {
+    /// Every UTC day of the span, with nothing spent as zero.
+    pub days: Vec<(i64, f64)>,
+    /// The most first.
+    pub projects: Vec<(String, f64)>,
+    /// The most first.
+    pub sessions: Vec<(SessionKey, String, f64)>,
+    pub total: f64,
+    /// Every model's price was known.
+    pub complete: bool,
+}
+
+/// Sums what sessions spent from UTC day `first_day` to `last_day`, each call a session
+/// shares with another (a resumed copy) once.
+pub fn spend_report(inputs: &[SpendInput], first_day: i64, last_day: i64) -> SpendReport {
+    let mut days: std::collections::BTreeMap<i64, UsageSum> = (first_day..=last_day).map(|day| (day, UsageSum::default())).collect();
+    let mut projects: Vec<(String, UsageSum)> = Vec::new();
+    let mut total = UsageSum::default();
+    let mut sessions: Vec<(SessionKey, String, f64)> = Vec::new();
+    let mut complete = true;
+    for input in inputs {
+        let mut own = UsageSum::default();
+        let at = match projects.iter().position(|(name, _)| *name == input.project) {
+            Some(at) => at,
+            None => {
+                projects.push((input.project.clone(), UsageSum::default()));
+                projects.len() - 1
+            }
+        };
+        for (day, spent) in input.days.iter().filter(|(day, _)| (first_day..=last_day).contains(day)) {
+            if let Some(sum) = days.get_mut(day) {
+                sum.add_session(spent);
+            }
+            projects[at].1.add_session(spent);
+            total.add_session(spent);
+            own.add_session(spent);
+        }
+        let (usd, known) = pricing::session_cost(&own.buckets);
+        complete &= known;
+        if usd > 0.0 {
+            sessions.push((input.key.clone(), input.title.clone(), usd));
+        }
+    }
+    let cost = |sum: &UsageSum| pricing::session_cost(&sum.buckets).0;
+    let mut projects: Vec<(String, f64)> = projects.iter().map(|(name, sum)| (name.clone(), cost(sum))).filter(|(_, usd)| *usd > 0.0).collect();
+    projects.sort_by(|a, b| b.1.total_cmp(&a.1));
+    sessions.sort_by(|a, b| b.2.total_cmp(&a.2));
+    SpendReport { days: days.iter().map(|(day, sum)| (*day, cost(sum))).collect(), projects, sessions, total: cost(&total), complete }
 }
 
 /// A prompt that only got API errors, at the end of a Claude Code session.
@@ -520,6 +650,34 @@ impl Transcript {
         SpentSince { named, unnamed }
     }
 
+    /// What the session spent on each UTC day from the day of `since_ms` on, each day as
+    /// [`Self::spent_since`] gives a span.
+    pub fn spent_by_day(&self, since_ms: i64) -> Vec<(i64, SpentSince)> {
+        let first = since_ms.div_euclid(DAY_MS);
+        let mut days: Vec<i64> = self.usage_by_day.iter().map(|(day, _, _)| *day).filter(|day| *day >= first).collect();
+        days.sort_unstable();
+        days.dedup();
+        days.into_iter()
+            .map(|day| {
+                let named: Vec<NamedCall> = self.named_calls.iter().filter(|call| call.at_ms.div_euclid(DAY_MS) == day).cloned().collect();
+                let mut unnamed: Vec<(String, Usage)> = Vec::new();
+                for (_, bucket, usage) in self.usage_by_day.iter().filter(|(at, _, _)| *at == day) {
+                    match unnamed.iter_mut().find(|(name, _)| name == bucket) {
+                        Some((_, sum)) => sum.add(usage),
+                        None => unnamed.push((bucket.clone(), *usage)),
+                    }
+                }
+                for call in &named {
+                    if let Some((_, sum)) = unnamed.iter_mut().find(|(bucket, _)| *bucket == call.bucket) {
+                        sum.subtract(&call.usage);
+                    }
+                }
+                unnamed.retain(|(_, usage)| !usage.is_empty());
+                (day, SpentSince { named, unnamed })
+            })
+            .collect()
+    }
+
     /// Files the session changed, from its edit and write calls, in first-touch order.
     pub fn changes(&self) -> Vec<FileChange> {
         let mut changes: Vec<FileChange> = Vec::new();
@@ -545,6 +703,50 @@ impl Transcript {
             }
         }
         changes
+    }
+
+    /// The files each prompt's turn changed, by the prompt's uuid: those its edits named,
+    /// with their state before and after the turn from Claude Code's file history.
+    pub fn turn_files(&self) -> std::collections::HashMap<String, Vec<TurnFile>> {
+        let mut turns = std::collections::HashMap::new();
+        let at: std::collections::HashMap<&str, usize> = self.entries.iter().enumerate().map(|(ix, entry)| (entry.id.as_str(), ix)).collect();
+        for (si, snapshot) in self.file_snapshots.iter().enumerate() {
+            let Some(&start) = at.get(snapshot.prompt.as_str()) else { continue };
+            let next = self.file_snapshots[si + 1..].iter().find(|later| at.contains_key(later.prompt.as_str()));
+            let end = next.and_then(|later| at.get(later.prompt.as_str()).copied()).unwrap_or(self.entries.len());
+            let mut files: Vec<TurnFile> = Vec::new();
+            for block in self.entries[start..end.max(start)].iter().flat_map(|entry| &entry.blocks) {
+                let Block::ToolCall { name, kind: ToolKind::Edit, input, result, .. } = block else { continue };
+                if result.as_ref().is_some_and(|result| result.is_error) {
+                    continue;
+                }
+                // Claude Code's own words for a file a write made.
+                let created = result.as_ref().is_some_and(|result| result.text.starts_with("File created successfully"));
+                for (path, ..) in edit_effects(name, input) {
+                    if files.iter().any(|file| same_path(&file.path, &path)) {
+                        continue;
+                    }
+                    let known = snapshot.files.iter().find(|file| same_path(&file.path, &path));
+                    let before = match known {
+                        Some(known) => TurnBefore::Backup(known.backup.clone()),
+                        None => TurnBefore::First { named: path.clone(), created },
+                    };
+                    let after = match next {
+                        Some(later) => match later.files.iter().find(|file| same_path(&file.path, &path)) {
+                            Some(later) => TurnAfter::Backup(later.backup.clone()),
+                            None => TurnAfter::Unknown,
+                        },
+                        None => TurnAfter::Current,
+                    };
+                    let path = known.map_or(path, |known| known.path.clone());
+                    files.push(TurnFile { path, before, after });
+                }
+            }
+            if !files.is_empty() {
+                turns.insert(snapshot.prompt.clone(), files);
+            }
+        }
+        turns
     }
 
     /// Shell commands and agents the session started. A call without a result still runs
@@ -806,6 +1008,101 @@ mod tests {
             usage: None,
             compact_summary: false,
         }
+    }
+
+    fn prompt(id: &str) -> Entry {
+        Entry { id: id.into(), role: Role::User, blocks: vec![Block::Text { text: "go".into() }], ..entry(Vec::new()) }
+    }
+
+    fn tracked(path: &str, backup: Option<&str>) -> SnapshotFile {
+        SnapshotFile { path: path.into(), backup: backup.map(str::to_owned) }
+    }
+
+    /// A turn's files are those its edits named, with the backup taken when its prompt came
+    /// and the one taken when the next came; the last turn's files are as they are now. A
+    /// file first changed in the turn has its first backup, by Claude Code's naming.
+    #[test]
+    fn a_turn_changed_the_files_its_edits_named() {
+        let edit = |path: &str| call("Edit", json!({"file_path": path, "old_string": "a", "new_string": "b"}), Some("ok"));
+        let failed = Block::ToolCall {
+            id: "bad".into(),
+            name: "Write".into(),
+            kind: ToolKind::Edit,
+            input: json!({"file_path": "C:\\p\\c.rs", "content": "x"}),
+            result: Some(ToolResult { text: "denied".into(), is_error: true }),
+        };
+        let transcript = Transcript {
+            entries: vec![
+                prompt("p1"),
+                entry(vec![edit("C:\\p\\a.rs"), edit("C:/P/a.rs"), failed]),
+                prompt("p2"),
+                entry(vec![edit("C:\\p\\b.rs")]),
+                prompt("p3"),
+                entry(vec![Block::Text { text: "nothing".into() }]),
+                prompt("p4"),
+                entry(vec![
+                    edit("C:\\p\\a.rs"),
+                    edit("C:\\p\\untracked.rs"),
+                    call("Write", json!({"file_path": "C:\\p\\made.md", "content": "x"}), Some("File created successfully at: C:\\p\\made.md")),
+                ]),
+            ],
+            file_snapshots: vec![
+                FileSnapshot { prompt: "p1".into(), files: vec![tracked("C:\\p\\a.rs", Some("h@v1")), tracked("C:\\p\\c.rs", Some("c@v1"))] },
+                FileSnapshot { prompt: "p2".into(), files: vec![tracked("C:\\p\\a.rs", Some("h@v2")), tracked("C:\\p\\b.rs", None)] },
+                FileSnapshot { prompt: "p3".into(), files: vec![tracked("C:\\p\\a.rs", Some("h@v2")), tracked("C:\\p\\b.rs", Some("b@v1"))] },
+                FileSnapshot { prompt: "p4".into(), files: vec![tracked("C:\\p\\a.rs", Some("h@v2"))] },
+            ],
+            ..Transcript::default()
+        };
+        let turns = transcript.turn_files();
+        let backup = |name: &str| TurnBefore::Backup(Some(name.into()));
+        assert_eq!(turns["p1"], vec![TurnFile { path: "C:\\p\\a.rs".into(), before: backup("h@v1"), after: TurnAfter::Backup(Some("h@v2".into())) }]);
+        assert_eq!(turns["p2"], vec![TurnFile { path: "C:\\p\\b.rs".into(), before: TurnBefore::Backup(None), after: TurnAfter::Backup(Some("b@v1".into())) }]);
+        assert!(!turns.contains_key("p3"), "a turn without edits changed nothing");
+        assert_eq!(
+            turns["p4"],
+            vec![
+                TurnFile { path: "C:\\p\\a.rs".into(), before: backup("h@v2"), after: TurnAfter::Current },
+                TurnFile { path: "C:\\p\\untracked.rs".into(), before: TurnBefore::First { named: "C:\\p\\untracked.rs".into(), created: false }, after: TurnAfter::Current },
+                TurnFile { path: "C:\\p\\made.md".into(), before: TurnBefore::First { named: "C:\\p\\made.md".into(), created: true }, after: TurnAfter::Current },
+            ]
+        );
+    }
+
+
+    /// Days, projects and sessions add up what was spent; a call two copies of a session
+    /// share counts once, and a day with nothing is there as zero.
+    #[test]
+    fn spending_adds_up_by_day_project_and_session() {
+        let day = 20_400;
+        let at = |d: i64| d * DAY_MS + 3_600_000;
+        let output = |output| Usage { output, ..Default::default() };
+        let mut first = Transcript::default();
+        first.add_named_call("m1", Some("claude-haiku-4-5"), output(1_000_000), at(day));
+        first.add_named_call("m2", Some("claude-haiku-4-5"), output(1_000_000), at(day + 2));
+        let mut copy = Transcript::default();
+        copy.add_named_call("m1", Some("claude-haiku-4-5"), output(1_000_000), at(day));
+        let mut other = Transcript::default();
+        other.add_call(Some("claude-haiku-4-5"), output(2_000_000), at(day + 2));
+        let input = |id: &str, project: &str, transcript: &Transcript| SpendInput {
+            key: SessionKey { env: EnvId::local(), harness: HarnessKind::Claude, id: id.into() },
+            title: id.into(),
+            project: project.into(),
+            days: transcript.spent_by_day(at(day - 5)),
+        };
+        let report = spend_report(&[input("a", "/p", &first), input("a2", "/p", &copy), input("b", "/q", &other)], day, day + 2);
+        let per_million = pricing::session_cost(&[("claude-haiku-4-5".into(), output(1_000_000))]).0;
+        assert!(per_million > 0.0);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert_eq!(report.days.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![day, day + 1, day + 2]);
+        assert!(close(report.days[0].1, per_million), "the shared call once: {:?}", report.days);
+        assert!(close(report.days[1].1, 0.0));
+        assert!(close(report.days[2].1, 3.0 * per_million));
+        assert!(close(report.total, 4.0 * per_million));
+        assert_eq!(report.projects.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["/p", "/q"]);
+        assert!(close(report.projects[0].1, 2.0 * per_million));
+        assert_eq!(report.sessions.iter().map(|(_, title, _)| title.as_str()).collect::<Vec<_>>(), vec!["a", "b", "a2"]);
+        assert!(report.complete);
     }
 
     #[test]

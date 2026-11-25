@@ -40,6 +40,11 @@ pub struct Item {
     pub model: Option<String>,
     pub compact_summary: bool,
     pub pieces: Vec<Piece>,
+    /// A prompt of a Claude Code session: the line a new session before it starts from, and
+    /// its text, to put back into the composer.
+    pub branch: Option<(String, String)>,
+    /// A prompt: its uuid, for the files its turn changed, and its text.
+    pub prompt: Option<(String, String)>,
 }
 
 fn field<'a>(input: &'a Value, names: &[&str]) -> Option<&'a str> {
@@ -110,6 +115,8 @@ fn item_of(entry: &Entry) -> Item {
         model: entry.model.clone(),
         compact_summary: entry.compact_summary,
         pieces,
+        branch: None,
+        prompt: None,
     }
 }
 
@@ -117,8 +124,20 @@ fn item_of(entry: &Entry) -> Item {
 /// before them, so a long agent run reads as one answer with folded work inside.
 pub fn items(transcript: &Transcript) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
+    let branches: std::collections::HashMap<&str, &str> = transcript.branch_points.iter().map(|(prompt, at)| (prompt.as_str(), at.as_str())).collect();
     for entry in &transcript.entries {
-        let item = item_of(entry);
+        let mut item = item_of(entry);
+        if entry.role == Role::User && !entry.compact_summary {
+            let text = entry.blocks.iter().filter_map(|block| match block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            });
+            let text = text.collect::<Vec<_>>().join("\n");
+            if let Some(at) = branches.get(entry.id.as_str()) {
+                item.branch = Some(((*at).to_owned(), text.clone()));
+            }
+            item.prompt = Some((entry.id.clone(), text));
+        }
         if item.pieces.is_empty() {
             continue;
         }
@@ -167,6 +186,21 @@ mod tests {
 
     fn call(name: &str) -> Block {
         Block::ToolCall { id: name.into(), name: name.into(), kind: ToolKind::classify(name), input: json!({"command": "ls"}), result: None }
+    }
+
+    /// A prompt with a branch point carries it and its text; an answer carries none.
+    #[test]
+    fn a_prompt_carries_where_a_branch_before_it_starts() {
+        let mut prompt = entry(Role::User, vec![Block::Text { text: "Remember BANANA.".into() }]);
+        prompt.id = "p2".into();
+        let transcript = Transcript {
+            entries: vec![prompt, entry(Role::Assistant, vec![Block::Text { text: "OK".into() }])],
+            branch_points: vec![("p2".into(), "a1".into())],
+            ..Transcript::default()
+        };
+        let shown = items(&transcript);
+        assert_eq!(shown[0].branch, Some(("a1".to_owned(), "Remember BANANA.".to_owned())));
+        assert_eq!(shown[1].branch, None);
     }
 
     #[test]

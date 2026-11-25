@@ -27,6 +27,7 @@ enum MenuAction {
     ResetName,
     MoveOut,
     CopyId,
+    Export,
     DeleteSession,
     /// A harness group: run the harness's update, or ask for versions again.
     UpdateHarness,
@@ -84,6 +85,7 @@ impl Shell {
                 self.status = Some(format!("{}: {}", t("code.copied"), key.id));
             }
             (MenuAction::DeleteSession, TreeNodeKind::Session(key)) => self.delete_session(key.clone(), cx),
+            (MenuAction::Export, TreeNodeKind::Session(key)) => self.export_session(key.clone(), cx),
             (MenuAction::UpdateHarness, _) => {
                 if let Some((env, harness)) = row.harness.clone() {
                     self.update_harness(env, harness, window, cx);
@@ -101,6 +103,71 @@ impl Shell {
 
     /// Deletes a session the user asked to delete: its files go to the trash of its
     /// machine. A session inside a store other sessions share is only hidden here.
+    /// Reads a session and writes it as Markdown where the user says, on this computer.
+    pub(super) fn export_session(&mut self, key: SessionKey, cx: &mut Context<Self>) {
+        let (Some(summary), Some(env)) = (self.summary(&key).cloned(), self.env_for(&key.env)) else { return };
+        let title = self.placements.get(&key).and_then(|placement| placement.title.clone()).unwrap_or_else(|| summary.display_title());
+        let cache = self.cache_dir.join("remote");
+        let dropped = self.dropped_prompt(&key);
+        self.status = Some(t("export.reading").to_owned());
+        let task = cx.background_spawn(async move {
+            let source = history::source_for(&summary.key.harness).ok_or_else(|| "no reader for this harness".to_owned())?;
+            let mut transcript = source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?;
+            if let Some(prompt) = &dropped {
+                transcript.hide_failed_turn(prompt);
+            }
+            let mut summary = summary;
+            summary.title = title;
+            let labels = history::ExportLabels {
+                you: t("export.you"),
+                computer: t("local"),
+                folder: t("export.folder"),
+                model: t("export.model"),
+                started: t("export.started"),
+                updated: t("export.updated"),
+                session: t("export.session"),
+                summary: t("export.summary"),
+                picture: t("export.picture"),
+            };
+            Ok::<_, String>((history::export_file_name(&summary.title), history::export_markdown(&summary, &transcript, &labels)))
+        });
+        cx.spawn(async move |this, cx| {
+            let (name, text) = match task.await {
+                Ok(done) => done,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.status = Some(format!("{}: {error}", t("export.failed")));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from).unwrap_or_default();
+            let downloads = home.join("Downloads");
+            let folder = if downloads.is_dir() { downloads } else { home };
+            let Ok(chosen) = this.update(cx, |this, cx| {
+                this.status = None;
+                cx.notify();
+                cx.prompt_for_new_path(&folder, Some(&name))
+            }) else {
+                return;
+            };
+            let Ok(Ok(Some(path))) = chosen.await else { return };
+            let written = std::fs::write(&path, text);
+            this.update(cx, |this, cx| {
+                this.status = Some(match written {
+                    Ok(()) => t("export.done").replace("{path}", &path.to_string_lossy()),
+                    Err(error) => format!("{}: {error}", t("export.failed")),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn delete_session(&mut self, key: SessionKey, cx: &mut Context<Self>) {
         let running = self.runs_turn_of(&key);
         if running {
@@ -172,6 +239,7 @@ impl Shell {
                     entries.push((MenuAction::MoveOut, t("menu.move_out"), false));
                 }
                 entries.push((MenuAction::CopyId, t("menu.copy_id"), false));
+                entries.push((MenuAction::Export, t("menu.export"), false));
                 let own_files = self.summary(key).and_then(history::session_files).is_some();
                 let label = match (menu.confirm_delete, own_files) {
                     (true, true) => t("menu.confirm_delete_session"),

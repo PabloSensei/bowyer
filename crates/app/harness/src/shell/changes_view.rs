@@ -15,7 +15,7 @@ use crate::highlight;
 use crate::i18n::t;
 
 /// Diff lines drawn at most; a bigger diff says how many are left out.
-const MAX_LINES: usize = 4000;
+pub(super) const MAX_LINES: usize = 4000;
 
 #[derive(Default)]
 pub(super) struct ChangesState {
@@ -132,6 +132,8 @@ impl Shell {
     pub(super) fn open_diff(&mut self, path: String, side: Side, cx: &mut Context<Self>) {
         self.preview = None;
         self.diff_view = Some(DiffView { path, side, diff: None, confirm: None, busy: false });
+        self.turn_view = None;
+        self.spend_view = None;
         self.load_diff(cx);
     }
 
@@ -286,6 +288,8 @@ impl Shell {
         self.diff_view = None;
         self.preview = None;
         self.commit_view = Some(CommitView { hash: hash.clone(), title: format!("{} {}", commit.short, commit.subject), files: None });
+        self.turn_view = None;
+        self.spend_view = None;
         let task = cx.background_spawn({
             let hash = hash.clone();
             async move { vcs::show(&*env, &root, &hash).map(Arc::new).map_err(|e| e.to_string()) }
@@ -905,7 +909,7 @@ impl Shell {
 
 /// The lines of a hunk with their old and new numbers and the colours of the code, as many
 /// as are left of `MAX_LINES` (`shown` counts them over the whole view).
-fn hunk_lines(hunk: &vcs::Hunk, lang: Option<&'static highlight::Lang>, theme: &Theme, shown: &mut usize) -> Vec<AnyElement> {
+pub(super) fn hunk_lines(hunk: &vcs::Hunk, lang: Option<&'static highlight::Lang>, theme: &Theme, shown: &mut usize) -> Vec<AnyElement> {
     let (mut old, mut new) = hunk_start(&hunk.header);
     let mut highlighter = lang.map(highlight::Highlighter::new);
     hunk
@@ -961,7 +965,7 @@ fn hunk_lines(hunk: &vcs::Hunk, lang: Option<&'static highlight::Lang>, theme: &
 
 /// A hunk as a card: its header with the buttons, if any, and its lines, which scroll
 /// sideways on their own (Shift+wheel).
-fn hunk_card(id: ElementId, header: &str, actions: Option<AnyElement>, lines: Vec<AnyElement>, theme: &Theme) -> AnyElement {
+pub(super) fn hunk_card(id: ElementId, header: &str, actions: Option<AnyElement>, lines: Vec<AnyElement>, theme: &Theme) -> AnyElement {
     div()
         .flex()
         .flex_col()

@@ -55,6 +55,8 @@ pub use titlebar::window_options;
 mod ssh_view;
 mod new_session;
 mod harness_view;
+mod turn_view;
+mod spend_view;
 mod memory_tunnel;
 
 pub const APP_NAME: &str = "Bowyer";
@@ -300,6 +302,8 @@ struct OpenSession {
     breakdown: ContextBreakdown,
     changes: Vec<FileChange>,
     tasks: Vec<TaskRun>,
+    /// The files each prompt's turn changed, from Claude Code's file history.
+    turns: Arc<std::collections::HashMap<String, Vec<model::TurnFile>>>,
     git: Option<GitInfo>,
     /// When the last model call answered, for the state of the prompt cache.
     last_call_ms: Option<i64>,
@@ -367,8 +371,14 @@ struct LiveRun {
     /// The harness answered and runs on only for what it left in the background (a command,
     /// an agent, a wakeup): the user's move, though its process lives.
     resting: bool,
-    /// What the harness runs in the background, by description.
-    background: Vec<String>,
+    /// What the harness runs in the background, and since when the window knows of each.
+    background: Vec<(live::BackgroundTask, std::time::Instant)>,
+    /// Prompts sent into the running harness that it has not taken yet: they go as the
+    /// next turn, like queued ones, if the turn ends first.
+    said: Vec<Queued>,
+    /// A prompt is on its way into the running harness (its files going up, a round trip
+    /// to the host): the next one waits for it.
+    saying: bool,
     error: Option<String>,
     stderr: String,
 }
@@ -406,12 +416,25 @@ const ROW_HEIGHT_GUESS: Pixels = px(120.);
 
 /// Replaces rows of a conversation where the reader may be. GPUI moves a place inside
 /// the replaced rows to the first of them; a reader who is not at the end keeps theirs.
+///
+/// GPUI counts a new row as empty until it is drawn: in a long session the scrollbar then
+/// shrank with every read of a growing file and grew back once the row was drawn, and rows
+/// never drawn stayed empty. New rows take the guess instead; rows already drawn keep the
+/// height they were drawn at (and are measured again when next drawn).
 fn splice_in_place(list: &ListState, range: std::ops::Range<usize>, count: usize) {
     let top = list.logical_scroll_top();
     list.splice(range, count);
+    let _ = list.clone().with_uniform_item_height(ROW_HEIGHT_GUESS);
     if !list.is_following_tail() {
         list.scroll_to(top);
     }
+}
+
+/// The rows to replace when a conversation of `old` rows becomes one of `new`: the last old
+/// row (it may have grown) and everything after it. Rows before it are the same.
+fn changed_tail(old: usize, new: usize) -> (std::ops::Range<usize>, usize) {
+    let start = old.min(new).saturating_sub(1);
+    (start..old, new - start)
 }
 
 fn can_run_live(harness: &HarnessKind) -> bool {
@@ -425,6 +448,7 @@ struct Loaded {
     breakdown: ContextBreakdown,
     changes: Vec<FileChange>,
     tasks: Vec<TaskRun>,
+    turns: std::collections::HashMap<String, Vec<model::TurnFile>>,
     git: Option<GitInfo>,
 }
 
@@ -585,6 +609,9 @@ pub struct Shell {
     month_cache: plan_view::MonthCache,
     /// The question before quitting while turns or terminals run.
     quit_ask: Option<quit_view::QuitAsk>,
+    /// The next message of this session starts a new one from the line `at`, before the
+    /// prompt shown at item `cut`.
+    branch: Option<(SessionKey, String, usize)>,
     /// The computer kept from sleeping while agents work.
     awake: crate::awake::Awake,
     /// A watched session wants its user (no key: the open one): on the next draw the
@@ -599,6 +626,11 @@ pub struct Shell {
     diff_view: Option<changes_view::DiffView>,
     /// A commit of the history opened in the centre.
     commit_view: Option<changes_view::CommitView>,
+    /// The files a turn changed, opened from its prompt.
+    turn_view: Option<turn_view::TurnView>,
+    /// What an account spent over the last weeks, opened from the plan.
+    spend_view: Option<spend_view::SpendView>,
+    spend_cache: spend_view::SpendCache,
     /// Turns the window runs, of any session; finished ones stay until their session is
     /// read again.
     runs: Vec<LiveRun>,
@@ -775,6 +807,7 @@ impl Shell {
             months: HashMap::new(),
             month_cache: Default::default(),
             quit_ask: None,
+            branch: None,
             awake: Default::default(),
             right_tab: Default::default(),
             files: Default::default(),
@@ -782,6 +815,9 @@ impl Shell {
             changes: Default::default(),
             diff_view: None,
             commit_view: None,
+            turn_view: None,
+            spend_view: None,
+            spend_cache: Default::default(),
             runs: Vec::new(),
             harness_versions: Default::default(),
             memory_link: Default::default(),
@@ -816,6 +852,7 @@ impl Shell {
                     this.poll_pinned_remote(cx);
                     this.retry_failures(cx);
                     this.keep_awake(cx);
+                    this.look_at_logins(cx);
                 });
                 if polled.is_err() {
                     break;
@@ -828,6 +865,64 @@ impl Shell {
 
     fn lib(&self) -> std::sync::MutexGuard<'_, Library> {
         self.library.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Redraws the window when the reader leaves the end of a conversation or comes back
+    /// to it, for the button that takes them down. Only those changes redraw: a scroll
+    /// otherwise draws the list alone.
+    pub(super) fn watch_scroll(&self, list: &ListState, cx: &mut Context<Self>) {
+        let shell = cx.entity().downgrade();
+        let seen = std::rc::Rc::new(std::cell::Cell::new((list.is_following_tail(), false)));
+        list.set_scroll_handler(move |event, _, cx| {
+            let now = (event.is_following_tail, event.visible_range.end >= event.count);
+            if seen.replace(now) != now {
+                shell.update(cx, |_, cx| cx.notify()).ok();
+            }
+        });
+    }
+
+    /// The round button over the end of a conversation the reader scrolled up from: it
+    /// takes them to the end, which the list then follows again.
+    fn render_jump_down(&self, list: &ListState, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Not following, yet at the bottom (the end was reached some other way than by the
+        // wheel): nothing to go down to.
+        let to_end = list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y;
+        if list.is_following_tail() || list.max_offset_for_scrollbar().y <= px(0.) || to_end <= px(4.) {
+            return None;
+        }
+        let list = list.clone();
+        Some(
+            div()
+                .absolute()
+                .bottom(px(14.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("jump-down")
+                        .size(px(34.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        // Solid over the text it sits on.
+                        .bg(Hsla { a: 1.0, ..theme.popup_bg })
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover))
+                        .child(icon("general/arrowDown", theme))
+                        .tooltip(|_, cx| tooltip(t("conversation.to_end"), None, cx))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            list.set_follow_mode(FollowMode::Tail);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn env_for(&self, id: &model::EnvId) -> Option<SharedEnv> {
@@ -1172,10 +1267,11 @@ impl Shell {
             let breakdown = ContextBreakdown::of(&transcript);
             let changes = transcript.changes();
             let tasks = transcript.tasks(false);
-            Ok::<_, String>((summary.key, transcript, offset, turn, items, breakdown, changes, tasks))
+            let turns = transcript.turn_files();
+            Ok::<_, String>((summary.key, transcript, offset, turn, items, breakdown, changes, tasks, turns))
         });
         cx.spawn(async move |this, cx| {
-            let Ok((key, transcript, offset, turn, items, breakdown, changes, tasks)) = task.await else { return };
+            let Ok((key, transcript, offset, turn, items, breakdown, changes, tasks, turns)) = task.await else { return };
             this.update(cx, |this, cx| {
                 if this.load_generation != generation || this.live_running() {
                     return;
@@ -1199,17 +1295,11 @@ impl Shell {
                 }
                 let Some(open) = &mut this.open else { return };
                 let (old, new) = (open.items.len(), items.len());
-                // The list follows the end by itself while the reader is there.
-                if new >= old && old > 0 {
-                    // The last item may have grown (a reply that went on); everything after is new.
-                    splice_in_place(&open.list, old - 1..old, new - old + 1);
-                } else {
-                    let top = open.list.logical_scroll_top();
-                    open.list.reset_with_uniform_height(new, ROW_HEIGHT_GUESS);
-                    if !open.list.is_following_tail() {
-                        open.list.scroll_to(top);
-                    }
-                }
+                // The list follows the end by itself while the reader is there. Only the end
+                // changes as a session grows: the last item may have grown (a reply that went
+                // on), or folded into the one before; the rows before keep their heights.
+                let (range, count) = changed_tail(old, new);
+                splice_in_place(&open.list, range, count);
                 open.items = Arc::new(items);
                 open.model = transcript.model.clone();
                 open.usage = transcript.total_usage;
@@ -1220,6 +1310,7 @@ impl Shell {
                 open.breakdown.take_memory(open.memory_tokens);
                 open.changes = changes;
                 open.tasks = tasks;
+                open.turns = Arc::new(turns);
                 open.failed = transcript.failed_turn.clone();
                 cx.notify();
             })
@@ -1683,6 +1774,10 @@ impl Shell {
         if self.selected.as_ref() == Some(&key) && (self.open.is_some() || self.loading) {
             return;
         }
+        // A branch begun in another session is given up.
+        self.branch = self.branch.take().filter(|(branched, ..)| *branched == key);
+        self.turn_view = self.turn_view.take().filter(|view| view.key() == &key);
+        self.spend_view = None;
         self.selected = Some(key.clone());
         // The user went to another session: the one a finished turn wanted to show again
         // stays where it is.
@@ -1714,12 +1809,13 @@ impl Shell {
             breakdown.take_memory(memory_tokens);
             let changes = transcript.changes();
             let tasks = transcript.tasks(false);
+            let turns = transcript.turn_files();
             let git = summary.cwd.as_deref().and_then(|cwd| env.git_info(cwd));
             if let Ok(library) = library.lock() {
                 let _ = library.index_session(&summary, &transcript.search_text_ends(INDEX_TEXT_BYTES));
                 let _ = library.set_started(&summary.key, &transcript.started_sessions());
             }
-            Ok::<_, String>((summary, Loaded { transcript, items, breakdown, memory_tokens, changes, tasks, git }))
+            Ok::<_, String>((summary, Loaded { transcript, items, breakdown, memory_tokens, changes, tasks, turns, git }))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -1741,17 +1837,16 @@ impl Shell {
                         }
                         this.switch_composer(Some(&summary), cx);
                         let list = conversation_list(loaded.items.len() + live_items);
+                        this.watch_scroll(&list, cx);
                         // The same session read again after a turn of the window keeps the
-                        // place the reader was at; a session opened anew shows its last item.
+                        // place the reader was at; a session opened anew shows its end and
+                        // follows it, as the list does from the start.
                         let before = this.open.as_ref().filter(|open| open.summary.key == summary.key).map(|open| &open.list);
                         let same = before.is_some();
-                        match before {
-                            Some(before) if before.is_following_tail() => {}
-                            Some(before) => list.scroll_to(before.logical_scroll_top()),
-                            None if !loaded.items.is_empty() => {
-                                list.scroll_to(ListOffset { item_ix: loaded.items.len() - 1, offset_in_item: px(0.) })
-                            }
-                            None => {}
+                        if let Some(before) = before
+                            && !before.is_following_tail()
+                        {
+                            list.scroll_to(before.logical_scroll_top());
                         }
                         // The same session read again keeps its blocks open and its selection.
                         if !same {
@@ -1769,6 +1864,7 @@ impl Shell {
                             breakdown: loaded.breakdown,
                             changes: loaded.changes,
                             tasks: loaded.tasks,
+                            turns: Arc::new(loaded.turns),
                             git: loaded.git,
                             follower: Arc::default(),
                             shown_offset: 0,
@@ -2097,7 +2193,13 @@ impl Shell {
             self.open_settings(settings_view::SettingsPage::General, window, cx);
             return;
         }
-        if stroke.key == "escape" && (self.commit_view.take().is_some() || self.diff_view.take().is_some() || self.preview.is_some()) {
+        if stroke.key == "escape"
+            && (self.commit_view.take().is_some()
+                || self.diff_view.take().is_some()
+                || self.preview.is_some()
+                || self.turn_view.take().is_some()
+                || self.spend_view.take().is_some())
+        {
             self.preview = None;
             cx.notify();
             return;
@@ -2275,6 +2377,12 @@ impl Shell {
     /// Whether the window runs a turn of this session now.
     fn runs_turn_of(&self, key: &SessionKey) -> bool {
         self.runs.iter().any(|run| !run.finished && !run.key.id.is_empty() && run.key == *key)
+    }
+
+    /// Whether the window's turn of this session has answered and waits only for what it
+    /// runs in the background.
+    fn runs_in_background(&self, key: &SessionKey) -> bool {
+        self.runs.iter().any(|run| !run.finished && run.resting && !run.background.is_empty() && !run.key.id.is_empty() && run.key == *key)
     }
 
     /// Pins a session to the group on top, or puts it back where it was. A pinned session
@@ -2751,7 +2859,24 @@ impl Shell {
                         .text_color(theme.text_muted)
                         .text_size(px(11.))
                         .when(!key.env.is_local(), |this| this.child(key.env.ssh_host().unwrap_or("").to_owned()))
+                        .when(key.harness == HarnessKind::Claude && self.pays_by_key(&key.env), |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("api-badge-{ix}")))
+                                    .px(px(4.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(theme.warning_mark)
+                                    .text_color(theme.warning_mark)
+                                    .text_size(px(10.))
+                                    .child(t("plan.api_badge"))
+                                    .tooltip(|_, cx| tooltip(t("plan.api_badge_tip"), None, cx)),
+                            )
+                        })
                         .child(match (running, row_status(row.turn, row.updated_ms, now_ms())) {
+                            (true, _) if self.runs_in_background(key) => {
+                                div().text_color(theme.text_secondary).child(t("status.background")).into_any_element()
+                            }
                             (true, _) | (false, Some(RowStatus::Working)) => {
                                 div().text_color(theme.accent).child(t("status.working")).into_any_element()
                             }
@@ -2942,8 +3067,15 @@ impl Shell {
         let list = list(open.list.clone(), cx.processor(|this, ix: usize, window, cx| this.render_item(ix, window, cx)))
             .size_full();
         let list = scrollable("conversation-scroll", &open.list, list, &theme, window, cx).size_full();
+        let jump_down = self.render_jump_down(&open.list, &theme, cx);
         let extensions = self.extensions_open.then(|| self.render_extensions(cx));
-        let preview = self.render_commit_view(cx).or_else(|| self.render_diff(cx)).or_else(|| self.render_preview(window, cx));
+        let preview = self
+            .render_commit_view(cx)
+            .or_else(|| self.render_diff(cx))
+            .or_else(|| self.render_preview(window, cx))
+            .or_else(|| self.render_turn_view(cx))
+            .or_else(|| self.render_spend_view(cx));
+        let turn_shown = self.turn_view_shown() || self.spend_view.is_some();
         let composer = self.render_composer(window, cx);
         pane.drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(theme.accent))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -2951,8 +3083,8 @@ impl Shell {
             }))
             .child(header)
             .when_some(preview, |this, preview| this.child(preview))
-            .when(self.preview.is_none() && self.diff_view.is_none() && self.commit_view.is_none(), |this| {
-                this.child(div().relative().flex_1().min_h_0().child(list).children(extensions))
+            .when(self.preview.is_none() && self.diff_view.is_none() && self.commit_view.is_none() && !turn_shown, |this| {
+                this.child(div().relative().flex_1().min_h_0().child(list).children(jump_down).children(extensions))
             })
             .child(composer)
     }
@@ -3041,6 +3173,43 @@ impl Shell {
             },
         };
         let user = item.role == Role::User && !item.compact_summary;
+        // A prompt of the history can start a branch, a new session before it, and shows
+        // the files its turn changed.
+        let can_branch = user
+            && ix < base.len()
+            && item.branch.is_some()
+            && open.summary.key.harness == HarnessKind::Claude
+            && !self.live_running();
+        let turn_files = (user && ix < base.len()).then(|| self.turn_files_of(ix)).flatten();
+        let action = |id: &'static str, label: String| {
+            div().id((id, ix)).px(px(6.)).rounded(px(5.)).hover(|style| style.bg(theme.hover).text_color(theme.text)).child(label)
+        };
+        let branch = (can_branch || turn_files.is_some()).then(|| {
+            div()
+                .id(("branch", ix))
+                .flex()
+                .justify_end()
+                .gap(px(4.))
+                .mt(px(4.))
+                .text_size(px(11.5))
+                .text_color(theme.text_muted)
+                .opacity(0.)
+                .group_hover("user-message", |style| style.opacity(1.))
+                .when_some(turn_files, |this, n| {
+                    this.child(
+                        action("turn-action", t("turn.action").replace("{n}", &n.to_string()))
+                            .tooltip(|_, cx| tooltip(t("turn.tip"), None, cx))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_turn(ix, cx))),
+                    )
+                })
+                .when(can_branch, |this| {
+                    this.child(
+                        action("branch-action", t("branch.action").to_owned())
+                            .tooltip(|_, cx| tooltip(t("branch.tip"), None, cx))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_branch(ix, window, cx))),
+                    )
+                })
+        });
         // A compaction summary is long and repeats what came before: folded until asked.
         let summary_open = item.compact_summary && self.open_summaries.contains(&ix);
         let mut column = div().flex().flex_col().gap(px(8.)).min_w_0();
@@ -3051,17 +3220,21 @@ impl Shell {
         }
         let content = if user {
             div()
+                .group("user-message")
                 .flex()
-                .justify_end()
+                .flex_col()
                 .child(
-                    div()
-                        .max_w(relative(0.82))
-                        .px(px(14.))
-                        .py(px(10.))
-                        .rounded(px(14.))
-                        .bg(theme.selection_muted)
-                        .child(column),
+                    div().flex().justify_end().child(
+                        div()
+                            .max_w(relative(0.82))
+                            .px(px(14.))
+                            .py(px(10.))
+                            .rounded(px(14.))
+                            .bg(theme.selection_muted)
+                            .child(column),
+                    ),
                 )
+                .children(branch)
                 .into_any_element()
         } else if item.role == Role::System {
             column.into_any_element()
@@ -4247,6 +4420,18 @@ fn parse_stats(out: &str) -> HashMap<String, (u64, i64)> {
             Some((parts.next()?.to_owned(), (size, seconds * 1000)))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tail_tests {
+    #[test]
+    fn only_the_end_of_a_growing_conversation_is_replaced() {
+        assert_eq!(super::changed_tail(10, 12), (9..10, 3), "the last row and two new ones");
+        assert_eq!(super::changed_tail(10, 10), (9..10, 1));
+        assert_eq!(super::changed_tail(10, 8), (7..10, 1), "rows folded into the one before");
+        assert_eq!(super::changed_tail(0, 5), (0..0, 5));
+        assert_eq!(super::changed_tail(4, 0), (0..4, 0));
+    }
 }
 
 #[cfg(test)]

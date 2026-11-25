@@ -64,7 +64,7 @@ impl Shell {
             .map(|run| {
                 let title = self.summary(&run.key).map_or_else(|| t("new_session").to_owned(), |summary| summary.title.clone());
                 match run.background.first().filter(|_| run.resting) {
-                    Some(task) => format!("{title} · {task}"),
+                    Some((task, _)) => format!("{title} · {}", task.description),
                     None => title,
                 }
             })

@@ -253,6 +253,8 @@ impl Shell {
         let Some(env) = self.env_for(&open.summary.key.env) else { return };
         self.diff_view = None;
         self.preview = Some(Preview { path: path.clone(), body: PreviewBody::Loading, scroll: UniformListScrollHandle::new() });
+        self.turn_view = None;
+        self.spend_view = None;
         let file = path.clone();
         let task = cx.background_spawn(async move {
             let size = env.stat(&file).map(|meta| meta.size).unwrap_or(0);

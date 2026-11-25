@@ -60,6 +60,12 @@ pub(crate) fn stop_task(input: &Input, tasks: &Tasks, call: &str) -> bool {
     input.send(&format!("{request}\n"))
 }
 
+/// Asks Claude to stop its task `task`; false when its input is closed.
+pub(crate) fn stop_task_id(input: &Input, task: &str) -> bool {
+    let request = json!({"type": "control_request", "request_id": format!("stop-{task}"), "request": {"subtype": "stop_task", "task_id": task}});
+    input.send(&format!("{request}\n"))
+}
+
 impl Input {
     pub(crate) fn new(sink: Sink) -> Self {
         Self(Arc::new(Mutex::new(Some(sink))))

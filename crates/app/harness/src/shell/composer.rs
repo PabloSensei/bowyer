@@ -38,10 +38,11 @@ pub(super) enum Command {
     Terminal,
     Resume,
     Compact,
+    Export,
 }
 
 impl Command {
-    const ALL: [Command; 8] = [
+    const ALL: [Command; 9] = [
         Command::New,
         Command::Model,
         Command::Permission,
@@ -50,6 +51,7 @@ impl Command {
         Command::Terminal,
         Command::Resume,
         Command::Compact,
+        Command::Export,
     ];
 
     fn name(self) -> &'static str {
@@ -62,6 +64,7 @@ impl Command {
             Command::Terminal => "terminal",
             Command::Resume => "resume",
             Command::Compact => "compact",
+            Command::Export => "export",
         }
     }
 
@@ -111,7 +114,7 @@ pub(super) struct Completion {
 pub(super) struct FolderIndex {
     key: Option<(EnvId, String)>,
     files: Option<Arc<Vec<String>>>,
-    commands: Option<Arc<Vec<(String, String)>>>,
+    commands: Option<Arc<Vec<history::HarnessCommand>>>,
     loading_files: bool,
     loading_commands: bool,
 }
@@ -197,36 +200,18 @@ fn walk(dir: &Path, prefix: &str, depth: u32, out: &mut Vec<String>) {
     }
 }
 
-/// Claude's own commands and skills, of the user and of the project: `(name, where from)`.
-fn list_commands(env: &SharedEnv, cwd: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let home = env.home().ok();
-    let mut roots = Vec::new();
-    if let Some(home) = &home {
-        roots.push((env.join(home, ".claude"), ("cmd.user_command", "cmd.user_skill")));
-    }
-    roots.push((env.join(cwd, ".claude"), ("cmd.project_command", "cmd.project_skill")));
-    for (root, (command_label, skill_label)) in roots {
-        let commands = env.join(&root, "commands");
-        for meta in env.find_files(&commands, ".md", 4).unwrap_or_default() {
-            let relative = meta.path.strip_prefix(commands.as_str()).unwrap_or(&meta.path);
-            let name = relative.trim_start_matches(['/', '\\']).trim_end_matches(".md").replace(['/', '\\'], ":");
-            if !name.is_empty() {
-                out.push((name, t(command_label).to_owned()));
-            }
-        }
-        let skills = env.join(&root, "skills");
-        for meta in env.find_files(&skills, "SKILL.md", 2).unwrap_or_default() {
-            let folder = meta.path.trim_end_matches("SKILL.md").trim_end_matches(['/', '\\']);
-            let name = folder.rsplit(['/', '\\']).next().unwrap_or("").to_owned();
-            if !name.is_empty() {
-                out.push((name, t(skill_label).to_owned()));
-            }
-        }
-    }
-    out.sort();
-    out.dedup_by(|a, b| a.0 == b.0);
-    out
+/// What the list shows beside a harness command: its hint and description, and where it
+/// comes from.
+fn command_detail(command: &history::HarnessCommand) -> String {
+    let from = match &command.source {
+        history::CommandSource::UserCommand => t("cmd.user_command").to_owned(),
+        history::CommandSource::ProjectCommand => t("cmd.project_command").to_owned(),
+        history::CommandSource::UserSkill => t("cmd.user_skill").to_owned(),
+        history::CommandSource::ProjectSkill => t("cmd.project_skill").to_owned(),
+        history::CommandSource::Plugin(name) => t("cmd.plugin").replace("{name}", name),
+    };
+    let about = [command.hint.as_deref().unwrap_or(""), command.description.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("  ");
+    if about.is_empty() { from } else { format!("{}  · {from}", model::shorten(&about, 140)) }
 }
 
 /// A picture of the clipboard in a format the models read: PNG, JPEG, WebP and GIF as they
@@ -404,7 +389,7 @@ impl Shell {
         }
         if want_commands && self.folder_index.commands.is_none() && !self.folder_index.loading_commands {
             self.folder_index.loading_commands = true;
-            let task = cx.background_spawn(async move { list_commands(&env, &cwd) });
+            let task = cx.background_spawn(async move { history::claude_commands(&*env, &cwd) });
             cx.spawn(async move |this, cx| {
                 let commands = task.await;
                 this.update(cx, |this, cx| {
@@ -450,13 +435,15 @@ impl Shell {
             if harness == HarnessKind::Claude {
                 self.ensure_index(true, cx);
                 if let Some(commands) = &self.folder_index.commands {
-                    items.extend(commands.iter().filter(|(name, _)| name.to_lowercase().contains(&query)).map(
-                        |(name, from)| Suggestion {
-                            label: format!("/{name}"),
-                            detail: from.clone(),
-                            choice: Choice::Insert(format!("/{name} ")),
-                        },
-                    ));
+                    // Names that start with the query first, then those that only contain it.
+                    let mut found: Vec<&history::HarnessCommand> =
+                        commands.iter().filter(|command| command.name.to_lowercase().contains(&query)).collect();
+                    found.sort_by_key(|command| !command.name.to_lowercase().starts_with(&query));
+                    items.extend(found.into_iter().map(|command| Suggestion {
+                        label: format!("/{}", command.name),
+                        detail: command_detail(command),
+                        choice: Choice::Insert(format!("/{} ", command.name)),
+                    }));
                 }
             }
             items.truncate(SHOWN * 4);
@@ -562,6 +549,7 @@ impl Shell {
                 let _ = (&env, &summary);
                 self.compact(cx);
             }
+            Command::Export => self.export_session(summary.key.clone(), cx),
         }
         cx.notify();
     }

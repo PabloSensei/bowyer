@@ -454,6 +454,8 @@ impl Shell {
             })
             .detach();
         }
+        let list = super::conversation_list(0);
+        self.watch_scroll(&list, cx);
         self.open = Some(OpenSession {
             git: summary.cwd.as_deref().filter(|_| local).and_then(|cwd| shared.as_ref().and_then(|env| env.git_info(cwd))),
             summary,
@@ -461,10 +463,11 @@ impl Shell {
             usage: Default::default(),
             cost_usd: None,
             items: Arc::new(Vec::new()),
-            list: super::conversation_list(0),
+            list,
             breakdown: Default::default(),
             changes: Vec::new(),
             tasks: Vec::new(),
+            turns: Default::default(),
             last_call_ms: None,
             usage_by_model: Vec::new(),
             follower: Default::default(),
@@ -575,6 +578,10 @@ impl Shell {
 
     pub(super) fn send(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.text.trim().to_owned();
+        if self.can_say() {
+            self.say(prompt, cx);
+            return;
+        }
         if self.live_running() {
             self.queue_prompt(prompt, cx);
             return;
@@ -610,7 +617,7 @@ impl Shell {
         // Claude Code on a host reaches Bowyer's memory through the window's tunnel.
         let mcp_config = if summary.key.harness == HarnessKind::Claude { self.turn_mcp_config(&summary.key.env, &cwd, cx) } else { None };
         let mcp_config = mcp_config.map(live::McpConfig::Text);
-        let spec = TurnSpec {
+        let mut spec = TurnSpec {
             harness: summary.key.harness.clone(),
             session,
             cwd,
@@ -622,10 +629,79 @@ impl Shell {
             attachments: Vec::new(),
             ide,
             drop_turn: if summary.key.harness == HarnessKind::Claude { self.turn_drop(&summary.key) } else { None },
+            fork_at: None,
             mcp_config,
         };
+        // A branch: a new session from the conversation before the prompt it was started
+        // at, which the view leaves out from now on; this session stays as it is.
+        let mut base = None;
+        if let Some((_, at, cut)) = self.branch.take().filter(|(key, ..)| *key == summary.key)
+            && summary.key.harness == HarnessKind::Claude
+            && spec.session.is_some()
+        {
+            spec.fork_at = Some(at);
+            spec.drop_turn = None;
+            if let Some(open) = &mut self.open
+                && cut <= open.items.len()
+            {
+                open.items = Arc::new(open.items[..cut].to_vec());
+                open.list.reset_with_uniform_height(cut, super::ROW_HEIGHT_GUESS);
+                base = Some(cut);
+            }
+        }
         let attached = std::mem::take(&mut self.attachments);
-        self.start_with_files(summary.key.clone(), spec, attached, true, None, cx);
+        self.start_with_files(summary.key.clone(), spec, attached, true, base, cx);
+    }
+
+    /// Starts a branch before the prompt at item `ix`: its text goes back into the composer
+    /// (unless something is typed there), and the next message starts the new session.
+    pub(super) fn start_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = &self.open else { return };
+        let Some((at, text)) = open.items.get(ix).and_then(|item| item.branch.clone()) else { return };
+        self.branch = Some((open.summary.key.clone(), at, ix));
+        if self.composer.text.trim().is_empty() {
+            self.composer = TextField::from_text(&text);
+        }
+        self.composer_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// The bar over the composer while the next message starts a branch.
+    fn render_branch_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.open.as_ref()?;
+        self.branch.as_ref().filter(|(key, ..)| *key == open.summary.key)?;
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .mb(px(8.))
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(8.))
+                .bg(theme.island_bg)
+                .border_1()
+                .border_color(theme.accent)
+                .text_size(px(12.5))
+                .child(div().flex_1().min_w_0().text_color(theme.text_secondary).child(t("branch.bar")))
+                .child(
+                    div()
+                        .id("branch-cancel")
+                        .flex_none()
+                        .px(px(10.))
+                        .py(px(3.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .hover(|style| style.bg(theme.hover))
+                        .child(t("branch.cancel"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.branch = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Starts a turn with its files: on an SSH host they go up first (with the memory's
@@ -698,6 +774,130 @@ impl Shell {
                 self.start_turn_from(key, spec, backup, from_composer, base, cx);
             }
         }
+    }
+
+    /// Whether a prompt typed now goes into the open session's running harness: Claude has
+    /// answered and runs on only for what it left in the background.
+    pub(super) fn can_say(&self) -> bool {
+        self.live().is_some_and(|live| !live.finished && !live.saying && live.resting && !live.background.is_empty() && live.spec.harness == HarnessKind::Claude) && !self.uploading
+    }
+
+    /// Sends a prompt into the open session's running harness, its files first up to the
+    /// host. The conversation shows it once the harness takes it; if the turn ends before,
+    /// it goes as the next turn.
+    fn say(&mut self, prompt: String, cx: &mut Context<Self>) {
+        let Some(ix) = self.live_ix() else { return };
+        if prompt.is_empty() && self.attachments.is_empty() {
+            return;
+        }
+        let attached = std::mem::take(&mut self.attachments);
+        self.composer = TextField::from_text("");
+        self.completion = None;
+        let run = &self.runs[ix];
+        let (id, stop) = (run.id, run.stop.clone());
+        let mut spec = run.spec.clone();
+        spec.prompt = prompt.clone();
+        spec.attachments = Vec::new();
+        let harness = spec.harness.clone();
+        let inline = move |a: &composer::Attached| harness == HarnessKind::Claude && a.picture.is_some();
+        let files = attached.clone();
+        self.runs[ix].said.push(super::Queued { text: prompt, attached });
+        self.runs[ix].saying = true;
+        let task = cx.background_spawn(async move {
+            let mut out = Vec::new();
+            for a in files {
+                let path = match &spec.ssh {
+                    Some(ssh) if !inline(&a) => ssh.upload(&a.local, &format!("{}-{}", now_ms(), a.name))?,
+                    _ if inline(&a) => a.name.clone(),
+                    _ => a.local.to_string_lossy().into_owned(),
+                };
+                out.push(live::Attachment { path, image: a.picture.map(|(media, bytes, _)| (media, bytes)) });
+            }
+            spec.attachments = out;
+            Ok::<_, std::io::Error>(stop.say(&spec))
+        });
+        cx.spawn(async move |this, cx| {
+            let sent = task.await;
+            this.update(cx, |this, cx| {
+                let Some(run) = this.runs.iter_mut().find(|run| run.id == id) else { return };
+                run.saying = false;
+                match sent {
+                    Ok(true) => {}
+                    // The input closed meanwhile, or a file did not go up: the prompt waits
+                    // for the end of the turn like a queued one.
+                    Ok(false) | Err(_) => {
+                        if let Some(prompt) = run.said.pop() {
+                            run.queued.insert(0, prompt);
+                        }
+                        if let Err(error) = sent {
+                            this.status = Some(format!("{}: {error}", t("error")));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Stops one command of the open session's turn that runs in the background.
+    fn stop_background(&mut self, task: String, cx: &mut Context<Self>) {
+        let Some(live) = self.live() else { return };
+        let stop = live.stop.clone();
+        // Over SSH the request is a round trip to the host: off the window's thread.
+        cx.background_spawn(async move { stop.stop_background(&task) }).detach();
+    }
+
+    /// What the open session's turn runs in the background, above the composer, each with
+    /// how long it has run and a button that stops it.
+    fn render_background(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let live = self.live().filter(|live| !live.finished && !live.background.is_empty())?;
+        // The times move: repaint every few seconds.
+        self.repaint_after(std::time::Duration::from_secs(5), cx);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .mb(px(8.))
+                .child(div().text_size(px(11.5)).text_color(theme.text_muted).child(t("live.background").replace("{n}", &live.background.len().to_string())))
+                .children(live.background.iter().enumerate().map(|(at, (task, since))| {
+                    let id = task.id.clone();
+                    let minutes = since.elapsed().as_secs() / 60;
+                    let age = if minutes == 0 { format!("{}s", since.elapsed().as_secs()) } else { format!("{minutes} min") };
+                    let label = if task.description.is_empty() { task.id.clone() } else { task.description.clone() };
+                    div()
+                        .id(("background", at))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(theme.island_bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(12.5))
+                        .child(div().flex_none().size(px(6.)).rounded_full().bg(theme.accent))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .child(div().flex_none().font_family(super::MONO).text_size(px(11.5)).text_color(theme.text_muted).child(age))
+                        .child(
+                            div()
+                                .id(("background-stop", at))
+                                .flex_none()
+                                .px(px(6.))
+                                .rounded(px(5.))
+                                .text_color(theme.text_muted)
+                                .hover(|style| style.bg(theme.hover).text_color(theme.error))
+                                .child("×")
+                                .tooltip(|_, cx| tooltip(t("live.background_stop"), None, cx))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.stop_background(id.clone(), cx))),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     /// A prompt sent while the open session's turn runs: it waits for the end of the turn,
@@ -856,6 +1056,8 @@ impl Shell {
             asks: Vec::new(),
             resting: false,
             background: Vec::new(),
+            said: Vec::new(),
+            saying: false,
             stopping: Vec::new(),
             picks: Default::default(),
             texts: Default::default(),
@@ -1252,15 +1454,27 @@ impl Shell {
                 // where they read otherwise.
                 if shown && let Some(open) = &self.open {
                     let base = open.items.len();
-                    super::splice_in_place(&open.list, base..base + old, new);
-                    if new > 0 {
-                        open.list.remeasure_items(base + new - 1..base + new);
-                    }
+                    let (range, count) = super::changed_tail(old, new);
+                    super::splice_in_place(&open.list, base + range.start..base + range.end, count);
                 }
             }
             LiveEvent::Stderr(text) => live.stderr = text,
             LiveEvent::Resting(now) => live.resting = now,
-            LiveEvent::Background(tasks) => live.background = tasks,
+            LiveEvent::Background(tasks) => {
+                let known = std::mem::take(&mut live.background);
+                live.background = tasks
+                    .into_iter()
+                    .map(|task| {
+                        let since = known.iter().find(|(old, _)| old.id == task.id).map_or_else(std::time::Instant::now, |(_, since)| *since);
+                        (task, since)
+                    })
+                    .collect();
+            }
+            LiveEvent::Heard => {
+                if !live.said.is_empty() {
+                    live.said.remove(0);
+                }
+            }
             LiveEvent::Permission(ask) => {
                 live.asks.push(ask);
                 let key = live.key.clone();
@@ -1277,7 +1491,8 @@ impl Shell {
                 // A turn that left a failed one out has done it: the ones after go on as usual.
                 let dropped = ok && live.spec.drop_turn.take().is_some();
                 let forget = dropped.then(|| key.clone());
-                let mut queued = std::mem::take(&mut live.queued);
+                let mut queued = std::mem::take(&mut live.said);
+                queued.append(&mut live.queued);
                 let follow = (ok && !queued.is_empty() && !key.id.is_empty()).then(|| live.spec.clone());
                 // The turn after follows the history and this turn's items.
                 let base = self.open.as_ref().filter(|_| shown).map(|open| open.items.len() + self.runs[ix].items.len());
@@ -1454,8 +1669,11 @@ impl Shell {
             // Repaint once a second for the timer.
             self.repaint_after(std::time::Duration::from_secs(1), cx);
         }
-        // While a turn runs, a typed prompt can wait for its end beside the Stop button.
-        let queue = (running && !self.composer.text.trim().is_empty()).then(|| {
+        // While a turn runs, a typed prompt can wait for its end beside the Stop button; once
+        // the harness has answered and waits for its background work, it goes in at once.
+        let typed = !self.composer.text.trim().is_empty() || !self.attachments.is_empty();
+        let say = self.can_say();
+        let queue = (running && typed).then(|| {
             div()
                 .id("send-next")
                 .flex()
@@ -1468,8 +1686,9 @@ impl Shell {
                 .text_color(theme.accent)
                 .font_weight(FontWeight::MEDIUM)
                 .hover(|style| style.bg(theme.hover))
-                .child(t("live.queue"))
-                .tooltip(|_, cx| tooltip(t("live.queue_tip"), Some("Enter".into()), cx))
+                .when(say, |this| this.bg(theme.accent).text_color(theme.over_accent))
+                .child(t(if say { "live.send" } else { "live.queue" }))
+                .tooltip(move |_, cx| tooltip(t(if say { "live.say_tip" } else { "live.queue_tip" }), Some("Enter".into()), cx))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send(cx)))
         });
         let action = if running {
@@ -1528,6 +1747,8 @@ impl Shell {
         let attachments = self.render_attachments(&theme, cx);
         let asks = self.render_asks(&theme, window, cx);
         let queued = self.render_queued(&theme, cx);
+        let background = self.render_background(&theme, cx);
+        let branch = self.render_branch_bar(&theme, cx);
         let failed = self.render_failed_turn(&theme, cx);
         div()
             .id("composer-area")
@@ -1537,6 +1758,8 @@ impl Shell {
             .border_color(theme.border)
             .children(asks)
             .children(failed)
+            .children(branch)
+            .children(background)
             .children(queued)
             .child(
                 div()
@@ -1760,6 +1983,7 @@ mod tests {
             attachments: Vec::new(),
             ide: None,
             drop_turn: None,
+            fork_at: None,
             mcp_config: None,
         };
         let next = queued_spec(spec.clone(), Some("claude-haiku-5-5".into()), Some(String::new()), Permission::Bypass);

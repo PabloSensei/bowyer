@@ -440,6 +440,7 @@ mod tests {
             attachments: vec![Attachment { path: "/w/app/notes.txt".into(), image: None }],
             ide: None,
             drop_turn: None,
+            fork_at: None,
             mcp_config: None,
         }
     }

@@ -286,6 +286,12 @@ pub const RUN_STARTED: &str = "bowyer-run-started";
 /// without it, the connection dropped while the run went on.
 pub const RUN_END: &str = "bowyer-run-end";
 
+/// The `awk` program that watches the output of an answered run and ends (and with it the
+/// run's input) at a result while nothing runs in the background, or when the last
+/// background command ends after a result. Lines of tools hold their JSON escaped, so a
+/// `"subtype"` there never matches; a result line is the one with `"total_cost_usd"`.
+const RESULT_WATCH: &str = r#"/"type": *"result"/ && /"total_cost_usd"/ { done = 1; if (!busy) exit } /"subtype": *"background_tasks_changed"/ { busy = ($0 !~ /"tasks": *\[ *\]/); if (done && !busy) exit }"#;
+
 /// The system's own files of host keys, which an option naming Bowyer's file must keep.
 #[cfg(windows)]
 const GLOBAL_KNOWN_HOSTS: &str = r"__PROGRAMDATA__\ssh/ssh_known_hosts __PROGRAMDATA__\ssh/ssh_known_hosts2";
@@ -545,10 +551,11 @@ impl SshEnvironment {
     }
 
     /// [`Self::detached`] for a harness that is answered while it runs (Claude Code's
-    /// permission questions): its standard input follows the input file, where
-    /// [`Self::append_input`] adds lines from later connections. The host itself ends that
-    /// input at the first `result` line of the output, so the harness ends after its turn
-    /// even when the connection is gone.
+    /// permission questions, and prompts sent while a command of it runs in the
+    /// background): its standard input follows the input file, where [`Self::append_input`]
+    /// adds lines from later connections. The host itself ends that input at a `result`
+    /// line of the output when nothing runs in the background, or later when the last such
+    /// command ends, so the harness ends after its turn even when the connection is gone.
     pub fn detached_answered(&self, program: &str, args: &[&str], cwd: Option<&str>, run: &str) -> Command {
         self.detached_run(program, args, cwd, run, true)
     }
@@ -571,16 +578,21 @@ impl SshEnvironment {
         let login = format!("\"${{SHELL:-sh}}\" -lc {}", shell_quote(&harness));
         let job = if answered {
             // A pipe fed by `tail -f` of the input file; a second `tail` watches the output
-            // and ends the feed at the turn's result. Both end with the job (`--pid`). The
-            // key order of a line changes between Claude versions, so `"type":"result"` is
-            // looked for anywhere in it, with `"total_cost_usd"`, a key only the result line
-            // has: a tool's input or output is JSON too and may hold the first one. One
-            // `grep` only: the pipeline ends when `tail` sees its reader gone, and a second
-            // `grep` between them would keep reading.
+            // and ends the feed at the turn's result, or, while something runs in the
+            // background (Claude's `background_tasks_changed` with tasks in it), once nothing
+            // does after a result. Both end with the job (`--pid`). The key order of a line
+            // changes between Claude versions, so `"type":"result"` is looked for anywhere
+            // in it, with `"total_cost_usd"`, a key only the result line has: a tool's input
+            // or output is JSON too and may hold the first one. One `awk` only: the pipeline
+            // ends when `tail` sees its reader gone, and a second reader between them would
+            // keep reading. `mawk` (Debian's and Ubuntu's `awk`) fills its buffer before it
+            // reads a line unless it runs interactive: measured, it saw a line only at the
+            // end of its input.
             format!(
                 "rm -f \"$1.fifo\"; mkfifo \"$1.fifo\" || exit 1; \
                  tail -n +1 -f --pid=$$ \"$1.in\" > \"$1.fifo\" & feed=$!; \
-                 (tail -n +1 -F --pid=$$ \"$1.out\" 2>/dev/null | grep -q -E '\"type\": *\"result\".*\"total_cost_usd\"|\"total_cost_usd\".*\"type\": *\"result\"' && kill $feed 2>/dev/null) & \
+                 a=awk; awk -W version </dev/null 2>&1 | grep -q mawk && a='awk -W interactive'; \
+                 (tail -n +1 -F --pid=$$ \"$1.out\" 2>/dev/null | $a '{RESULT_WATCH}' && kill $feed 2>/dev/null) & \
                  {login} < \"$1.fifo\" > \"$1.out\" 2> \"$1.err\"; code=$?; kill $feed 2>/dev/null; rm -f \"$1.fifo\"; echo $code > \"$1.code\""
             )
         } else {
@@ -1328,7 +1340,8 @@ mod tests {
         let command = SshEnvironment::new("vm").detached_answered("claude", &["-p"], None, "17-43");
         let script = command.get_args().last().unwrap().to_string_lossy().into_owned();
         assert!(script.contains("mkfifo"), "{script}");
-        assert!(script.contains(r#"grep -q -E '\''"type": *"result".*"total_cost_usd"|"total_cost_usd".*"type": *"result"'\''"#), "{script}");
+        assert!(script.contains(r#"$a '\''/"type": *"result"/ && /"total_cost_usd"/"#), "{script}");
+        assert!(script.contains("a='\\''awk -W interactive'\\''"), "mawk reads line by line: {script}");
         assert!(script.contains(r#"cat > "$f.in""#), "{script}");
     }
 
@@ -1370,6 +1383,46 @@ mod tests {
         let _ = ssh.script_text(&format!("rm -f \"$HOME/.cache/bowyer/runs/{run}\".*"));
         assert!(out.contains(r#""prompt": "the prompt", "answer": "yes""#), "{out}");
         assert!(out.contains(r#"{"type": "eof", "rest": ""}"#), "its input ended at the result: {out}");
+        assert_eq!(out.lines().last(), Some("0"), "{out}");
+    }
+
+    /// While something runs in the background, the input stays open past a result: a
+    /// prompt added then reaches the harness, and the input ends once nothing runs in the
+    /// background, with the connection gone. Same host as above.
+    #[test]
+    #[ignore = "needs an SSH host with python3"]
+    fn an_answered_turn_keeps_its_input_while_a_command_runs_in_the_background() {
+        use std::io::{BufRead, Write};
+        let host = std::env::var("BOWYER_SSH_HOST").expect("BOWYER_SSH_HOST");
+        let key = std::env::var_os("BOWYER_SSH_KEY").map(PathBuf::from);
+        let ssh = SshEnvironment::new(&host).with_identity(key);
+        let run = format!("background-{}", std::process::id());
+        let stub = "import json, sys\n\
+            prompt = sys.stdin.readline().strip()\n\
+            print(json.dumps({'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': [{'task_id': 'b1'}]}), flush=True)\n\
+            print(json.dumps({'type': 'result', 'total_cost_usd': 0, 'prompt': prompt}), flush=True)\n\
+            later = sys.stdin.readline().strip()\n\
+            print(json.dumps({'type': 'result', 'total_cost_usd': 0, 'later': later}), flush=True)\n\
+            print(json.dumps({'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []}), flush=True)\n\
+            print(json.dumps({'type': 'eof', 'rest': sys.stdin.read()}), flush=True)\n";
+        let mut command = ssh.detached_answered("python3", &["-u", "-c", stub], None, &run);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"the prompt\n").unwrap();
+        drop(stdin);
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(lines.nth(1).unwrap().unwrap().contains("the prompt"));
+        // Time for the watcher to see the result, were it to close the input there.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        ssh.append_input(&run, b"sent later\n").unwrap();
+        child.kill().unwrap();
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let out = ssh.script_text(&format!("cat \"$HOME/.cache/bowyer/runs/{run}.out\"; echo; cat \"$HOME/.cache/bowyer/runs/{run}.code\"")).unwrap();
+        let _ = ssh.script_text(&format!("rm -f \"$HOME/.cache/bowyer/runs/{run}\".*"));
+        assert!(out.contains(r#""later": "sent later""#), "a prompt past the result went in: {out}");
+        assert!(out.contains(r#"{"type": "eof", "rest": ""}"#), "its input ended once nothing ran in the background: {out}");
         assert_eq!(out.lines().last(), Some("0"), "{out}");
     }
 

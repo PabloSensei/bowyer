@@ -37,14 +37,18 @@ const SKIPPED_TYPES: [&str; 6] = [
     "\"type\":\"frame-link\"",
 ];
 
-fn skipped(line: &str) -> bool {
+fn skipped(line: &str, files: bool) -> bool {
     let mut end = line.len().min(160);
     while !line.is_char_boundary(end) {
         end -= 1;
     }
     let head = &line[..end];
-    SKIPPED_TYPES.iter().any(|marker| head.contains(marker))
+    SKIPPED_TYPES.iter().filter(|marker| !(files && **marker == FILE_HISTORY)).any(|marker| head.contains(marker))
 }
+
+/// The file history's lines: a scan skips them, a whole read keeps them for the changes of
+/// each turn.
+const FILE_HISTORY: &str = "\"type\":\"file-history";
 
 /// What a scan learns from the lines it reads.
 #[derive(Default)]
@@ -180,6 +184,11 @@ fn is_human_prompt(value: &Value) -> bool {
 }
 
 fn parse_lines(text: &str, skip_first: bool, skip_last: bool) -> impl Iterator<Item = Value> + '_ {
+    parse_lines_with(text, skip_first, skip_last, false)
+}
+
+/// [`parse_lines`], keeping the file history's lines when `files` says so.
+fn parse_lines_with(text: &str, skip_first: bool, skip_last: bool, files: bool) -> impl Iterator<Item = Value> + '_ {
     let mut lines: Vec<&str> = text.split('\n').collect();
     if skip_last {
         lines.pop();
@@ -188,7 +197,7 @@ fn parse_lines(text: &str, skip_first: bool, skip_last: bool) -> impl Iterator<I
     lines
         .into_iter()
         .skip(start)
-        .filter(|line| !line.trim().is_empty() && !skipped(line))
+        .filter(move |line| !line.trim().is_empty() && !skipped(line, files))
         .filter_map(|line| serde_json::from_str(line).ok())
 }
 
@@ -529,6 +538,7 @@ impl ClaudeParser {
                 });
             }
         }
+        "file-history-snapshot" => self.take_snapshot(value),
         "system" => {
             let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
             let text = match subtype {
@@ -604,6 +614,9 @@ impl ClaudeParser {
                 self.calls.retain(|_, (entry, _)| *entry < start);
             }
         }
+        if prompt && !parent.is_empty() {
+            self.transcript.branch_points.push((uuid.to_owned(), parent.to_owned()));
+        }
         if prompt {
             self.last_prompt = (!parent.is_empty()).then(|| PromptTurn {
                 prompt: uuid.to_owned(),
@@ -612,6 +625,35 @@ impl ClaudeParser {
                 lines: HashSet::from([uuid.to_owned()]),
                 ..Default::default()
             });
+        }
+    }
+
+    /// A line of Claude Code's file history: the files it tracks when a prompt comes. An
+    /// update adds the files first changed during that prompt's turn, as they were before.
+    fn take_snapshot(&mut self, value: &Value) {
+        let Some(prompt) = value.get("messageId").and_then(Value::as_str).filter(|id| !id.is_empty()) else { return };
+        let Some(tracked) = value.pointer("/snapshot/trackedFileBackups").and_then(Value::as_object) else { return };
+        let files = tracked.iter().map(|(key, backup)| {
+            // The key is the path as Claude named it, often under the session's folder; the
+            // folder it really is in comes beside it.
+            let name = key.rsplit(['/', '\\']).next().unwrap_or(key);
+            let path = match backup.get("realParentDir").and_then(Value::as_str) {
+                Some(dir) => format!("{}{}{name}", dir.trim_end_matches(['/', '\\']), if dir.contains('\\') { '\\' } else { '/' }),
+                None => key.clone(),
+            };
+            model::SnapshotFile { path, backup: backup.get("backupFileName").and_then(Value::as_str).map(str::to_owned) }
+        });
+        let snapshots = &mut self.transcript.file_snapshots;
+        match snapshots.iter_mut().find(|snapshot| snapshot.prompt == prompt) {
+            Some(snapshot) => {
+                for file in files {
+                    match snapshot.files.iter_mut().find(|known| known.path == file.path) {
+                        Some(known) => *known = file,
+                        None => snapshot.files.push(file),
+                    }
+                }
+            }
+            None => snapshots.push(model::FileSnapshot { prompt: prompt.to_owned(), files: files.collect() }),
         }
     }
 
@@ -687,7 +729,7 @@ impl ClaudeFollower {
     fn feed(&mut self, bytes: &[u8]) {
         let Some(end) = bytes.iter().rposition(|&b| b == b'\n') else { return };
         let text = String::from_utf8_lossy(&bytes[..=end]);
-        for value in parse_lines(&text, false, false) {
+        for value in parse_lines_with(&text, false, false, true) {
             self.turn = turn_after(&value).or(self.turn);
             self.parser.feed(&value);
         }
@@ -785,7 +827,7 @@ fn task_line(summary: &str) -> String {
 /// The whole transcript of a session file.
 pub fn parse_transcript(text: &str) -> Transcript {
     let mut parser = ClaudeParser::new();
-    for value in parse_lines(text, false, false) {
+    for value in parse_lines_with(text, false, false, true) {
         parser.feed(&value);
     }
     parser.finish()
@@ -1083,6 +1125,53 @@ Task 0.16: previews"), "Task 0.16: previews");
         let last = transcript.entries.last().unwrap();
         assert_eq!(last.role, Role::System);
         assert!(matches!(&last.blocks[0], Block::Notice { text } if text == "⌘ /model haiku"));
+    }
+
+    /// Every prompt but the first knows the line it hangs under: a branch starts there.
+    #[test]
+    fn each_prompt_knows_where_a_branch_before_it_starts() {
+        let text = [
+            r#"{"type":"user","uuid":"p1","parentUuid":null,"message":{"role":"user","content":"Remember APPLE."}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"p1","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"OK"}]}}"#,
+            r#"{"type":"user","uuid":"p2","parentUuid":"a1","message":{"role":"user","content":"Remember BANANA."}}"#,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"p2","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"OK"}]}}"#,
+        ]
+        .join("\n");
+        let transcript = parse_transcript(&text);
+        assert_eq!(transcript.branch_points, vec![("p2".to_owned(), "a1".to_owned())]);
+    }
+
+    /// The file history's lines give each prompt its tracked files: an update adds the files
+    /// first edited during the turn, and each file sits in the folder Claude says it is in.
+    #[test]
+    fn the_file_history_follows_each_prompt() {
+        let text = [
+            r#"{"type":"file-history-snapshot","messageId":"p1","isSnapshotUpdate":false,"snapshot":{"messageId":"p1","trackedFileBackups":{}}}"#,
+            r#"{"type":"user","uuid":"p1","parentUuid":null,"message":{"role":"user","content":"Fix it."}}"#,
+            r#"{"type":"file-history-snapshot","messageId":"p1","isSnapshotUpdate":true,"snapshot":{"messageId":"p1","trackedFileBackups":{"src/a.rs":{"backupFileName":"h@v1","version":1,"realParentDir":"/home/u/p/src"},"/home/u/p/new.md":{"backupFileName":null,"version":1,"realParentDir":"/home/u/p"}}}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"p1","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Done"}]}}"#,
+            r#"{"type":"file-history-snapshot","messageId":"p2","isSnapshotUpdate":false,"snapshot":{"messageId":"p2","trackedFileBackups":{"src/a.rs":{"backupFileName":"h@v2","version":2,"realParentDir":"/home/u/p/src"}}}}"#,
+        ]
+        .join("\n");
+        let mut transcript = parse_transcript(&text);
+        // The order of a JSON object's keys depends on serde_json's features.
+        for snapshot in &mut transcript.file_snapshots {
+            snapshot.files.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        assert_eq!(
+            transcript.file_snapshots,
+            vec![
+                model::FileSnapshot {
+                    prompt: "p1".into(),
+                    files: vec![
+                        model::SnapshotFile { path: "/home/u/p/new.md".into(), backup: None },
+                        model::SnapshotFile { path: "/home/u/p/src/a.rs".into(), backup: Some("h@v1".into()) },
+                    ],
+                },
+                model::FileSnapshot { prompt: "p2".into(), files: vec![model::SnapshotFile { path: "/home/u/p/src/a.rs".into(), backup: Some("h@v2".into()) }] },
+            ]
+        );
+        assert!(parse_lines(&text, false, false).all(|value| value["type"] != "file-history-snapshot"), "a scan still skips them");
     }
 
     #[test]

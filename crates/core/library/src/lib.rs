@@ -125,7 +125,13 @@ const MIGRATIONS: &[&str] = &[
     INSERT OR REPLACE INTO digest_rows (session_key, row) SELECT session_key, rowid FROM digest_search ORDER BY rowid;
     DELETE FROM digest_search WHERE rowid NOT IN (SELECT row FROM digest_rows);
     "#,
+    // How full each window of a subscription's limits was when the window looked, per
+    // account (`<env>|<harness>`): the history of the five-hour and weekly windows.
+    "CREATE TABLE limit_samples (account TEXT NOT NULL, at_ms INTEGER NOT NULL, kind TEXT NOT NULL, percent REAL NOT NULL, PRIMARY KEY (account, at_ms, kind));",
 ];
+
+/// How long samples of the limits are kept.
+const LIMIT_SAMPLES_KEPT_MS: i64 = 60 * 86_400_000;
 
 /// The row of a session in a full-text table, through its table of rows (`search_rows`,
 /// `digest_rows`).
@@ -634,6 +640,26 @@ impl Library {
             .flatten()
     }
 
+    /// Keeps how full the windows of an account's limits are at `at_ms`: `(kind, percent)`.
+    /// Samples older than two months go.
+    pub fn add_limit_samples(&self, account: &str, at_ms: i64, windows: &[(String, f64)]) -> Result<()> {
+        for (kind, percent) in windows {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO limit_samples (account, at_ms, kind, percent) VALUES (?1, ?2, ?3, ?4)",
+                params![account, at_ms, kind, percent],
+            )?;
+        }
+        self.connection.execute("DELETE FROM limit_samples WHERE at_ms < ?1", [at_ms - LIMIT_SAMPLES_KEPT_MS])?;
+        Ok(())
+    }
+
+    /// The samples of an account's limits from `since_ms` on, oldest first: `(at, kind, percent)`.
+    pub fn limit_samples(&self, account: &str, since_ms: i64) -> Result<Vec<(i64, String, f64)>> {
+        let mut statement = self.connection.prepare("SELECT at_ms, kind, percent FROM limit_samples WHERE account = ?1 AND at_ms >= ?2 ORDER BY at_ms")?;
+        let rows = statement.query_map(params![account, since_ms], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.connection.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", params![key, value])?;
         Ok(())
@@ -672,6 +698,21 @@ mod tests {
     use super::*;
     use model::{EnvId, HarnessKind, SourceStamp};
 
+    /// Samples of the limits come back oldest first from a time on; old ones go.
+    #[test]
+    fn limit_samples_are_kept_per_account() {
+        let library = Library::in_memory().unwrap();
+        let day = 86_400_000;
+        library.add_limit_samples("local|claude", 100 * day, &[("five_hours".into(), 10.0), ("week".into(), 3.0)]).unwrap();
+        library.add_limit_samples("local|claude", 101 * day, &[("five_hours".into(), 40.0)]).unwrap();
+        library.add_limit_samples("ssh:edge|claude", 101 * day, &[("five_hours".into(), 99.0)]).unwrap();
+        let samples = library.limit_samples("local|claude", 0).unwrap();
+        assert_eq!(samples, vec![(100 * day, "five_hours".to_owned(), 10.0), (100 * day, "week".to_owned(), 3.0), (101 * day, "five_hours".to_owned(), 40.0)]);
+        assert_eq!(library.limit_samples("local|claude", 101 * day).unwrap().len(), 1);
+        library.add_limit_samples("local|claude", 170 * day, &[("five_hours".into(), 1.0)]).unwrap();
+        assert_eq!(library.limit_samples("local|claude", 0).unwrap().len(), 1, "two months on, the old ones are gone");
+    }
+
     #[test]
     fn a_setting_goes_away_when_removed() {
         let library = Library::in_memory().unwrap();
@@ -687,10 +728,11 @@ mod tests {
     #[test]
     fn the_full_text_rows_are_found_by_their_table_of_rows() {
         let connection = Connection::open_in_memory().unwrap();
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        let rows_at = MIGRATIONS.iter().position(|migration| migration.contains("CREATE TABLE search_rows")).unwrap();
+        for migration in &MIGRATIONS[..rows_at] {
             connection.execute_batch(migration).unwrap();
         }
-        connection.pragma_update(None, "user_version", MIGRATIONS.len() as i64 - 1).unwrap();
+        connection.pragma_update(None, "user_version", rows_at as i64).unwrap();
         let key = summary("a", "Parser fix", "/w", 1).key.encode();
         for title in ["stale twin", "Parser fix"] {
             connection

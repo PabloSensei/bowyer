@@ -57,7 +57,7 @@
 - **Your files stay yours.** Bowyer only reads what the harnesses write. Folders, pins, names and notes live in Bowyer's own database; your agents keep working exactly as before, with or without the window open.
 - **See what a session really costs.** The context window split by what fills it, token totals, cost at API prices, and whether the prompt cache is still warm, so you know when compacting pays off.
 - **Keep going from the window.** Type a message and the harness runs the turn in the background, here or on an SSH host. Every session has its own turn, composer, model and effort, so several can run at once. The answer streams in; turns start with every permission allowed (one click switches to the harness's own settings or to accepting edits only), and questions show up as buttons, not as a terminal you have to find.
-- **Know where your plan stands.** For a Claude subscription the side panel shows the five-hour and weekly limits with their reset times; for an API key, what this month cost.
+- **Know where your plan stands.** For a Claude subscription the side panel shows the five-hour and weekly limits with their reset times; for an API key, what this month cost. Each machine shows how its Claude Code is signed in, and sessions that pay by API key are marked in the tree. *History* shows the last 30 days at API prices by day, week, project and session, and how full the limits were hour by hour.
 
 ## Features
 
@@ -77,7 +77,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>A chat, not a terminal dump</h3>
-      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so does the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills, <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next; <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag. A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
+      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so does the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills (the user's, the project's and those of plugins turned on, with their descriptions), <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next, or straight in while Claude Code waits for a command it left in the background (shown above the composer, each with its own stop); <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag and a button that takes you back to the end. <i>Branch from here</i> under a prompt of a Claude Code session starts a new session from the conversation before it, and <i>Changes of this turn</i> shows what the answer did to each file, from Claude Code's own backups, with an undo of the whole turn (what the files were goes to the trash first). A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
     </td>
   </tr>
   <tr>
@@ -111,6 +111,7 @@ And more:
 - **Stays awake while agents work.** While a turn runs, an agent's background command goes on, or a terminal is busy, the computer does not go to sleep (the screen may still turn off). One switch in the settings turns it off.
 - **Themes.** Seven built in (Dark, Light, High Contrast, Retro, Nord, Mocha, Paper), your own as JSON with a live editor, and import of VS Code themes and IntelliJ `.icls` schemes. The interface speaks English, Simplified Chinese, Spanish, Brazilian Portuguese, German, French, Japanese and Russian.
 - **Stays out of the way.** Closing the window can keep Bowyer in the notification area, watching your sessions: on Windows, and on Linux desktops whose panel shows tray icons (StatusNotifierItem: KDE, GNOME with the AppIndicator extension, waybar and others).
+- **Export to Markdown.** A session from its menu or with `/export`: what was said, with each tool call folded under its summary.
 - **Updates itself** from a signed feed: it checks on start and twice a day, and installs only when you click.
 
 ## Install

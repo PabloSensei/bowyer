@@ -210,6 +210,32 @@ pub fn parse_diff(text: &str) -> FileDiff {
     diff
 }
 
+/// The diff of two texts of a file, as git would show it: what a turn did to a file whose
+/// before and after came from a harness's backups, not from git. `None` stands for a file
+/// that did not exist; bytes that are not text make a binary diff.
+pub fn text_diff(path: &str, before: Option<&[u8]>, after: Option<&[u8]>) -> FileDiff {
+    let side = |bytes: Option<&[u8]>, prefix: &str| if bytes.is_some() { format!("{prefix}/{path}") } else { "/dev/null".to_owned() };
+    let (old, new) = (side(before, "a"), side(after, "b"));
+    let mut header = vec![format!("diff --git a/{path} b/{path}")];
+    if before.is_none() {
+        header.push("new file".to_owned());
+    } else if after.is_none() {
+        header.push("deleted file".to_owned());
+    }
+    let binary = [before, after].into_iter().flatten().any(|bytes| bytes.contains(&0) || std::str::from_utf8(bytes).is_err());
+    if binary {
+        header.push(format!("Binary files {old} and {new} differ"));
+        let raw = header.join("\n").into_bytes();
+        return FileDiff { header, hunks: Vec::new(), binary: true, raw };
+    }
+    let text = |bytes: Option<&[u8]>| bytes.map(|bytes| String::from_utf8_lossy(bytes).into_owned()).unwrap_or_default();
+    let (before, after) = (text(before), text(after));
+    let unified = similar::TextDiff::from_lines(&before, &after).unified_diff().context_radius(3).header(&old, &new).to_string();
+    let mut diff = parse_diff(&format!("{}\n{unified}", header.join("\n")));
+    diff.binary = false;
+    diff
+}
+
 /// Stages one hunk of the unstaged diff.
 pub fn stage_hunk(env: &dyn Environment, root: &str, diff: &FileDiff, index: usize) -> io::Result<()> {
     apply(env, root, diff, index, &["apply", "--cached", "--whitespace=nowarn", "-"])
@@ -429,6 +455,22 @@ mod tests {
     use super::*;
     use envs::LocalEnvironment;
     use test_support::TempDir;
+
+    /// A turn's change to a file, from its two texts: one hunk with the lines it took out
+    /// and put in; a new file has no before, and bytes that are not text show no hunks.
+    #[test]
+    fn two_texts_of_a_file_make_its_diff() {
+        let diff = text_diff("src/a.rs", Some(b"one\ntwo\nthree\n"), Some(b"one\nTWO\nthree\n"));
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].lines, [" one", "-two", "+TWO", " three"].map(String::from));
+        assert!(diff.header.iter().any(|line| line == "--- a/src/a.rs"), "{:?}", diff.header);
+        let created = text_diff("new.txt", None, Some(b"hello\n"));
+        assert_eq!(created.hunks[0].lines, ["+hello"]);
+        assert!(created.header.iter().any(|line| line == "--- /dev/null"));
+        let binary = text_diff("pic.png", Some(b"\x89PNG\0"), Some(b"\x89PNG\0\x01"));
+        assert!(binary.binary && binary.hunks.is_empty());
+        assert!(text_diff("same.txt", Some(b"x\n"), Some(b"x\n")).hunks.is_empty());
+    }
 
     /// A name with a space ends with a tab in the header; one with a quote is quoted.
     #[test]

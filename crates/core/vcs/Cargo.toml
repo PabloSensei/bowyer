@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 envs.workspace = true
+similar = "2"
 
 [dev-dependencies]
 test-support.workspace = true

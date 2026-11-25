@@ -428,18 +428,21 @@ impl Shell {
     }
 
     fn settings_hosts(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let hosts: Vec<(String, Option<String>)> =
+        let hosts: Vec<(String, Option<String>, String, bool)> =
             self.ssh_hosts
                 .iter()
                 .map(|ssh| {
                     let how = if ssh.password { Some(t("ssh.password_auth").to_owned()) } else { ssh.identity.as_ref().map(|key| key.to_string_lossy().into_owned()) };
-                    (ssh.host.clone(), how)
+                    let env = model::EnvId::ssh(&ssh.host);
+                    let login = self.login_line(&env).map_or_else(|| t("plan.login_unknown").to_owned(), |who| t("plan.login").replace("{who}", &who));
+                    (ssh.host.clone(), how, login, self.pays_by_key(&env))
                 })
                 .collect();
+        let here = self.login_line(&model::EnvId::local()).map(|who| (t("plan.login").replace("{who}", &who), self.pays_by_key(&model::EnvId::local())));
         let list = div().flex().flex_col().gap(px(6.)).when(hosts.is_empty(), |this| {
             this.child(div().text_size(px(12.5)).text_color(theme.text_muted).child(t("settings.no_hosts")))
         });
-        let list = list.children(hosts.into_iter().enumerate().map(|(ix, (host, key))| {
+        let list = list.children(hosts.into_iter().enumerate().map(|(ix, (host, key, login, keyed))| {
             let forget = host.clone();
             div()
                 .flex()
@@ -458,7 +461,8 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .child(div().text_size(px(13.)).child(host))
-                        .child(div().truncate().text_size(px(11.5)).text_color(theme.text_muted).child(key.unwrap_or_else(|| t("settings.key_default").to_owned()))),
+                        .child(div().truncate().text_size(px(11.5)).text_color(theme.text_muted).child(key.unwrap_or_else(|| t("settings.key_default").to_owned())))
+                        .child(div().truncate().text_size(px(11.5)).text_color(if keyed { theme.warning_mark } else { theme.text_muted }).child(login)),
                 )
                 .child(
                     button(SharedString::from(format!("settings-host-forget-{ix}")), t("settings.forget"), theme)
@@ -468,6 +472,7 @@ impl Shell {
         vec![
             group(t("settings.hosts"), theme)
                 .child(div().text_size(px(12.5)).text_color(theme.text_muted).child(t("settings.hosts_hint")))
+                .children(here.map(|(line, keyed)| div().text_size(px(12.)).text_color(if keyed { theme.warning_mark } else { theme.text_secondary }).child(format!("{} — {line}", t("local")))))
                 .child(list)
                 .child(div().flex().child(button("settings-host-add", t("settings.add_host"), theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.close_settings(cx);

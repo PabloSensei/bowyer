@@ -17,12 +17,16 @@ use crate::i18n::t;
 const STALE_MS: i64 = 5 * 60_000;
 /// How soon after the last look a finished turn or a click may look again.
 const AGAIN_MS: i64 = 20_000;
+/// How often the login of Claude Code on each machine is asked, open session or not.
+const LOGIN_STALE_MS: i64 = 30 * 60_000;
 
 /// The plan of one account: the harness on one machine.
 #[derive(Default)]
 pub(super) struct PlanState {
     pub(super) at_ms: i64,
     pub(super) plan: Option<Plan>,
+    /// Who Claude Code runs as there, from the same answer.
+    pub(super) account: Option<live::usage::Account>,
     pub(super) busy: bool,
 }
 
@@ -83,6 +87,45 @@ impl Shell {
         }
     }
 
+    /// Asks Claude Code on every machine how it is signed in, every half hour: the tree
+    /// marks the ones that pay by API key, and the hosts' settings say who each runs as.
+    pub(super) fn look_at_logins(&mut self, cx: &mut Context<Self>) {
+        let now = now_ms();
+        let envs: Vec<EnvId> = self.envs.iter().map(|env| env.id()).collect();
+        for env in envs {
+            let account = (env, HarnessKind::Claude);
+            let state = self.plans.entry(account.clone()).or_default();
+            if !state.busy && now - state.at_ms >= LOGIN_STALE_MS {
+                state.busy = true;
+                self.probe_plan(account, cx);
+            }
+        }
+    }
+
+    /// Whether Claude Code on this machine is known to pay by API key.
+    pub(super) fn pays_by_key(&self, env: &EnvId) -> bool {
+        matches!(self.plans.get(&(env.clone(), HarnessKind::Claude)).and_then(|state| state.plan.as_ref()), Some(Plan::Api))
+    }
+
+    /// Who Claude Code runs as on this machine, in one line: the way it is signed in and the
+    /// account. `None` before the first answer.
+    pub(super) fn login_line(&self, env: &EnvId) -> Option<String> {
+        let state = self.plans.get(&(env.clone(), HarnessKind::Claude))?;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(account) = &state.account {
+            parts.extend(account.method.clone());
+            parts.extend(account.email.clone().or_else(|| account.organization.clone()));
+        }
+        if parts.is_empty() {
+            match state.plan.as_ref()? {
+                Plan::Limits { name, .. } => parts.push(t("plan.subscription").replace("{name}", &capitalized(name.as_deref().unwrap_or("")))),
+                Plan::Api => parts.push(t("plan.api").to_owned()),
+                Plan::Unknown(error) => parts.push(error.clone()),
+            }
+        }
+        Some(parts.join(" · "))
+    }
+
     fn probe_plan(&mut self, account: Account, cx: &mut Context<Self>) {
         let Some(env) = self.env_for(&account.0) else {
             self.plans.remove(&account);
@@ -101,18 +144,22 @@ impl Shell {
             let (program, args) = live::usage::claude_command(local);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             match env.run_with_input(&program, &args, folder.as_deref(), request.as_bytes()) {
-                Ok(output) => live::usage::parse_claude(&output),
-                Err(error) => Plan::Unknown(model::shorten(&error.to_string(), 200)),
+                Ok(output) => (live::usage::parse_claude(&output), live::usage::parse_account(&output)),
+                Err(error) => (Plan::Unknown(model::shorten(&error.to_string(), 200)), None),
             }
         });
         cx.spawn(async move |this, cx| {
-            let plan = task.await;
+            let (plan, login) = task.await;
             this.update(cx, |this, cx| {
                 let api = plan == Plan::Api;
+                this.keep_limits(&account, &plan);
                 let state = this.plans.entry(account).or_default();
                 state.busy = false;
                 state.at_ms = now_ms();
                 state.plan = Some(plan);
+                if login.is_some() {
+                    state.account = login;
+                }
                 if api {
                     this.look_at_plan(false, cx);
                 }
@@ -233,6 +280,16 @@ impl Shell {
             HarnessKind::DeepSeek => month_view(month, &theme),
             _ => return None,
         };
+        let history = div()
+            .id("plan-history")
+            .px(px(5.))
+            .rounded(px(4.))
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+            .child(t("spend.open"))
+            .tooltip(|_, cx| tooltip(t("spend.open_tip"), None, cx))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_spend(cx)));
         let refresh = div()
             .id("plan-refresh")
             .px(px(4.))
@@ -243,7 +300,18 @@ impl Shell {
             .child("↻")
             .tooltip(|_, cx| tooltip(t("plan.refresh"), None, cx))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.look_at_plan(true, cx)));
-        Some(self.fold("plan", t("plan.title"), Some(refresh.into_any_element()), body, cx))
+        // Who Claude Code runs as on this machine, under the plan.
+        let login = (account.1 == HarnessKind::Claude)
+            .then(|| self.plans.get(&account).and_then(|state| state.account.as_ref()))
+            .flatten()
+            .map(|login| [login.method.clone(), login.email.clone().or_else(|| login.organization.clone())].into_iter().flatten().collect::<Vec<_>>().join(" · "))
+            .filter(|line| !line.is_empty());
+        let body = match login {
+            Some(line) => div().flex().flex_col().gap(px(6.)).child(body).child(div().truncate().text_size(px(11.5)).text_color(theme.text_muted).child(line)).into_any_element(),
+            None => body,
+        };
+        let actions = div().flex().items_center().gap(px(4.)).child(history).child(refresh);
+        Some(self.fold("plan", t("plan.title"), Some(actions.into_any_element()), body, cx))
     }
 }
 
