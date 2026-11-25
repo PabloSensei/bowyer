@@ -1,7 +1,7 @@
 name: Release
 
-# Packages for a tag `v*`: the Windows installer (NSIS), the Linux .deb and AppImage, the
-# macOS .app and .dmg, with SHA-256 sums, as a draft release. Signing happens when the
+# Packages for a tag `v*`: the Windows installer (NSIS), the Linux .deb, .rpm, Arch package
+# and AppImage, the macOS .app and .dmg, with SHA-256 sums, as a draft release. Signing happens when the
 # secrets below are set; without them the packages are built unsigned.
 #
 #   WINDOWS_PFX_BASE64, WINDOWS_PFX_PASSWORD   Authenticode certificate (.pfx in base64)
@@ -67,7 +67,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libfontconfig1-dev libwayland-dev libx11-dev \
-            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2 rpm
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -126,6 +126,15 @@ jobs:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.UPDATE_PRIVATE_KEY }}
           CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATE_PRIVATE_KEY_PASSWORD }}
         run: cargo packager -c packaging/packager.toml --release -f ${{ matrix.formats }}
+
+      # The .rpm (Fedora, openSUSE) and the Arch package carry the files of the .deb; each
+      # Linux package is then installed in a container of its distribution and checked.
+      - name: Fedora, openSUSE and Arch packages
+        if: runner.os == 'Linux'
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' packaging/packager.toml | head -n 1)
+          bash packaging/linux/repackage.sh "target/packages/bowyer_${version}_amd64.deb" "$version"
+          bash packaging/linux/try-packages.sh target/packages
 
       - name: macOS update package
         if: runner.os == 'macOS'

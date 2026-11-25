@@ -5,7 +5,7 @@ Packages are built by [cargo-packager](https://github.com/crabnebula-dev/cargo-p
 | System | Format | Installs to |
 |---|---|---|
 | Windows | NSIS installer `bowyer_<version>_x64-setup.exe` | `%LOCALAPPDATA%\Bowyer` for the current user, no administrator rights; shortcuts in the Start menu and on the desktop |
-| Linux | `.deb`, AppImage | `/usr/bin/bowyer`, hicolor icons, `bowyer.desktop`, licenses in `/usr/lib/bowyer/licenses` |
+| Linux | `.deb`, `.rpm`, Arch package, AppImage | `/usr/bin/bowyer`, hicolor icons, `bowyer.desktop`, licenses in `/usr/lib/bowyer/licenses` |
 | macOS | `.app`, `.dmg` | `Bowyer.app` |
 
 Uninstalling removes the program only: the library, themes and caches (`%APPDATA%\Bowyer`, `~/.local/share/Bowyer`, `~/Library/Application Support/Bowyer`) stay. The Windows installer remembers its folder in `HKCU\Software\Bowyer\Bowyer` and leaves that key after uninstalling (the cargo-packager template does so).
@@ -18,7 +18,7 @@ python packaging/prepare.py
 cargo packager -c packaging/packager.toml --release -f nsis
 ```
 
-On Linux and macOS, run `strip target/release/bowyer` before packaging (the release profile keeps line tables: about 216 MB unstripped on Linux, 41 MB stripped) and use `-f deb,appimage` or `-f app,dmg`. The packages land in `target/packages`.
+On Linux and macOS, run `strip target/release/bowyer` before packaging (the release profile keeps line tables: about 216 MB unstripped on Linux, 41 MB stripped) and use `-f deb,appimage` or `-f app,dmg`. The packages land in `target/packages`. The `.rpm` (Fedora, openSUSE) and the Arch package carry the files of the `.deb`: `bash packaging/linux/repackage.sh target/packages/bowyer_<version>_amd64.deb <version>` builds them with `rpmbuild` and, in an Arch Linux container, `makepkg`; `bash packaging/linux/try-packages.sh target/packages` installs every Linux package in a clean container of its distribution and checks that the libraries the program needs are there. The release workflow runs both.
 
 `prepare.py` gathers into `target/packaging/licenses` what every package has to carry: the GPL of Bowyer itself, the licenses of the Inter and JetBrains Mono fonts and of the IntelliJ icons, the notices of code taken from Arro and Zed, and `THIRD-PARTY.txt` with every Rust crate in the binary, its license and its license files (from `cargo metadata` for the current platform).
 

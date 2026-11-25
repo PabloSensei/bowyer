@@ -459,14 +459,26 @@ fn can_run_live(harness: &HarnessKind) -> bool {
 
 struct Loaded {
     transcript: Transcript,
+    /// How far the reader of a Claude Code session got.
+    offset: u64,
     memory_tokens: u64,
     items: Vec<Item>,
     breakdown: ContextBreakdown,
     changes: Vec<FileChange>,
     tasks: Vec<TaskRun>,
     turns: std::collections::HashMap<String, Vec<model::TurnFile>>,
-    git: Option<GitInfo>,
+    /// What goes into the search index once the session shows.
+    search_text: String,
+    started: Vec<String>,
 }
+
+/// Claude Code sessions opened lately keep their reader, so going back to one reads only
+/// what was written since: a big session is parsed once, not at every switch.
+const KEPT_READERS: usize = 4;
+/// The readers kept, by the size of their files: their transcripts stay in memory.
+const KEPT_READER_BYTES: u64 = 1_200_000_000;
+
+type Reader = Arc<Mutex<Option<history::ClaudeFollower>>>;
 
 pub struct Shell {
     library: Arc<Mutex<Library>>,
@@ -520,6 +532,8 @@ pub struct Shell {
     open: Option<OpenSession>,
     loading: bool,
     load_generation: u64,
+    /// The readers of the Claude Code sessions opened lately, the latest last.
+    readers: Vec<(SessionKey, u64, Reader)>,
     load_error: Option<String>,
     /// The session that failed to load and when to load it again.
     load_retry: Option<(SessionKey, Retry)>,
@@ -765,6 +779,7 @@ impl Shell {
             open: None,
             loading: false,
             load_generation: 0,
+            readers: Vec::new(),
             load_error: None,
             load_retry: None,
             open_runs: HashSet::new(),
@@ -952,6 +967,21 @@ impl Shell {
 
     fn env_for(&self, id: &model::EnvId) -> Option<SharedEnv> {
         self.envs.iter().find(|env| &env.id() == id).cloned()
+    }
+
+    /// The reader of a Claude Code session, kept from the last time it was open or new.
+    fn reader_for(&mut self, key: &SessionKey, size: u64) -> Reader {
+        let reader = match self.readers.iter().position(|(kept, ..)| kept == key) {
+            Some(at) => self.readers.remove(at).2,
+            None => Reader::default(),
+        };
+        self.readers.push((key.clone(), size, reader.clone()));
+        while self.readers.len() > 1
+            && (self.readers.len() > KEPT_READERS || self.readers.iter().map(|(_, size, _)| size).sum::<u64>() > KEPT_READER_BYTES)
+        {
+            self.readers.remove(0);
+        }
+        reader
     }
 
     fn summary(&self, key: &SessionKey) -> Option<&SessionSummary> {
@@ -1818,12 +1848,36 @@ impl Shell {
         let generation = self.load_generation;
         self.loading = true;
         self.load_error = None;
+        let asked_at = std::time::Instant::now();
         let cache = self.cache_dir.join("remote");
         let library = self.library.clone();
         let dropped = self.dropped_prompt(&summary.key);
+        let reader = (summary.key.harness == HarnessKind::Claude).then(|| self.reader_for(&summary.key, summary.source.size));
+        let kept = reader.clone();
+        // Git is asked beside the reading: a process or two, while the history is parsed.
+        let git_env = env.clone();
+        let git_cwd = summary.cwd.clone();
+        let git_task = cx.background_spawn(async move { git_cwd.as_deref().and_then(|cwd| git_env.git_info(cwd)) });
         let task = cx.background_spawn(async move {
-            let source = history::source_for(&summary.key.harness).ok_or_else(|| "no reader for this harness".to_owned())?;
-            let mut transcript = source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?;
+            // A Claude Code session read before reads on from where it stopped.
+            let (mut transcript, offset) = match &kept {
+                Some(reader) => {
+                    let mut follower = reader.lock().map_err(|_| "reader poisoned".to_owned())?;
+                    let path = summary.source.path.as_str();
+                    match follower.as_mut().filter(|f| f.path() == path) {
+                        Some(f) => {
+                            f.read_on(&*env).map_err(|e| e.to_string())?;
+                        }
+                        None => *follower = Some(history::ClaudeFollower::open(&*env, path).map_err(|e| e.to_string())?),
+                    }
+                    let f = follower.as_ref().ok_or_else(|| "no reader".to_owned())?;
+                    (f.transcript(), f.offset())
+                }
+                None => {
+                    let source = history::source_for(&summary.key.harness).ok_or_else(|| "no reader for this harness".to_owned())?;
+                    (source.load(&*env, &summary, &cache).map_err(|e| e.to_string())?, 0)
+                }
+            };
             // A prompt the user dropped is left out until the next turn resumes before it.
             if let Some(prompt) = &dropped {
                 transcript.hide_failed_turn(prompt);
@@ -1835,15 +1889,24 @@ impl Shell {
             let changes = transcript.changes();
             let tasks = transcript.tasks(false);
             let turns = transcript.turn_files();
-            let git = summary.cwd.as_deref().and_then(|cwd| env.git_info(cwd));
-            if let Ok(library) = library.lock() {
-                let _ = library.index_session(&summary, &transcript.search_text_ends(INDEX_TEXT_BYTES));
-                let _ = library.set_started(&summary.key, &transcript.started_sessions());
-            }
-            Ok::<_, String>((summary, Loaded { transcript, items, breakdown, memory_tokens, changes, tasks, turns, git }))
+            let search_text = transcript.search_text_ends(INDEX_TEXT_BYTES);
+            let started = transcript.started_sessions();
+            Ok::<_, String>((summary, Loaded { transcript, offset, items, breakdown, memory_tokens, changes, tasks, turns, search_text, started }))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
+            // The index is written after the session shows: the library may be busy.
+            if let Ok((summary, loaded)) = &result {
+                let (summary, text, started) = (summary.clone(), loaded.search_text.clone(), loaded.started.clone());
+                let library = library.clone();
+                cx.background_spawn(async move {
+                    if let Ok(library) = library.lock() {
+                        let _ = library.index_session(&summary, &text);
+                        let _ = library.set_started(&summary.key, &started);
+                    }
+                })
+                .detach();
+            }
             this.update(cx, |this, cx| {
                 if this.load_generation != generation {
                     return;
@@ -1851,6 +1914,7 @@ impl Shell {
                 this.loading = false;
                 match result {
                     Ok((summary, mut loaded)) => {
+                        log::info!("session {} shown in {} ms", summary.key.id, asked_at.elapsed().as_millis());
                         this.load_retry = None;
                         this.ide = None;
                         // A turn the window still runs in this session shows after the history
@@ -1890,9 +1954,9 @@ impl Shell {
                             changes: loaded.changes,
                             tasks: loaded.tasks,
                             turns: Arc::new(loaded.turns),
-                            git: loaded.git,
-                            follower: Arc::default(),
-                            shown_offset: 0,
+                            git: None,
+                            follower: reader.clone().unwrap_or_default(),
+                            shown_offset: loaded.offset,
                             memory_tokens: loaded.memory_tokens,
                             exact: None,
                             exact_busy: false,
@@ -1904,6 +1968,19 @@ impl Shell {
                         this.extensions_of = None;
                         this.look_for_ide(cx);
                         this.look_at_plan(false, cx);
+                        cx.spawn(async move |this, cx| {
+                            let git = git_task.await;
+                            this.update(cx, |this, cx| {
+                                if this.load_generation == generation
+                                    && let Some(open) = &mut this.open
+                                {
+                                    open.git = git;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
                     }
                     Err(error) => {
                         // What was typed for the session left stays with it.

@@ -1,0 +1,20 @@
+# The pacman package of Bowyer for Arch Linux, made by repackage.sh from the files of the
+# .deb (@VERSION@ is filled in). The program is already built and stripped.
+pkgname=bowyer
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="One window for every AI coding harness: Claude Code, Codex, OpenCode and DeepSeek, local or over SSH"
+arch=('x86_64')
+url="https://github.com/PabloSensei/bowyer"
+license=('GPL-3.0-or-later')
+# Linked: libxcb, libxkbcommon, libxkbcommon-x11; opened at start: Wayland and EGL.
+depends=('glibc' 'gcc-libs' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd' 'hicolor-icon-theme')
+options=('!strip' '!debug')
+source=('data.tar')
+noextract=('data.tar')
+sha256sums=('SKIP')
+
+package() {
+  bsdtar -xf "$srcdir/data.tar" -C "$pkgdir"
+  chmod 755 "$pkgdir"
+}

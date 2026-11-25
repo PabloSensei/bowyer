@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "envs"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "model",
@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "embed-resource",
@@ -3082,7 +3082,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "envs",
@@ -3769,7 +3769,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "library"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "model",
  "rusqlite",
@@ -3836,7 +3836,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "live"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "envs",
@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "envs",
  "history",
@@ -4150,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -6961,7 +6961,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alacritty_terminal",
  "arc-swap",
@@ -6974,11 +6974,11 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.9"
+version = "0.1.10"
 
 [[package]]
 name = "theme"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "roxmltree 0.21.2",
  "serde",
@@ -7387,7 +7387,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "gpui-kit",
  "gpui-pre-linux",
@@ -7484,7 +7484,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "update"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "minisign",
@@ -7613,7 +7613,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vcs"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "envs",
  "similar",

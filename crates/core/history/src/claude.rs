@@ -201,6 +201,71 @@ fn parse_lines_with(text: &str, skip_first: bool, skip_last: bool, files: bool) 
         .filter_map(|line| serde_json::from_str(line).ok())
 }
 
+/// Text above this size is parsed on several threads.
+const PARALLEL_BYTES: usize = 4 << 20;
+/// The text parsed at once: its values live together until they are fed.
+const BATCH_BYTES: usize = 16 << 20;
+
+/// Every line of a whole read (the file history's lines kept), parsed and handed to `feed`
+/// in order. JSON parsing is most of the time of opening a big session, so a big text goes
+/// through a pipeline: the threads of the machine parse a batch while the one before is fed,
+/// and the values fed are freed on a thread of their own.
+fn feed_lines(text: &str, mut feed: impl FnMut(&Value)) {
+    let lines: Vec<&str> = text.split('\n').filter(|line| !line.trim().is_empty() && !skipped(line, true)).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if text.len() < PARALLEL_BYTES || threads < 2 {
+        for value in lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+            feed(&value);
+        }
+        return;
+    }
+    let runs = batches(&lines, BATCH_BYTES);
+    std::thread::scope(|scope| {
+        let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<Vec<Vec<Value>>>(2);
+        let (spent_tx, spent_rx) = std::sync::mpsc::channel::<Vec<Vec<Value>>>();
+        scope.spawn(move || spent_rx.into_iter().for_each(drop));
+        scope.spawn(move || {
+            for batch in runs {
+                let pieces = batches(batch, batch.iter().map(|line| line.len()).sum::<usize>().div_ceil(threads));
+                let parsed: Vec<Vec<Value>> = std::thread::scope(|inner| {
+                    let handles: Vec<_> = pieces
+                        .into_iter()
+                        .map(|piece| inner.spawn(move || piece.iter().filter_map(|line| serde_json::from_str(line).ok()).collect::<Vec<Value>>()))
+                        .collect();
+                    handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+                });
+                if parsed_tx.send(parsed).is_err() {
+                    return;
+                }
+            }
+        });
+        for parsed in parsed_rx {
+            parsed.iter().flatten().for_each(&mut feed);
+            let _ = spent_tx.send(parsed);
+        }
+        drop(spent_tx);
+    });
+}
+
+/// `lines` cut into runs of about `size` bytes each, in order.
+fn batches<'a, 'b>(lines: &'b [&'a str], size: usize) -> Vec<&'b [&'a str]> {
+    let mut runs = Vec::new();
+    let mut from = 0;
+    let mut taken = 0;
+    for (i, line) in lines.iter().enumerate() {
+        taken += line.len();
+        if taken >= size.max(1) {
+            runs.push(&lines[from..=i]);
+            from = i + 1;
+            taken = 0;
+        }
+    }
+    if from < lines.len() {
+        runs.push(&lines[from..]);
+    }
+    runs
+}
+
 /// The end of a Claude Code session from its last bytes, for a preview. `cut` says the
 /// bytes start inside the file: their first line is part of one and is left out, as is a
 /// last line still being written.
@@ -754,10 +819,10 @@ impl ClaudeFollower {
     fn feed(&mut self, bytes: &[u8]) {
         let Some(end) = bytes.iter().rposition(|&b| b == b'\n') else { return };
         let text = String::from_utf8_lossy(&bytes[..=end]);
-        for value in parse_lines_with(&text, false, false, true) {
-            self.turn = turn_after(&value).or(self.turn);
-            self.parser.feed(&value);
-        }
+        feed_lines(&text, |value| {
+            self.turn = turn_after(value).or(self.turn);
+            self.parser.feed(value);
+        });
         self.offset += end as u64 + 1;
     }
 
@@ -867,9 +932,7 @@ fn task_line(summary: &str) -> String {
 /// The whole transcript of a session file.
 pub fn parse_transcript(text: &str) -> Transcript {
     let mut parser = ClaudeParser::new();
-    for value in parse_lines_with(text, false, false, true) {
-        parser.feed(&value);
-    }
+    feed_lines(text, |value| parser.feed(value));
     parser.finish()
 }
 
@@ -1182,6 +1245,23 @@ Task 0.16: previews"), "Task 0.16: previews");
         assert_eq!(transcript.entries.len(), 2, "{:?}", transcript.entries);
         assert_eq!(claude_tail("", true).entries.len(), 0);
         assert_eq!(claude_tail("no newline at all", true).entries.len(), 0);
+    }
+
+    /// A big text is parsed on several threads, and its values still come in the order of
+    /// its lines; a broken line is left out as before.
+    #[test]
+    fn a_big_text_is_parsed_in_order_on_several_threads() {
+        let mut text = String::new();
+        for n in 0..60_000 {
+            text.push_str(&format!("{{\"type\":\"user\",\"n\":{n},\"pad\":\"{}\"}}\n", "x".repeat(80)));
+            if n == 30_000 {
+                text.push_str("not json\n\n");
+            }
+        }
+        assert!(text.len() > PARALLEL_BYTES);
+        let mut seen = Vec::new();
+        feed_lines(&text, |value| seen.push(value["n"].as_u64().unwrap()));
+        assert_eq!(seen, (0..60_000).collect::<Vec<u64>>());
     }
 
     /// What a Stop hook said to the model shows as one quiet line, marked or not, and is not

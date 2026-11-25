@@ -166,12 +166,30 @@ Bowyer does not bundle the agents: install Claude Code, Codex, OpenCode or DeepS
 
 ### Linux x86-64
 
-The build needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 or a later release.
+The build needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36, openSUSE Tumbleweed, Arch Linux or a later release. Each package is installed in a clean container of its distribution before a release.
 
-On Debian and Ubuntu, install the package:
+Debian, Ubuntu, Linux Mint, Pop!_OS:
 
 ```shell
 sudo apt install ./bowyer_<version>_amd64.deb
+```
+
+Fedora:
+
+```shell
+sudo dnf install ./bowyer-<version>-1.x86_64.rpm
+```
+
+openSUSE Tumbleweed:
+
+```shell
+sudo zypper install --allow-unsigned-rpm ./bowyer-<version>-1.x86_64.rpm
+```
+
+Arch Linux, Manjaro, EndeavourOS:
+
+```shell
+sudo pacman -U ./bowyer-<version>-1-x86_64.pkg.tar.zst
 ```
 
 Anywhere else, use the AppImage:
@@ -190,7 +208,7 @@ The AppImage needs `libfuse2`; the window needs `libfontconfig`, `libwayland`, `
 
 ### Updates and limitations
 
-Bowyer checks for a new version on start and twice a day (Settings → Updates turns that off) and installs it only after you click **Install and restart**. The package is accepted only when its signature matches the key built into Bowyer. The Windows installer, the AppImage and the macOS app update themselves; a `.deb` installation only tells you that a version is out.
+Bowyer checks for a new version on start and twice a day (Settings → Updates turns that off) and installs it only after you click **Install and restart**. The package is accepted only when its signature matches the key built into Bowyer. The Windows installer, the AppImage and the macOS app update themselves; a `.deb`, `.rpm` or Arch installation only tells you that a version is out.
 
 Your library, themes and caches live in `%APPDATA%\Bowyer`, `~/.local/share/Bowyer` or `~/Library/Application Support/Bowyer` and survive uninstalling.
 
