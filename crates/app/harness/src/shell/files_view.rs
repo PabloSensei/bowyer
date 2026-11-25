@@ -252,6 +252,7 @@ impl Shell {
         let Some(open) = &self.open else { return };
         let Some(env) = self.env_for(&open.summary.key.env) else { return };
         self.diff_view = None;
+        self.mission = None;
         self.preview = Some(Preview { path: path.clone(), body: PreviewBody::Loading, scroll: UniformListScrollHandle::new() });
         self.turn_view = None;
         self.spend_view = None;

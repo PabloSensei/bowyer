@@ -24,9 +24,9 @@ mod time;
 mod trash;
 mod turns;
 
-pub use claude::{ClaudeFollower, ClaudeParser, ClaudeSource, turn_of_tail};
+pub use claude::{ClaudeFollower, ClaudeParser, ClaudeSource, claude_tail, hook_feedback, turn_of_tail};
 pub use commands::{CommandSource, HarnessCommand, claude_commands};
-pub use codex::{CodexSource, codex_turn_of_tail};
+pub use codex::{CodexSource, codex_tail, codex_turn_of_tail};
 pub use dsh::DshSource;
 pub use export::{ExportLabels, export_file_name, export_markdown};
 pub use memory_files::{memory_file_paths, memory_tokens};

@@ -201,6 +201,17 @@ fn parse_lines_with(text: &str, skip_first: bool, skip_last: bool, files: bool) 
         .filter_map(|line| serde_json::from_str(line).ok())
 }
 
+/// The end of a Claude Code session from its last bytes, for a preview. `cut` says the
+/// bytes start inside the file: their first line is part of one and is left out, as is a
+/// last line still being written.
+pub fn claude_tail(text: &str, cut: bool) -> Transcript {
+    let mut parser = ClaudeParser::new();
+    for value in parse_lines(text, cut, true) {
+        parser.feed(&value);
+    }
+    parser.snapshot()
+}
+
 fn stem(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.strip_suffix(".jsonl").unwrap_or(name).to_owned()
@@ -460,6 +471,20 @@ impl ClaudeParser {
             }
         }
         "user" => {
+            // What a hook said to the model is not the user's: one quiet line, the same in a
+            // turn that streams and in the history read again.
+            if let Some(text) = hook_feedback(value) {
+                self.transcript.entries.push(Entry {
+                    id,
+                    role: Role::System,
+                    timestamp_ms,
+                    blocks: vec![Block::Notice { text: format!("⚙ {}", model::shorten(&text.split_whitespace().collect::<Vec<_>>().join(" "), 200)) }],
+                    model: None,
+                    usage: None,
+                    compact_summary: false,
+                });
+                return;
+            }
             if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
                 return;
             }
@@ -780,6 +805,21 @@ fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 
 /// What a line of a slash command shows: `Some(Some(notice))` for the command and its
 /// output, `Some(None)` for a line to leave out, `None` for an ordinary message.
+/// The text of a `user` line that a hook wrote for the model (a Stop hook that asks for more,
+/// a blocking error): marked `rowSource: "hook"` or `hookText` by Claude Code 2.1.332, known
+/// by its first words in an older history or in a streamed turn.
+pub fn hook_feedback(value: &Value) -> Option<String> {
+    let text = match value.pointer("/message/content")? {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+        _ => return None,
+    };
+    let marked = value.get("rowSource").and_then(Value::as_str) == Some("hook") || value.get("hookText").and_then(Value::as_bool) == Some(true);
+    let lead = text.trim_start();
+    let known = ["Stop hook feedback", "Stop hook blocking error", "SubagentStop hook feedback", "SubagentStop hook blocking error"].iter().any(|start| lead.starts_with(start));
+    (marked || known).then(|| lead.trim_end().to_owned()).filter(|text| !text.is_empty())
+}
+
 fn command_notice(text: &str) -> Option<Option<String>> {
     let text = text.trim_start();
     if let Some(name) = tag(text, "command-name") {
@@ -1125,6 +1165,41 @@ Task 0.16: previews"), "Task 0.16: previews");
         let last = transcript.entries.last().unwrap();
         assert_eq!(last.role, Role::System);
         assert!(matches!(&last.blocks[0], Block::Notice { text } if text == "⌘ /model haiku"));
+    }
+
+    /// The last bytes of a session read as its end: the cut first line and a line still
+    /// being written are left out.
+    #[test]
+    fn the_end_of_a_session_reads_from_its_last_bytes() {
+        let text = [
+            r#"ssistant","uuid":"a0","message":{"role":"assistant","content":[{"type":"text","text":"cut"}]}}"#,
+            r#"{"type":"user","uuid":"p1","parentUuid":null,"message":{"role":"user","content":"Fix it."}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"p1","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"On it."}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","message":{"id":"m2","role":"assis"#,
+        ]
+        .join("\n");
+        let transcript = claude_tail(&text, true);
+        assert_eq!(transcript.entries.len(), 2, "{:?}", transcript.entries);
+        assert_eq!(claude_tail("", true).entries.len(), 0);
+        assert_eq!(claude_tail("no newline at all", true).entries.len(), 0);
+    }
+
+    /// What a Stop hook said to the model shows as one quiet line, marked or not, and is not
+    /// taken for a prompt of the user.
+    #[test]
+    fn a_hook_feedback_is_a_notice_not_a_prompt() {
+        let line = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        let marked = line(r#"{"type":"user","isMeta":true,"rowSource":"hook","hookText":true,"uuid":"h1","message":{"role":"user","content":"Stop hook feedback:\nWrite the summary, then finish."}}"#);
+        let streamed = line(r#"{"type":"user","uuid":"h2","message":{"role":"user","content":[{"type":"text","text":"Stop hook feedback:\nAgain."}]}}"#);
+        let caveat = line(r#"{"type":"user","isMeta":true,"uuid":"h3","message":{"content":"caveat"}}"#);
+        let mut parser = ClaudeParser::new();
+        for value in [&marked, &streamed, &caveat] {
+            parser.feed(value);
+        }
+        let entries = parser.snapshot().entries;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries.iter().all(|entry| entry.role == Role::System));
+        assert_eq!(entries[0].blocks, vec![Block::Notice { text: "⚙ Stop hook feedback: Write the summary, then finish.".into() }]);
     }
 
     /// Every prompt but the first knows the line it hangs under: a branch starts there.

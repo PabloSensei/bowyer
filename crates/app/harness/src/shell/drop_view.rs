@@ -51,6 +51,7 @@ impl Shell {
             }
             _ => self.forget_drop(&key),
         }
+        self.mission = None;
         // Read the session again, with or without the turn.
         self.selected = None;
         self.open_session(key, cx);

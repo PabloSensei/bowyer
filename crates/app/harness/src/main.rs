@@ -17,6 +17,7 @@ mod rerank;
 mod i18n;
 mod launch;
 mod markdown;
+mod mission;
 mod notify;
 mod tray;
 mod shell;

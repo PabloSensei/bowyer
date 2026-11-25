@@ -10,7 +10,7 @@ use model::{EnvId, HarnessKind, SessionKey, SessionSummary, SourceStamp, TaskRun
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{LiveRun, OpenSession, Shell, can_run_live, chip, composer, effort_presets, harness_color, model_presets, now_ms};
+use super::{LiveRun, OpenSession, Shell, can_run_live, chip, composer, critter, effort_presets, harness_color, model_presets, now_ms};
 use crate::display;
 use crate::i18n::t;
 
@@ -406,6 +406,7 @@ impl Shell {
     }
 
     fn open_draft(&mut self, env: EnvId, harness: HarnessKind, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.mission = None;
         let shared = self.env_for(&env);
         let summary = SessionSummary {
             key: SessionKey { env, harness, id: String::new() },
@@ -1113,7 +1114,12 @@ impl Shell {
     /// Answers the question of the harness about `tool_call_id` with an option it offered.
     fn answer_permission(&mut self, tool_call_id: &str, option: String, cx: &mut Context<Self>) {
         let Some(ix) = self.live_ix() else { return };
-        let live = &mut self.runs[ix];
+        self.answer_permission_of(ix, tool_call_id, option, cx);
+    }
+
+    /// Answers a question about an action of the turn at `ix` of the runs.
+    pub(super) fn answer_permission_of(&mut self, ix: usize, tool_call_id: &str, option: String, cx: &mut Context<Self>) {
+        let Some(live) = self.runs.get_mut(ix) else { return };
         if let Some(at) = live.asks.iter().position(|ask| ask.tool_call_id == tool_call_id) {
             let ask = live.asks.remove(at);
             let _ = ask.reply.send(Some(option));
@@ -1346,14 +1352,7 @@ impl Shell {
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.send_answers(&send_call, cx)))
                     });
                     let buttons = ask.options.iter().enumerate().map(|(n, (id, kind, name))| {
-                        let label = match kind.as_str() {
-                            "allow_once" => t("ask.allow_once").to_owned(),
-                            "allow_always" => t("ask.allow_always").to_owned(),
-                            "reject_once" if question => t("ask.dismiss").to_owned(),
-                            "reject_once" => t("ask.reject_once").to_owned(),
-                            "reject_always" => t("ask.reject_always").to_owned(),
-                            _ => name.clone(),
-                        };
+                        let label = option_label(kind, name, question);
                         let primary = kind == "allow_once";
                         let reject = kind.starts_with("reject");
                         let (call, option) = (ask.tool_call_id.clone(), id.clone());
@@ -1814,7 +1813,7 @@ impl Shell {
                                             .px(px(4.))
                                             .text_size(px(12.))
                                             .text_color(theme.text_secondary)
-                                            .child(div().size(px(8.)).rounded_full().bg(harness_color(&harness)))
+                                            .child(critter(&harness, harness_color(&harness), 12.))
                                             .child(harness.label().to_owned())
                                             .children(update_mark),
                                     )
@@ -1906,6 +1905,19 @@ impl Shell {
                 })
                 .into_any_element(),
         )
+    }
+}
+
+/// What the button of an option of a question says: the harness's kinds in the window's
+/// words, its own name otherwise.
+pub(super) fn option_label(kind: &str, name: &str, question: bool) -> String {
+    match kind {
+        "allow_once" => t("ask.allow_once").to_owned(),
+        "allow_always" => t("ask.allow_always").to_owned(),
+        "reject_once" if question => t("ask.dismiss").to_owned(),
+        "reject_once" => t("ask.reject_once").to_owned(),
+        "reject_always" => t("ask.reject_always").to_owned(),
+        _ => name.to_owned(),
     }
 }
 

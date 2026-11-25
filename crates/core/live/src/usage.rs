@@ -105,6 +105,13 @@ pub fn parse_account(output: &str) -> Option<Account> {
     (account != Account::default()).then_some(account)
 }
 
+/// Whether a login method names a subscription account ("Claude Max account", "Claude
+/// Pro account", a claude.ai login) rather than a key or a cloud provider.
+fn subscription_login(method: &str) -> bool {
+    let method = method.to_ascii_lowercase();
+    !method.contains("api") && !method.contains("token") && (method.contains("account") || method.contains("claude.ai") || method.contains("subscription"))
+}
+
 /// What an account's plan is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
@@ -159,6 +166,11 @@ pub fn parse_claude(output: &str) -> Plan {
             Some(Value::String(_)) => Plan::Unknown("rate limits unavailable".into()),
             // Nobody signed in reads like an API key: the status tells them apart.
             _ if signed_in(response_to(&events, STATUS)) == Some(false) => Plan::Unknown("Claude Code is not signed in".into()),
+            // A subscription whose login expired has no limits and no plan either, while its
+            // status still names the account: it does not pay by key.
+            _ if parse_account(output).and_then(|account| account.method).is_some_and(|method| subscription_login(&method)) => {
+                Plan::Unknown("the subscription's limits are unavailable: sign in to Claude Code there again".into())
+            }
             _ => Plan::Api,
         };
     }
@@ -286,6 +298,13 @@ mod tests {
         assert_eq!(parse_claude(&keyed), Plan::Api);
         let nobody = format!("{api}{}\n", status(&["Version", "Session ID", "Session kind", "Peer address", "cwd"]));
         assert_eq!(parse_claude(&nobody), Plan::Unknown("Claude Code is not signed in".into()), "nobody signed in is no API account");
+        let login = |method: &str| {
+            json!({"type": "control_response", "response": {"subtype": "success", "request_id": "bowyer-status", "response": {"sections": [{"title": "Session", "rows": [{"label": "Login method", "value": method}]}]}}}).to_string()
+        };
+        let expired = format!("{api}{}\n", login("Claude Max account"));
+        assert!(matches!(parse_claude(&expired), Plan::Unknown(_)), "an expired subscription login pays by no key");
+        let bedrock = format!("{api}{}\n", login("AWS Bedrock"));
+        assert_eq!(parse_claude(&bedrock), Plan::Api, "a cloud provider pays by API");
         let scopeless = answer(json!({"subscription_type": "max", "rate_limits_available": false, "rate_limits": null}));
         assert!(matches!(parse_claude(&scopeless), Plan::Unknown(_)), "a subscriber without limits is no API account");
         let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"bowyer-usage","error":"Unsupported control request subtype: get_usage"}}"#;

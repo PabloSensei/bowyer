@@ -85,6 +85,7 @@ impl Shell {
         self.preview = None;
         self.turn_view = None;
         let samples = self.lib().limit_samples(&account_key(&account.0, &account.1), now_ms() - LIMIT_HOURS * HOUR_MS).unwrap_or_default();
+        self.mission = None;
         self.spend_view = Some(SpendView { account: account.clone(), report: None, samples });
         self.count_spend(account, cx);
         cx.notify();

@@ -49,7 +49,44 @@ pub struct Note {
 pub struct SearchHit {
     pub key: SessionKey,
     pub title: String,
+    /// A piece of the text around the match, the matched words between [`MATCH_START`]
+    /// and [`MATCH_END`]: see [`snippet_pieces`] and [`SearchHit::bracketed`].
     pub snippet: String,
+}
+
+/// Where a matched word starts in a snippet: a control character, which text never holds.
+pub const MATCH_START: char = '\u{2}';
+/// Where a matched word ends in a snippet.
+pub const MATCH_END: char = '\u{3}';
+
+impl SearchHit {
+    /// The snippet on one line, the matched words in brackets: for a model to read.
+    pub fn bracketed(&self) -> String {
+        self.snippet.replace(MATCH_START, "[").replace(MATCH_END, "]").replace('\n', " ")
+    }
+}
+
+/// A snippet on one line in pieces, each with whether it is a matched word.
+pub fn snippet_pieces(snippet: &str) -> Vec<(String, bool)> {
+    let mut pieces: Vec<(String, bool)> = Vec::new();
+    let mut matched = false;
+    let mut piece = String::new();
+    for ch in snippet.chars() {
+        match ch {
+            MATCH_START | MATCH_END => {
+                if !piece.is_empty() {
+                    pieces.push((std::mem::take(&mut piece), matched));
+                }
+                matched = ch == MATCH_START;
+            }
+            '\n' | '\r' | '\t' => piece.push(' '),
+            _ => piece.push(ch),
+        }
+    }
+    if !piece.is_empty() {
+        pieces.push((piece, matched));
+    }
+    pieces
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -394,7 +431,7 @@ impl Library {
             return Ok(Vec::new());
         }
         let mut statement = self.connection.prepare(
-            "SELECT session_key, title, snippet(search, -1, '[', ']', '…', 12)
+            "SELECT session_key, title, snippet(search, -1, char(2), char(3), '…', 12)
              FROM search WHERE search MATCH ?1 ORDER BY bm25(search, 0.0, 8.0, 3.0, 2.0, 1.0) LIMIT ?2",
         )?;
         let rows = statement.query_map(params![words.join(" AND "), limit as i64], |row| {
@@ -412,7 +449,7 @@ impl Library {
     pub fn search_any(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let Some(words) = any_words(query) else { return Ok(Vec::new()) };
         let mut statement = self.connection.prepare(
-            "SELECT session_key, title, snippet(search, -1, '[', ']', '…', 12)
+            "SELECT session_key, title, snippet(search, -1, char(2), char(3), '…', 12)
              FROM search WHERE search MATCH ?1 ORDER BY bm25(search, 0.0, 8.0, 3.0, 2.0, 1.0) LIMIT ?2",
         )?;
         let rows = statement.query_map(params![words, limit as i64], |row| {
@@ -895,6 +932,20 @@ mod tests {
         let key = SessionKey { env: EnvId::local(), harness: HarnessKind::Claude, id: "a".into() };
         library.index_body(&key, "we discussed the websocket reconnect").unwrap();
         assert_eq!(library.search("websock", 10).unwrap()[0].key, key);
+    }
+
+    #[test]
+    fn a_snippet_marks_its_matched_words_apart_from_brackets_in_the_text() {
+        let mut library = Library::in_memory().unwrap();
+        library.store_scan("local", "claude", &[summary("a", "Retries", "/w/app", 1)]).unwrap();
+        let key = SessionKey { env: EnvId::local(), harness: HarnessKind::Claude, id: "a".into() };
+        library.index_body(&key, "the [draft] webhook retry queue\nkeeps failed deliveries").unwrap();
+        let hit = &library.search("webhook", 10).unwrap()[0];
+        let pieces = snippet_pieces(&hit.snippet);
+        assert!(pieces.contains(&("webhook".into(), true)), "{pieces:?}");
+        assert!(pieces.iter().any(|(text, matched)| !matched && text.contains("[draft]")), "{pieces:?}");
+        assert!(pieces.iter().all(|(text, _)| !text.contains('\n')));
+        assert!(hit.bracketed().contains("[webhook]"), "{}", hit.bracketed());
     }
 
     #[test]

@@ -17,7 +17,8 @@ use crate::i18n::t;
 const STALE_MS: i64 = 5 * 60_000;
 /// How soon after the last look a finished turn or a click may look again.
 const AGAIN_MS: i64 = 20_000;
-/// How often the login of Claude Code on each machine is asked, open session or not.
+/// How often the login of Claude Code on each machine with a subscription's limits is asked,
+/// open session or not; one without them is asked every [`STALE_MS`].
 const LOGIN_STALE_MS: i64 = 30 * 60_000;
 
 /// The plan of one account: the harness on one machine.
@@ -95,7 +96,10 @@ impl Shell {
         for env in envs {
             let account = (env, HarnessKind::Claude);
             let state = self.plans.entry(account.clone()).or_default();
-            if !state.busy && now - state.at_ms >= LOGIN_STALE_MS {
+            // A machine without a subscription's limits is asked more often: a new login there
+            // shows soon.
+            let wait = if matches!(state.plan, Some(Plan::Limits { .. })) { LOGIN_STALE_MS } else { STALE_MS };
+            if !state.busy && now - state.at_ms >= wait {
                 state.busy = true;
                 self.probe_plan(account, cx);
             }

@@ -78,6 +78,7 @@ impl Shell {
         self.preview = None;
         self.spend_view = None;
         let title = format!("{}: {}", t("turn.title"), model::shorten(text.lines().next().unwrap_or(""), 90));
+        self.mission = None;
         self.turn_view = Some(TurnView { key: open.summary.key.clone(), prompt, title, files: None, confirm: false, busy: false });
         self.load_turn(cx);
         cx.notify();

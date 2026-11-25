@@ -11,7 +11,7 @@ mod context;
 pub mod pricing;
 mod tokens;
 
-pub use context::{ClaudeContext, ContextBreakdown, ContextPart, parse_claude_context};
+pub use context::{ClaudeContext, ContextBreakdown, ContextPart, parse_claude_context, window_of};
 pub use tokens::estimate_tokens;
 
 /// The harnesses the application knows how to read and start.

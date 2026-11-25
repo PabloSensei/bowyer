@@ -57,6 +57,7 @@ mod new_session;
 mod harness_view;
 mod turn_view;
 mod spend_view;
+mod mission_view;
 mod memory_tunnel;
 
 pub const APP_NAME: &str = "Bowyer";
@@ -107,6 +108,8 @@ enum Side {
     Right,
 }
 const TREE_ROW: f32 = 30.;
+/// A search result: the session and the words that matched under it.
+const SEARCH_ROW: f32 = 46.;
 /// The width of the stripe a folded side pane leaves.
 const STRIPE_WIDTH: f32 = 40.;
 /// The height of the terminal panel under the conversation, and how far it goes.
@@ -133,6 +136,19 @@ fn harness_color(harness: &HarnessKind) -> Hsla {
         HarnessKind::DeepSeek => hex(0x4D6BFE),
         HarnessKind::Other(_) => hex(0x9AA0A6),
     }
+}
+
+/// Bowyer's own pixel critter of a harness, in one colour: it stands for the harness in the
+/// tree, beside an answer, on a card and where a harness is picked.
+fn critter(harness: &HarnessKind, color: Hsla, size: f32) -> Svg {
+    let name = match harness {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Codex => "codex",
+        HarnessKind::OpenCode => "opencode",
+        HarnessKind::DeepSeek => "deepseek",
+        HarnessKind::Other(_) => "other",
+    };
+    svg().path(format!("icons/critters/{name}.svg")).size(px(size)).flex_none().text_color(color)
 }
 
 fn part_color(part: ContextPart) -> Hsla {
@@ -634,6 +650,12 @@ pub struct Shell {
     /// Turns the window runs, of any session; finished ones stay until their session is
     /// read again.
     runs: Vec<LiveRun>,
+    /// Mission control, while it is open: every agent at work in one grid.
+    mission: Option<mission_view::Mission>,
+    /// Counts the openings of mission control, so the ticker of a closed one stops.
+    mission_generation: u64,
+    /// The order of mission control's cards when it was last open: it opens again the same way.
+    mission_order: Vec<mission_view::CardId>,
     /// The harnesses' versions in each environment and the newest releases.
     harness_versions: harness_view::HarnessVersions,
     /// The memory server over HTTP and the tunnels that bring it to SSH hosts.
@@ -819,6 +841,9 @@ impl Shell {
             spend_view: None,
             spend_cache: Default::default(),
             runs: Vec::new(),
+            mission: None,
+            mission_generation: 0,
+            mission_order: Vec::new(),
             harness_versions: Default::default(),
             memory_link: Default::default(),
             next_run: 1,
@@ -1453,7 +1478,7 @@ impl Shell {
             .take(rerank::TOP)
             .map(|hit| {
                 let title = self.summaries.iter().find(|s| s.key == hit.key).map(|s| s.display_title()).unwrap_or_else(|| hit.title.clone());
-                (title, hit.snippet.clone())
+                (title, hit.bracketed())
             })
             .collect();
         let count = items.len();
@@ -2099,6 +2124,7 @@ impl Shell {
             }
             "enter" | "down" => {
                 if let Some(Row { kind: TreeNodeKind::Session(key), .. }) = self.rows.first().cloned() {
+                    self.mission = None;
                     self.open_session(key, cx);
                 }
             }
@@ -2185,8 +2211,16 @@ impl Shell {
             cx.notify();
             return;
         }
+        if stroke.key == "escape" && self.mission.take().is_some() {
+            cx.notify();
+            return;
+        }
         if stroke.key == "escape" && self.settings.is_some() {
             self.close_settings(cx);
+            return;
+        }
+        if primary && stroke.modifiers.shift && stroke.key == "m" {
+            self.toggle_mission(cx);
             return;
         }
         if primary && stroke.key == "," {
@@ -2632,6 +2666,11 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(2.))
+                    .child(
+                        icon_button("mission", "own/grid", t("mission.open"), Some("Ctrl+Shift+M".into()), &theme)
+                            .when(self.mission_open(), |this| this.bg(theme.selection_muted))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_mission(cx))),
+                    )
                     .child(icon_button("new-session", "general/add", t("new_session"), None, &theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| this.open_new_session(window, cx),
                     )))
@@ -2846,11 +2885,14 @@ impl Shell {
                     }));
                 (
                     div()
-                        .size(px(8.))
+                        .size(px(16.))
                         .flex_none()
-                        .rounded_full()
-                        .bg(harness_color(&key.harness))
-                        .when(running, |this| this.border_2().border_color(theme.accent).size(px(10.)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .when(running, |this| this.bg(theme.accent.opacity(0.22)))
+                        .child(critter(&key.harness, harness_color(&key.harness), 12.))
                         .into_any_element(),
                     div()
                         .flex()
@@ -2902,13 +2944,12 @@ impl Shell {
         let row_for_click = row.clone();
         let row_for_drop = row.clone();
         let row_for_menu = row.clone();
-        let mut element = div()
+        let base = div()
             .id(("row", ix))
             .group("tree-row")
             .flex()
             .items_center()
             .gap(px(6.))
-            .h(px(TREE_ROW))
             .w_full()
             .pl(px(6. + row.depth as f32 * 14.))
             // Room for the scrollbar, which widens over the right edge under the mouse.
@@ -2918,14 +2959,22 @@ impl Shell {
             .when(is_group, |this| this.text_color(theme.text_secondary).font_weight(FontWeight::MEDIUM))
             .when(is_more, |this| this.text_size(px(12.)).text_color(theme.accent))
             .when(selected, |this| this.bg(theme.selection_inactive))
-            .when(!selected, |this| this.hover(move |style| style.bg(hover)))
-            .child(chevron)
-            .child(lead)
-            .child(label)
-            .when(search_detail.is_none(), |this| this.child(trailing))
-            .when_some(search_detail, |this, detail| {
-                this.child(div().max_w(px(110.)).truncate().text_size(px(11.)).text_color(theme.text_muted).child(detail))
-            })
+            .when(!selected, |this| this.hover(move |style| style.bg(hover)));
+        let mut element = match search_detail {
+            // A search result: the session as in the tree, and under it the words that matched
+            // in their sentence.
+            Some(detail) => base.h(px(SEARCH_ROW)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(3.))
+                    .child(div().flex().items_center().gap(px(6.)).child(lead).child(label).child(trailing))
+                    .child(div().pl(px(22.)).truncate().text_size(px(11.5)).text_color(theme.text_muted).child(matched_snippet(&detail, &theme))),
+            ),
+            None => base.h(px(TREE_ROW)).child(chevron).child(lead).child(label).child(trailing),
+        }
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
                     this.start_rename(&row_for_click, window, cx);
@@ -2941,6 +2990,7 @@ impl Shell {
                         if row_for_click.expandable && event.click_count() == 1 && this.selected.as_ref() == Some(key) {
                             this.toggle_row(&row_for_click, cx);
                         }
+                        this.mission = None;
                         this.open_session(key.clone(), cx);
                     }
                     _ => this.toggle_row(&row_for_click, cx),
@@ -2967,7 +3017,11 @@ impl Shell {
 
     /// The conversation, and the terminal panel under it when it is shown.
     fn render_center(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let pane = self.render_conversation_pane(window, cx).into_any_element();
+        let pane = if self.mission_open() {
+            self.render_mission(cx)
+        } else {
+            self.render_conversation_pane(window, cx).into_any_element()
+        };
         let Some(panel) = self.render_terminal_panel(cx) else { return pane };
         let edge = div()
             .id("terminal-edge")
@@ -3033,7 +3087,7 @@ impl Shell {
                     .items_center()
                     .gap(px(10.))
                     .min_w_0()
-                    .child(badge(summary.key.harness.label(), harness_color(&summary.key.harness)))
+                    .child(badge(&summary.key.harness, harness_color(&summary.key.harness)))
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.)).truncate().child(title))
                     .when(self.loading, |this| this.child(div().text_color(theme.text_muted).child(t("loading")))),
             )
@@ -3252,10 +3306,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(hex(0xFFFFFF))
-                        .child(open.summary.key.harness.label().chars().next().unwrap_or('?').to_string()),
+                        .child(critter(&open.summary.key.harness, hex(0xFFFFFF), 12.)),
                 )
                 .child(
                     div()
@@ -3785,9 +3836,12 @@ fn logo(size: f32) -> impl IntoElement {
     img("brand/bowyer.png").size(px(size)).rounded(px(size * 0.22))
 }
 
-fn badge(label: &str, color: Hsla) -> impl IntoElement {
+fn badge(harness: &HarnessKind, color: Hsla) -> impl IntoElement {
     div()
         .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
         .px(px(8.))
         .py(px(2.))
         .rounded(px(5.))
@@ -3795,7 +3849,8 @@ fn badge(label: &str, color: Hsla) -> impl IntoElement {
         .text_color(color)
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
-        .child(label.to_owned())
+        .child(critter(harness, color, 12.))
+        .child(harness.label().to_owned())
 }
 
 /// The space at the end of a tree row: the counts and times stay clear of the scrollbar.
@@ -3963,6 +4018,26 @@ fn diff_view(old: &str, new: &str, theme: &Theme) -> impl IntoElement {
         .py(px(4.))
         .children(old.lines().take(400).map(|l| line(l, "−", theme.error)))
         .children(new.lines().take(400).map(|l| line(l, "+", theme.success)))
+}
+
+/// The words around a search match, the matched ones bright on a tint of the accent.
+fn matched_snippet(snippet: &str, theme: &Theme) -> StyledText {
+    let mut text = String::new();
+    let mut highlights = Vec::new();
+    for (piece, matched) in library::snippet_pieces(snippet) {
+        let start = text.len();
+        text.push_str(&piece);
+        if matched {
+            let style = HighlightStyle {
+                color: Some(theme.text),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                background_color: Some(theme.accent.opacity(0.2)),
+                ..Default::default()
+            };
+            highlights.push((start..text.len(), style));
+        }
+    }
+    StyledText::new(text).with_highlights(highlights)
 }
 
 /// Text coloured by the highlighter, with the code colours of the theme.

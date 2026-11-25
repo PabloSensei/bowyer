@@ -162,6 +162,20 @@ fn usage_of(value: &Value) -> Usage {
     }
 }
 
+/// The end of a Codex session from its last bytes, for a preview: a line cut at the start or
+/// still being written does not read and is left out. Entries are named by when they were
+/// written, so that the same entry keeps its name in a later, longer or shorter, read.
+pub fn codex_tail(text: &str) -> Transcript {
+    let mut transcript = parse_transcript(text);
+    let mut seen: HashMap<i64, usize> = HashMap::new();
+    for entry in &mut transcript.entries {
+        let n = seen.entry(entry.timestamp_ms).or_default();
+        entry.id = format!("{}#{n}", entry.timestamp_ms);
+        *n += 1;
+    }
+    transcript
+}
+
 pub fn parse_transcript(text: &str) -> Transcript {
     let mut transcript = Transcript::default();
     let mut calls: HashMap<String, (usize, usize)> = HashMap::new();
@@ -324,6 +338,22 @@ pub fn codex_turn_of_tail(tail: &[u8]) -> Option<TurnState> {
 
 #[cfg(test)]
 mod tests {
+    /// The end of a session read twice, the second time from further on: an entry keeps its
+    /// name, and a line cut at the start is left out.
+    #[test]
+    fn an_entry_keeps_its_name_from_one_read_of_the_end_to_the_next() {
+        use super::codex_tail;
+        let user = |at: &str, text: &str| format!(r#"{{"timestamp":"{at}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#);
+        let answer = |at: &str, text: &str| format!(r#"{{"timestamp":"{at}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#);
+        let lines = [user("2026-01-01T10:00:00Z", "one"), answer("2026-01-01T10:00:05Z", "two"), user("2026-01-01T10:01:00Z", "three")];
+        let whole = codex_tail(&lines.join("\n"));
+        let cut = codex_tail(&format!("stamp\":\"2026-01-01\"}}\n{}\n{}", lines[1], lines[2]));
+        assert_eq!(whole.entries.len(), 3);
+        assert_eq!(cut.entries.len(), 2, "the cut line is left out");
+        assert_eq!(whole.entries[1].id, cut.entries[0].id);
+        assert_eq!(whole.entries[2].id, cut.entries[1].id);
+    }
+
     #[test]
     fn a_file_name_of_any_letters_gives_an_id() {
         use super::file_id;

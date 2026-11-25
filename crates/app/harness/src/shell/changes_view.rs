@@ -131,6 +131,7 @@ impl Shell {
 
     pub(super) fn open_diff(&mut self, path: String, side: Side, cx: &mut Context<Self>) {
         self.preview = None;
+        self.mission = None;
         self.diff_view = Some(DiffView { path, side, diff: None, confirm: None, busy: false });
         self.turn_view = None;
         self.spend_view = None;
@@ -287,6 +288,7 @@ impl Shell {
         let hash = commit.hash.clone();
         self.diff_view = None;
         self.preview = None;
+        self.mission = None;
         self.commit_view = Some(CommitView { hash: hash.clone(), title: format!("{} {}", commit.short, commit.subject), files: None });
         self.turn_view = None;
         self.spend_view = None;

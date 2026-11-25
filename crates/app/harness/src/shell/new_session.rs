@@ -9,7 +9,7 @@ use model::{EnvId, HarnessKind};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{Shell, harness_color};
+use super::{Shell, critter, harness_color};
 use crate::i18n::t;
 use crate::launch;
 
@@ -355,7 +355,7 @@ impl Shell {
             let target = harness.clone();
             let mark = marks.remove(harness);
             option(SharedString::from(format!("new-harness-{}", harness.id())), chosen)
-                .child(div().size(px(8.)).rounded_full().bg(harness_color(harness)))
+                .child(critter(harness, harness_color(harness), 12.))
                 .child(harness.label().to_owned())
                 .when(!state.is_empty(), |this| this.child(div().text_size(px(11.)).text_color(theme.text_muted).child(state)))
                 .children(mark)

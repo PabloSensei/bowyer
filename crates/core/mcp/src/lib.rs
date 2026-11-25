@@ -457,7 +457,7 @@ impl Server {
                 harness = summary.key.harness,
                 folder = summary.cwd.as_deref().unwrap_or("?"),
                 updated = model::format_ms_utc(summary.updated_ms),
-                snippet = hit.snippet.replace('\n', " "),
+                snippet = hit.bracketed(),
             ));
             if lines.len() >= limit {
                 break;

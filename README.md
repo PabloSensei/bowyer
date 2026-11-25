@@ -44,16 +44,28 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/hero.png" alt="Bowyer in the Dark theme: the session tree groups sessions by environment, harness and project with three agent sessions under the Claude Code session that started them, the conversation shows folded tool calls and a code block above a composer with its own model and effort, and the side panel shows folding sections for the context window, plan limits, the session cost and the changed files" width="100%">
+  <img src=".github/readme/hero.png" alt="Bowyer in the Nightfall theme: the session tree groups sessions by environment, harness and project, each with its harness's pixel critter, with three agent sessions under the Claude Code session that started them; the conversation shows folded tool calls and a code block above a composer with its own model and effort, and the side panel shows folding sections for the context window, plan limits, the session cost and the changed files" width="100%">
 </p>
 
-> [!WARNING]
-> **Early preview.** Bowyer is young. Expect rough edges and breaking changes between versions. Bug reports are very welcome.
+## See it at work
+
+<p align="center">
+  <img src=".github/readme/mission-control.gif" alt="Mission control: six Claude Code and Codex agents stream their tool calls in a grid of cards; one card asks to run rm -rf .cache/build and pulses, Allow once is clicked on the card and the agent finishes; a click on a Codex card opens its session, and the grid comes back with every card in its place" width="100%">
+</p>
+
+**Mission control** (`Ctrl+Shift+M`) shows every agent at work in one grid: up to nine cards, each with its harness, machine and state, the last hundred lines of its log (tool calls with a spinner, then a tick or a cross), how full its context is, its pace in tokens a second and what its last turn cost. A card that waits for you pulses, and a permission question is answered right on the card. A click opens the session; each card keeps its place.
+
+<p align="center">
+  <img src=".github/readme/speed-and-search.gif" alt="Bowyer starts in 0.40 seconds with 788 sessions in the tree, opens a 400 MB Claude Code session in about a second, then Ctrl+K and the words webhook retry find seven sessions of Claude Code, Codex and OpenCode as they are typed, each with the sentence where the words matched" width="100%">
+</p>
+
+**Fast to open, quick to find.** On a Windows 11 desktop Bowyer shows a tree of almost 800 sessions in 0.4 seconds and opens a 400 MB session in about a second. `Ctrl+K` searches every conversation of every harness as you type, and each result shows the sentence where your words matched.
 
 ## Why Bowyer
 
 - **Every agent, one place.** Claude Code, Codex, OpenCode and DeepSeek each keep their history in their own folder, format and terminal. Bowyer reads all of them and shows every session you ever ran, on this machine and on your servers, in one searchable tree.
 - **Native and fast.** Rust from top to bottom and a GPU-rendered UI on GPUI. No Electron, no web view. Hundreds of sessions load in a moment and search as you type.
+- **Watch them all at once.** Mission control lays every running agent out in a grid of live cards and lets you answer a permission question without opening the session.
 - **Your files stay yours.** Bowyer only reads what the harnesses write. Folders, pins, names and notes live in Bowyer's own database; your agents keep working exactly as before, with or without the window open.
 - **See what a session really costs.** The context window split by what fills it, token totals, cost at API prices, and whether the prompt cache is still warm, so you know when compacting pays off.
 - **Keep going from the window.** Type a message and the harness runs the turn in the background, here or on an SSH host. Every session has its own turn, composer, model and effort, so several can run at once. The answer streams in; turns start with every permission allowed (one click switches to the harness's own settings or to accepting edits only), and questions show up as buttons, not as a terminal you have to find.
@@ -65,7 +77,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Every session in one tree</h3>
-      Sessions grouped by environment, harness and project (or any one of them), with your own folders, drag and drop, pins, renames and four sort orders, picked from lists at the bottom. Sub-agent and worktree sessions fold under the session that started them, and so do sessions Claude's desktop app started in a separate session. Long projects show the latest ten with <i>Show more</i>, and one button collapses everything. <i>Delete session</i> moves a Claude Code or Codex session into <code>~/.bowyer-trash</code> on its machine. Both side panels hide into thin stripes at the window's edges (<code>Ctrl+B</code>, <code>Ctrl+Alt+B</code>). Live state for sessions running in a terminal elsewhere: <i>working</i>, <i>waiting</i> or <i>your turn</i>, with a taskbar flash when one needs you. <code>Ctrl+K</code> searches titles, prompts, folders and the whole conversation text (SQLite FTS5).
+      Sessions grouped by environment, harness and project (or any one of them), with your own folders, drag and drop, pins, renames and four sort orders, picked from lists at the bottom. Sub-agent and worktree sessions fold under the session that started them, and so do sessions Claude's desktop app started in a separate session. Long projects show the latest ten with <i>Show more</i>, and one button collapses everything. <i>Delete session</i> moves a Claude Code or Codex session into <code>~/.bowyer-trash</code> on its machine. Both side panels hide into thin stripes at the window's edges (<code>Ctrl+B</code>, <code>Ctrl+Alt+B</code>). Each harness has a pixel critter of its own, so a glance tells Claude Code from Codex or OpenCode. Live state for sessions running in a terminal elsewhere: <i>working</i>, <i>waiting</i> or <i>your turn</i>, with a taskbar flash when one needs you. <code>Ctrl+K</code> searches titles, prompts, folders and the whole conversation text (SQLite FTS5); each result shows the sentence where the words matched, with the words lit.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/tree.png" alt="The session tree: This computer, then Claude Code, OpenCode and Codex, then projects; under shop-api a Claude Code session with three agent sessions nested under it">
@@ -77,7 +89,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>A chat, not a terminal dump</h3>
-      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so does the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills (the user's, the project's and those of plugins turned on, with their descriptions), <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next, or straight in while Claude Code waits for a command it left in the background (shown above the composer, each with its own stop); <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag and a button that takes you back to the end. <i>Branch from here</i> under a prompt of a Claude Code session starts a new session from the conversation before it, and <i>Changes of this turn</i> shows what the answer did to each file, from Claude Code's own backups, with an undo of the whole turn (what the files were goes to the trash first). A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
+      Markdown, highlighted code blocks with Copy and Run, folded thinking, and tool calls folded into one line per run that open into commands, output and diffs. Background task notices fold into a short line, and so do what a hook told the model and the long summary a harness writes when it compacts the context. Paste screenshots, drop files, <code>/</code> for commands and skills (the user's, the project's and those of plugins turned on, with their descriptions), <code>@</code> for files of the session's folder. Select text across messages and ask about it. Claude Code and OpenCode ask before a command or edit their settings don't allow, right in the window, and Claude's questions come with their choices and a field for your own answer. Send another prompt while a turn runs and it goes next, or straight in while Claude Code waits for a command it left in the background (shown above the composer, each with its own stop); <i>Stop</i> belongs to its session. The view stays where you read while new text arrives, with a scrollbar you can drag and a button that takes you back to the end. <i>Branch from here</i> under a prompt of a Claude Code session starts a new session from the conversation before it, and <i>Changes of this turn</i> shows what the answer did to each file, from Claude Code's own backups, with an undo of the whole turn (what the files were goes to the trash first). A prompt that never reached the model (a wrong model, the wrong session) can be deleted: Claude Code resumes from the answer before it.
     </td>
   </tr>
   <tr>
@@ -109,7 +121,7 @@ And more:
 - **Settings in one place,** in a dialog over the window: language, appearance, sessions, harnesses, SSH hosts, terminal, search, memory and updates.
 - **Quits cleanly.** When a turn is at work, a command an agent left in the background still runs, or a terminal runs a program, quitting asks first, then stops them and waits for them to end. A harness that only waits for you and a shell at its prompt are stopped without a question.
 - **Stays awake while agents work.** While a turn runs, an agent's background command goes on, or a terminal is busy, the computer does not go to sleep (the screen may still turn off). One switch in the settings turns it off.
-- **Themes.** Seven built in (Dark, Light, High Contrast, Retro, Nord, Mocha, Paper), your own as JSON with a live editor, and import of VS Code themes and IntelliJ `.icls` schemes. The interface speaks English, Simplified Chinese, Spanish, Brazilian Portuguese, German, French, Japanese and Russian.
+- **Themes.** Eight built in (Dark, Light, High Contrast, Retro, Nord, Mocha, Paper and the violet Nightfall), your own as JSON with a live editor, and import of VS Code themes and IntelliJ `.icls` schemes. The interface speaks English, Simplified Chinese, Spanish, Brazilian Portuguese, German, French, Japanese and Russian.
 - **Stays out of the way.** Closing the window can keep Bowyer in the notification area, watching your sessions: on Windows, and on Linux desktops whose panel shows tray icons (StatusNotifierItem: KDE, GNOME with the AppIndicator extension, waybar and others).
 - **Export to Markdown.** A session from its menu or with `/export`: what was said, with each tool call folded under its summary.
 - **Updates itself** from a signed feed: it checks on start and twice a day, and installs only when you click.
@@ -155,7 +167,7 @@ Bowyer checks for a new version on start and twice a day (Settings → Updates t
 
 Your library, themes and caches live in `%APPDATA%\Bowyer`, `~/.local/share/Bowyer` or `~/Library/Application Support/Bowyer` and survive uninstalling.
 
-Known limitations of this preview:
+Known limitations:
 
 - Linux and macOS are built and tested by CI, but used far less than the Windows build.
 - Codex and DeepSeek Harness support is written but has not been tried against a real installation yet. Claude Code and OpenCode are used every day.
@@ -178,6 +190,7 @@ The binary is `bowyer`. `--data-dir <folder>` keeps the database somewhere else,
 | Area | State |
 |---|---|
 | Session tree, search, conversation view | ✅ Works every day |
+| Mission control | 🚧 New |
 | Claude Code: history, live turns, permissions, plugins | ✅ Works |
 | OpenCode: history, live turns over the Agent Client Protocol | ✅ Works |
 | Codex, DeepSeek Harness | 🚧 Written, untested |

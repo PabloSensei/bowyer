@@ -878,6 +878,10 @@ fn read_claude(
 /// (`--replay-user-messages`): Claude Code 2.0.19 and later mark it `isReplay`, an older one
 /// only by its shape (text and pictures, not a tool's result, not a subagent's prompt).
 fn replay_text(line: &Value) -> Option<String> {
+    // What a hook said to the model comes back too: it is not a prompt the user sent.
+    if history::hook_feedback(line).is_some() {
+        return None;
+    }
     match line.get("isReplay") {
         Some(Value::Bool(true)) => {}
         Some(_) => return None,
