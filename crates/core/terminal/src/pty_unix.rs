@@ -69,9 +69,6 @@ pub(crate) struct Pty {
     master: File,
     child: Mutex<Option<Child>>,
     pub(crate) pid: u32,
-    /// The terminal as `pkill -t` names it (`pts/3`, `ttys005`): every process that still
-    /// has it as its own terminal was started in it.
-    tty: String,
     /// The child has exited: its number may belong to another process soon, so it is not
     /// signalled any more. Set before the child is reaped.
     exited: AtomicBool,
@@ -143,7 +140,6 @@ impl Pty {
                 master,
                 child: Mutex::new(Some(child)),
                 pid,
-                tty: name.trim_start_matches("/dev/").to_owned(),
                 exited: AtomicBool::new(false),
             },
             writer,
@@ -194,20 +190,18 @@ impl Pty {
     /// terminal, so the tab ends.
     pub(crate) fn terminate(&self) {
         // A session lives as long as one of its processes, and its number is not given to a
-        // new process meanwhile: `pkill -s` reaches only what the terminal started. The
-        // `pkill` of macOS does not find a session's processes that way, so the processes
-        // whose terminal this is go too (a job of the shell keeps it; a daemon that left it,
-        // as daemons do, stays). The name is ours while `master` is open, which it is here
-        // and in `drop`: no other terminal can have it yet.
-        let pkill = |args: &[&str]| {
-            let _ = Command::new("pkill").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        };
-        // By the terminal first: once the session's leader is gone, macOS takes the terminal
-        // away from the rest of the session and `-t` finds nothing more.
-        if !self.tty.is_empty() {
-            pkill(&["-KILL", "-t", &self.tty]);
+        // new process meanwhile: the processes whose session it is are what the terminal
+        // started, background jobs in their own groups among them. Asked of the system
+        // itself, as `pkill -s` does not find them on macOS. Twice, for one forked meanwhile.
+        let sid = self.pid as libc::pid_t;
+        for _ in 0..2 {
+            for pid in session_processes(sid) {
+                // SAFETY: `pid` was in the session a moment ago, and the session is ours.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
         }
-        pkill(&["-KILL", "-s", &self.pid.to_string()]);
         if !self.exited.load(Ordering::SeqCst) {
             // SAFETY: the child has not exited, so the number is still its own.
             unsafe {
@@ -224,6 +218,45 @@ impl Pty {
 
     /// `terminate` already signals the whole session of the child.
     pub(crate) fn kill_tree(&self) {}
+}
+
+/// The processes of the session `sid`, but not its leader while that is our child (the
+/// caller signals it by its number only while it has not exited).
+fn session_processes(sid: libc::pid_t) -> Vec<libc::pid_t> {
+    all_processes()
+        .into_iter()
+        .filter(|&pid| pid != sid && pid > 1)
+        // SAFETY: a plain query; a process gone meanwhile answers -1.
+        .filter(|&pid| unsafe { libc::getsid(pid) } == sid)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .map(|entries| entries.flatten().filter_map(|entry| entry.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn all_processes() -> Vec<libc::pid_t> {
+    // SAFETY: a null buffer asks for the count; then the buffer holds that many and more.
+    unsafe {
+        let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut pids: Vec<libc::pid_t> = vec![0; count as usize + 64];
+        let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        let found = libc::proc_listallpids(pids.as_mut_ptr().cast(), size);
+        pids.truncate(found.max(0) as usize);
+        pids
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn all_processes() -> Vec<libc::pid_t> {
+    Vec::new()
 }
 
 impl Drop for Pty {
