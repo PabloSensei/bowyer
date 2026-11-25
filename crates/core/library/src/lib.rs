@@ -269,8 +269,15 @@ impl Library {
             // A session the user renamed is found by its name.
             let title = given_title(&transaction, &key)?.unwrap_or_else(|| summary.title.clone());
             match fts_row(&transaction, "search_rows", &key)? {
+                // FTS5 writes a row anew whole, the text of the conversation too: a running
+                // session changes on every poll, its title, prompt and folder seldom.
                 Some(row) => {
-                    transaction.execute("UPDATE search SET title = ?2, prompt = ?3, cwd = ?4 WHERE rowid = ?1", params![row, title, prompt, cwd])?;
+                    let indexed: Option<(String, String, String)> = transaction
+                        .query_row("SELECT title, prompt, cwd FROM search WHERE rowid = ?1", [row], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .optional()?;
+                    if indexed.as_ref().is_none_or(|(old_title, old_prompt, old_cwd)| (old_title, old_prompt, old_cwd) != (&title, &prompt, &cwd)) {
+                        transaction.execute("UPDATE search SET title = ?2, prompt = ?3, cwd = ?4 WHERE rowid = ?1", params![row, title, prompt, cwd])?;
+                    }
                 }
                 None => {
                     transaction.execute(
@@ -788,6 +795,35 @@ mod tests {
         assert_eq!(library.bodies_to_index("local", i64::MAX, 10).unwrap().len(), 1);
         assert!(library.bodies_to_index("ssh:host", i64::MAX, 10).unwrap().is_empty(), "per environment");
         assert!(library.bodies_to_index("local", 5, 10).unwrap().is_empty(), "written lately: later");
+    }
+
+    /// A running session changes on every poll; the full-text index is written only when
+    /// what it holds changed, not with the whole text of the conversation each time.
+    #[test]
+    fn a_running_session_does_not_rewrite_its_text_in_the_index() {
+        let mut library = Library::in_memory().unwrap();
+        let mut running = summary("a", "Parser work", "/w", 10);
+        library.store_scan("local", "claude", &[running.clone()]).unwrap();
+        library.index_session(&running, &"the websocket reconnect ".repeat(5_000)).unwrap();
+        let written = |library: &Library| -> (i64, i64) {
+            library.connection.query_row("SELECT count(*), total(length(block)) FROM search_data", [], |row| Ok((row.get(0)?, row.get::<_, f64>(1)? as i64))).unwrap()
+        };
+        let before = written(&library);
+        for poll in 1..=5 {
+            running.updated_ms += poll;
+            running.source.size += 100;
+            running.source.modified_ms += poll;
+            running.turn = Some(model::TurnState::Working);
+            assert!(library.store_scan("local", "claude", &[running.clone()]).unwrap(), "the row in the tree changed");
+        }
+        assert_eq!(written(&library), before, "the index was not written");
+        assert_eq!(library.search("websock", 10).unwrap().len(), 1);
+
+        running.title = "Parser and sockets".into();
+        library.store_scan("local", "claude", &[running]).unwrap();
+        assert_ne!(written(&library), before, "a new title is written");
+        assert_eq!(library.search("sockets", 10).unwrap().len(), 1);
+        assert_eq!(library.search("websock", 10).unwrap().len(), 1, "the text stays");
     }
 
     /// A renamed session is found by its name after the next scan too, and by the

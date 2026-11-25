@@ -274,6 +274,7 @@ impl Shell {
         }));
         let notify = self.notifications_enabled();
         let tray_close = tray::close_to_tray();
+        let keep_awake = self.keep_awake_enabled();
         let data = self.settings_dir.clone();
         let data_text = data.to_string_lossy().into_owned();
         vec![
@@ -291,6 +292,15 @@ impl Shell {
                     toggle("tray-close", tray_close, theme, cx, |this, on, cx| {
                         tray::set_close_to_tray(on);
                         this.set_flag("tray.close", on, cx);
+                    }),
+                    theme,
+                ))
+                .child(row(
+                    t("settings.keep_awake"),
+                    Some(t("settings.keep_awake_hint")),
+                    toggle("keep-awake", keep_awake, theme, cx, |this, on, cx| {
+                        this.set_flag("power.keep_awake", on, cx);
+                        this.keep_awake(cx);
                     }),
                     theme,
                 ))

@@ -300,6 +300,7 @@ impl Engine {
         self.shared
             .bytes
             .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        self.shared.output_came();
         drop(self.events.try_send(TerminalEvent::Output));
         self.dirty = true;
         self.search_dirty = self.search.is_some();

@@ -140,6 +140,12 @@ pub enum LiveEvent {
     Stderr(String),
     /// The harness waits for the user to allow or refuse an action.
     Permission(PermissionAsk),
+    /// The harness answered (`true`) but goes on running for what it left in the background
+    /// (a command, an agent, a wakeup); `false` once that brings it back to work.
+    Resting(bool),
+    /// What the harness runs in the background now, by description: commands and agents it
+    /// started and has not heard the end of (Claude's `background_tasks_changed`).
+    Background(Vec<String>),
     Finished { ok: bool, error: Option<String> },
 }
 
@@ -735,6 +741,9 @@ fn read_claude(
     let mut named = false;
     let mut error = None;
     let mut partial = Partial::default();
+    // Past a result Claude still runs while a command, an agent or a wakeup it left in the
+    // background is pending; what it finishes comes back as a turn of its own.
+    let mut resting = false;
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
         if !named && let Some(id) = value.get("session_id").and_then(Value::as_str) {
@@ -742,12 +751,25 @@ fn read_claude(
             let _ = sender.unbounded_send(LiveEvent::Session(id.to_owned()));
         }
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if resting && matches!(kind, "user" | "assistant" | "stream_event") {
+            resting = false;
+            let _ = sender.unbounded_send(LiveEvent::Resting(false));
+        }
+        if kind == "result" && !resting {
+            resting = true;
+            let _ = sender.unbounded_send(LiveEvent::Resting(true));
+        }
         if kind == "control_request" {
             claude_ask::take_request(&value, answers, sender);
             continue;
         }
         if kind == "system" {
             claude_ask::take_task(&value, tasks);
+            if value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed") {
+                let described = |task: &Value| task.get("description").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let running = value.get("tasks").and_then(Value::as_array).map(|tasks| tasks.iter().map(described).collect()).unwrap_or_default();
+                let _ = sender.unbounded_send(LiveEvent::Background(running));
+            }
         }
         if kind == "result" {
             // The turn is over: with its input closed, Claude ends instead of waiting for
@@ -1191,6 +1213,45 @@ mod tests {
         let last = updates.last().unwrap();
         assert_eq!(text_of(last).matches("Rivers flow.").count(), 1, "the whole block replaces the partial text");
         assert_eq!(last.entries.len(), 2, "the prompt and one answer");
+    }
+
+    /// Claude answers, waits for a command it left in the background, and takes up the
+    /// notice of its end as a turn of its own: the window sees it rest and work again.
+    #[test]
+    fn claude_rests_between_its_answer_and_what_it_left_in_the_background() {
+        // As Claude Code 2.1.332 wrote them in a real turn: the command goes to the background,
+        // the answer ends the turn, and the notice of the end starts one of its own.
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build","run_in_background":true}}]}}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"Build the app"}]}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"t1","description":"Build the app","is_backgrounded":true}"#,
+            r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"Building in the background."}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Building in the background."}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed"}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"t1","status":"completed"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"The build passed."}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"The build passed."}"#,
+        ]
+        .map(String::from);
+        let (sender, mut events) = unbounded();
+        let error = read_claude(lines.into_iter(), &[Block::Text { text: "Build it".into() }], &sender, &claude_ask::Input::closed(), &claude_ask::Tasks::default());
+        assert_eq!(error, None);
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) = events.try_next() {
+            match event {
+                LiveEvent::Resting(now) => seen.push(format!("resting {now}")),
+                LiveEvent::Background(tasks) => seen.push(format!("background {tasks:?}")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [r#"background ["Build the app"]"#, "resting true", "background []", "resting false", "resting true"],
+            "system lines alone do not wake it"
+        );
     }
 
     #[derive(Clone, Default)]

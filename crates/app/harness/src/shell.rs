@@ -40,6 +40,7 @@ mod memory_view;
 mod drop_view;
 mod plan_view;
 mod quit_view;
+mod awake_view;
 mod context_menu;
 mod selection;
 mod settings_view;
@@ -321,6 +322,12 @@ struct OpenSession {
     failed: Option<model::FailedTurn>,
 }
 
+/// A prompt waiting for the end of a turn, and the files sent with it.
+struct Queued {
+    text: String,
+    attached: Vec<composer::Attached>,
+}
+
 /// A turn the window runs. Each belongs to its session: several sessions can run at once,
 /// and the composer and the conversation show the one of the open session.
 struct LiveRun {
@@ -336,9 +343,10 @@ struct LiveRun {
     effort: Option<String>,
     /// The turn as it was asked for: a prompt sent while it runs goes the same way.
     spec: live::TurnSpec,
-    /// Prompts sent while the turn runs: they go as the next turn of the session when this
-    /// one ends well, and back into the composer when it fails or is stopped.
-    queued: Vec<String>,
+    /// Prompts sent while the turn runs, with their files: they go as the next turn of the
+    /// session when this one ends well, and back into the composer when it fails or is
+    /// stopped.
+    queued: Vec<Queued>,
     stop: StopHandle,
     items: Arc<Vec<Item>>,
     turn: Option<Transcript>,
@@ -356,6 +364,11 @@ struct LiveRun {
     typing: Option<(String, usize)>,
     answer_focus: FocusHandle,
     finished: bool,
+    /// The harness answered and runs on only for what it left in the background (a command,
+    /// an agent, a wakeup): the user's move, though its process lives.
+    resting: bool,
+    /// What the harness runs in the background, by description.
+    background: Vec<String>,
     error: Option<String>,
     stderr: String,
 }
@@ -572,6 +585,8 @@ pub struct Shell {
     month_cache: plan_view::MonthCache,
     /// The question before quitting while turns or terminals run.
     quit_ask: Option<quit_view::QuitAsk>,
+    /// The computer kept from sleeping while agents work.
+    awake: crate::awake::Awake,
     /// A watched session wants its user (no key: the open one): on the next draw the
     /// window flashes and the system shows a notification, if the window is not in front.
     attention: Option<(Option<SessionKey>, Call)>,
@@ -760,6 +775,7 @@ impl Shell {
             months: HashMap::new(),
             month_cache: Default::default(),
             quit_ask: None,
+            awake: Default::default(),
             right_tab: Default::default(),
             files: Default::default(),
             preview: None,
@@ -799,6 +815,7 @@ impl Shell {
                     this.poll_open_remote(cx);
                     this.poll_pinned_remote(cx);
                     this.retry_failures(cx);
+                    this.keep_awake(cx);
                 });
                 if polled.is_err() {
                     break;
@@ -3100,24 +3117,36 @@ impl Shell {
                 )
                 .into_any_element()
         };
-        div().w_full().px(px(24.)).py(px(10.)).max_w(px(980.)).mx_auto().child(content).into_any_element()
+        // A row of the list is laid out on its own, where `mx_auto` has no parent to centre
+        // in: a full-width row centres the column instead.
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(div().w_full().max_w(px(980.)).min_w_0().px(px(24.)).py(px(10.)).child(content))
+            .into_any_element()
     }
 
     fn render_piece(&self, ix: usize, pi: usize, piece: &Piece, user: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         match piece {
             Piece::Markdown(blocks) => self.markdown_view(blocks, ix * 1000 + pi, cx).into_any_element(),
+            // One line, as wide as the column at most: a long one ends in an ellipsis.
             Piece::Notice(text) => div()
                 .flex()
                 .justify_center()
+                .min_w_0()
                 .child(
                     div()
+                        .max_w_full()
+                        .min_w_0()
                         .px(px(10.))
                         .py(px(3.))
                         .rounded_full()
                         .bg(theme.hover)
                         .text_size(px(11.))
                         .text_color(theme.text_muted)
+                        .truncate()
                         .child(text.clone()),
                 )
                 .into_any_element(),
@@ -3890,7 +3919,11 @@ impl Shell {
             return;
         }
         let title = format!("{} · {}", summary.key.harness.label(), summary.display_title());
-        if !self.show_in_terminal(launch::resume_line(&*env, &summary), title, window, cx) {
+        if self.show_in_terminal(launch::resume_line(&*env, &summary), title, window, cx) {
+            if let Some(view) = self.terminals.last() {
+                view.update(cx, |view, _| view.harness = true);
+            }
+        } else {
             let result = launch::resume_in_terminal(&*env, &summary);
             self.report(result, cx);
         }

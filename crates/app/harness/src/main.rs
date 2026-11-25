@@ -9,6 +9,7 @@ use library::Library;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
+mod awake;
 mod display;
 mod extensions;
 mod highlight;
@@ -148,6 +149,10 @@ fn start_tray(hwnd: Option<usize>, view: Entity<Shell>, cx: &mut App) {
                 tray::TrayEvent::Quit => cx.update(|cx| {
                     if view.update(cx, |shell, cx| shell.may_quit(cx)) {
                         cx.quit();
+                        return;
+                    }
+                    // Nothing went on: it quits by itself in a moment.
+                    if !view.read(cx).asking() {
                         return;
                     }
                     // The question is in the window: bring it up, from the icon too.

@@ -14,6 +14,7 @@ mod console;
 mod engine;
 mod env;
 mod keys;
+mod programs;
 mod screen;
 mod search;
 mod session;

@@ -753,7 +753,7 @@ fn command_notice(text: &str) -> Option<Option<String>> {
     }
     // The harness tells the model that a background command or agent finished: one line.
     if text.starts_with("<task-notification>") {
-        let summary = tag(text, "summary").map(str::trim).filter(|summary| !summary.is_empty());
+        let summary = tag(text, "summary").map(unescape_xml).map(|summary| task_line(&summary)).filter(|summary| !summary.is_empty());
         let status = tag(text, "status").map(str::trim).unwrap_or_default();
         return Some(Some(match summary {
             Some(summary) => format!("◷ {summary}"),
@@ -761,6 +761,25 @@ fn command_notice(text: &str) -> Option<Option<String>> {
         }));
     }
     text.starts_with("<local-command-caveat>").then_some(None)
+}
+
+/// The text of an XML element as written: `&lt;`, `&gt;`, `&quot;`, `&apos;` and `&amp;`
+/// read back (`&amp;` last, so `&amp;gt;` stays `&gt;`).
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&#39;", "'").replace("&amp;", "&")
+}
+
+/// A task's summary as one line that says how it ended first: `Background command "<a long
+/// command>" completed (exit code 0)` becomes `Background command completed (exit code 0):
+/// <the command>`, so cutting the line short cuts the command, not the outcome.
+fn task_line(summary: &str) -> String {
+    let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (Some(open), Some(close)) = (summary.find('"'), summary.rfind('"')) else { return summary };
+    let (kind, what, outcome) = (summary[..open].trim(), &summary[open + 1..close], summary[close + 1..].trim());
+    if close <= open || kind.is_empty() || outcome.is_empty() || what.is_empty() {
+        return summary;
+    }
+    format!("{kind} {outcome}: {what}")
 }
 
 /// The whole transcript of a session file.
@@ -1049,8 +1068,14 @@ Task 0.16: previews"), "Task 0.16: previews");
 <status>completed</status>
 <summary>Background command \"Run checks\" completed (exit code 0)</summary>
 </task-notification>"),
-            Some(Some("◷ Background command \"Run checks\" completed (exit code 0)".to_owned()))
+            Some(Some("◷ Background command completed (exit code 0): Run checks".to_owned()))
         );
+        // A long command comes escaped and over lines: one line, as written, outcome first.
+        assert_eq!(
+            command_notice("<task-notification>\n<summary>Background command \"cd /w; gh run watch 7 &gt; /dev/null 2&gt;&amp;1;\n echo \"exit $?\"\" completed (exit code 0)</summary>\n</task-notification>"),
+            Some(Some("◷ Background command completed (exit code 0): cd /w; gh run watch 7 > /dev/null 2>&1; echo \"exit $?\"".to_owned()))
+        );
+        assert_eq!(task_line("Agent finished"), "Agent finished", "no quoted part: as it is");
         assert_eq!(command_notice("<task-notification><status>failed</status></task-notification>"), Some(Some("◷ task failed".to_owned())));
 
         let line = r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-args>haiku</command-args>"},"timestamp":"2026-11-01T10:07:00.000Z"}"#;

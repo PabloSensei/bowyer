@@ -107,7 +107,8 @@ And more:
 - **Harness versions** next to each harness in the tree, the composer and the new-session dialog, with an arrow when a newer release is out: it runs the harness's own update in a terminal tab. A harness that is not installed shows its official install command (OpenCode 2 included).
 - **MCP servers and plugins** of each harness at a glance; Claude Code plugins switch on and off (Bowyer keeps a backup of the settings it changes).
 - **Settings in one place,** in a dialog over the window: language, appearance, sessions, harnesses, SSH hosts, terminal, search, memory and updates.
-- **Quits cleanly.** With turns or terminals still running, quitting asks first, then stops them and waits for them to end.
+- **Quits cleanly.** When a turn is at work, a command an agent left in the background still runs, or a terminal runs a program, quitting asks first, then stops them and waits for them to end. A harness that only waits for you and a shell at its prompt are stopped without a question.
+- **Stays awake while agents work.** While a turn runs, an agent's background command goes on, or a terminal is busy, the computer does not go to sleep (the screen may still turn off). One switch in the settings turns it off.
 - **Themes.** Seven built in (Dark, Light, High Contrast, Retro, Nord, Mocha, Paper), your own as JSON with a live editor, and import of VS Code themes and IntelliJ `.icls` schemes. The interface speaks English, Simplified Chinese, Spanish, Brazilian Portuguese, German, French, Japanese and Russian.
 - **Stays out of the way.** Closing the window can keep Bowyer in the notification area, watching your sessions: on Windows, and on Linux desktops whose panel shows tray icons (StatusNotifierItem: KDE, GNOME with the AppIndicator extension, waybar and others).
 - **Updates itself** from a signed feed: it checks on start and twice a day, and installs only when you click.

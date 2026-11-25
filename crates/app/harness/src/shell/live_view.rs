@@ -81,6 +81,19 @@ fn queued_spec(mut spec: TurnSpec, model: Option<String>, effort: Option<String>
     spec
 }
 
+/// The prompts of a queue as one, and all their files in order.
+fn join_queued(queued: Vec<super::Queued>) -> (String, Vec<composer::Attached>) {
+    let mut texts = Vec::new();
+    let mut files = Vec::new();
+    for item in queued {
+        if !item.text.is_empty() {
+            texts.push(item.text);
+        }
+        files.extend(item.attached);
+    }
+    (texts.join("\n\n"), files)
+}
+
 fn foreign_model(harness: &HarnessKind, model: &str) -> bool {
     *harness == HarnessKind::Claude && !model.starts_with("claude-") && !model_presets(harness).contains(&Some(model))
 }
@@ -597,7 +610,7 @@ impl Shell {
         // Claude Code on a host reaches Bowyer's memory through the window's tunnel.
         let mcp_config = if summary.key.harness == HarnessKind::Claude { self.turn_mcp_config(&summary.key.env, &cwd, cx) } else { None };
         let mcp_config = mcp_config.map(live::McpConfig::Text);
-        let mut spec = TurnSpec {
+        let spec = TurnSpec {
             harness: summary.key.harness.clone(),
             session,
             cwd,
@@ -612,9 +625,16 @@ impl Shell {
             mcp_config,
         };
         let attached = std::mem::take(&mut self.attachments);
+        self.start_with_files(summary.key.clone(), spec, attached, true, None, cx);
+    }
+
+    /// Starts a turn with its files: on an SSH host they go up first (with the memory's
+    /// config), off the window's thread; Claude takes pictures inline. A failed upload
+    /// puts the files back where they were typed. `from_composer` and `base` are as for
+    /// [`Self::start_turn_from`].
+    fn start_with_files(&mut self, key: SessionKey, mut spec: TurnSpec, attached: Vec<composer::Attached>, from_composer: bool, base: Option<usize>, cx: &mut Context<Self>) {
         let backup = attached.clone();
         let harness = spec.harness.clone();
-        let key = summary.key.clone();
         let slot = draft_slot(&key, Some(&spec.cwd));
         // Claude takes pictures inline; every other file must be on the machine of the turn.
         let inline = move |a: &composer::Attached| harness == HarnessKind::Claude && a.picture.is_some();
@@ -650,12 +670,12 @@ impl Shell {
                     this.update(cx, |this, cx| {
                         this.uploading = false;
                         match uploaded {
-                            Ok(spec) => this.start_turn(key, spec, backup, cx),
+                            Ok(spec) => this.start_turn_from(key, spec, backup, from_composer, base, cx),
                             Err(error) => {
                                 if this.open.as_ref().is_some_and(|open| parked(&open.summary) == slot) {
-                                    this.attachments = backup;
+                                    this.attachments.splice(0..0, backup);
                                 } else {
-                                    this.drafts.entry(slot).or_insert_with(|| (TextField::from_text(""), Vec::new())).1 = backup;
+                                    this.drafts.entry(slot).or_insert_with(|| (TextField::from_text(""), Vec::new())).1.splice(0..0, backup);
                                 }
                                 this.status = Some(format!("{}: {error}", t("error")));
                                 cx.notify();
@@ -675,34 +695,36 @@ impl Shell {
                         as_live(a, path)
                     })
                     .collect();
-                self.start_turn(summary.key.clone(), spec, backup, cx);
+                self.start_turn_from(key, spec, backup, from_composer, base, cx);
             }
         }
     }
 
-    /// A prompt sent while the open session's turn runs: it waits for the end of the turn.
-    /// Attachments stay in the composer for the turn after.
+    /// A prompt sent while the open session's turn runs: it waits for the end of the turn,
+    /// with the files attached to it.
     fn queue_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         let Some(ix) = self.live_ix() else { return };
-        if prompt.is_empty() {
+        if prompt.is_empty() && self.attachments.is_empty() {
             return;
         }
-        self.runs[ix].queued.push(prompt);
+        let attached = std::mem::take(&mut self.attachments);
+        self.runs[ix].queued.push(super::Queued { text: prompt, attached });
         self.composer = TextField::from_text("");
         self.completion = None;
         cx.notify();
     }
 
-    /// Takes a waiting prompt back into the composer.
+    /// Takes a waiting prompt back into the composer, its files too.
     fn unqueue(&mut self, at: usize, cx: &mut Context<Self>) {
         let Some(ix) = self.live_ix() else { return };
         let queued = &mut self.runs[ix].queued;
         if at >= queued.len() {
             return;
         }
-        let prompt = queued.remove(at);
+        let super::Queued { text: prompt, attached } = queued.remove(at);
         let text = if self.composer.text.trim().is_empty() { prompt } else { format!("{prompt}\n\n{}", self.composer.text) };
         self.composer = TextField::from_text(&text);
+        self.attachments.splice(0..0, attached);
         cx.notify();
     }
 
@@ -716,7 +738,8 @@ impl Shell {
                 .gap(px(4.))
                 .mb(px(8.))
                 .child(div().text_size(px(11.5)).text_color(theme.text_muted).child(t("live.queued")))
-                .children(live.queued.iter().enumerate().map(|(at, prompt)| {
+                .children(live.queued.iter().enumerate().map(|(at, queued)| {
+                    let files = queued.attached.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
                     div()
                         .id(("queued", at))
                         .flex()
@@ -729,7 +752,10 @@ impl Shell {
                         .border_1()
                         .border_color(theme.border)
                         .text_size(px(12.5))
-                        .child(div().flex_1().min_w_0().truncate().child(prompt.lines().next().unwrap_or("").to_owned()))
+                        .child(div().flex_1().min_w_0().truncate().child(queued.text.lines().next().unwrap_or("").to_owned()))
+                        .when(!files.is_empty(), |this| {
+                            this.child(div().flex_none().max_w(px(220.)).truncate().text_size(px(11.5)).text_color(theme.text_muted).child(files))
+                        })
                         .child(
                             div()
                                 .id(("unqueue", at))
@@ -747,21 +773,19 @@ impl Shell {
         )
     }
 
-    /// The next turn of a session whose turn just ended, with the prompts sent meanwhile.
-    fn send_queued(&mut self, spec: TurnSpec, key: SessionKey, queued: Vec<String>, base: Option<usize>, cx: &mut Context<Self>) {
+    /// The next turn of a session whose turn just ended, with the prompts sent meanwhile and
+    /// their files.
+    fn send_queued(&mut self, spec: TurnSpec, key: SessionKey, queued: Vec<super::Queued>, base: Option<usize>, cx: &mut Context<Self>) {
         let kept = |kind: &str| self.lib().setting(&choice_setting(kind, &key));
         let mut spec = queued_spec(spec, kept("model"), kept("effort"), self.permission);
         spec.session = Some(key.id.clone());
-        spec.prompt = queued.join("\n\n");
+        let (texts, attached) = join_queued(queued);
+        spec.prompt = texts;
         spec.attachments = Vec::new();
         if spec.ssh.is_none() {
             spec.ide = self.ide_of(&spec.cwd);
         }
-        self.start_turn_from(key, spec, Vec::new(), false, base, cx);
-    }
-
-    fn start_turn(&mut self, key: SessionKey, spec: TurnSpec, attached: Vec<composer::Attached>, cx: &mut Context<Self>) {
-        self.start_turn_from(key, spec, attached, true, None, cx);
+        self.start_with_files(key, spec, attached, false, base, cx);
     }
 
     /// Starts a turn of the session `key`. `from_composer` empties the composer it was typed
@@ -776,7 +800,7 @@ impl Shell {
         // still going up, nor the next message of a queue.
         if self.quitting() {
             if here {
-                self.attachments = attached;
+                self.attachments.splice(0..0, attached);
             }
             return;
         }
@@ -786,9 +810,9 @@ impl Shell {
             Ok(turn) => turn,
             Err(error) => {
                 if here {
-                    self.attachments = attached;
+                    self.attachments.splice(0..0, attached);
                 } else if let Some((_, kept)) = self.drafts.get_mut(&slot) {
-                    *kept = attached;
+                    kept.splice(0..0, attached);
                 }
                 self.status = Some(format!("{}: {error}", t("error")));
                 cx.notify();
@@ -830,6 +854,8 @@ impl Shell {
             turn: None,
             started: std::time::Instant::now(),
             asks: Vec::new(),
+            resting: false,
+            background: Vec::new(),
             stopping: Vec::new(),
             picks: Default::default(),
             texts: Default::default(),
@@ -1233,6 +1259,8 @@ impl Shell {
                 }
             }
             LiveEvent::Stderr(text) => live.stderr = text,
+            LiveEvent::Resting(now) => live.resting = now,
+            LiveEvent::Background(tasks) => live.background = tasks,
             LiveEvent::Permission(ask) => {
                 live.asks.push(ask);
                 let key = live.key.clone();
@@ -1249,22 +1277,24 @@ impl Shell {
                 // A turn that left a failed one out has done it: the ones after go on as usual.
                 let dropped = ok && live.spec.drop_turn.take().is_some();
                 let forget = dropped.then(|| key.clone());
-                let queued = std::mem::take(&mut live.queued);
+                let mut queued = std::mem::take(&mut live.queued);
                 let follow = (ok && !queued.is_empty() && !key.id.is_empty()).then(|| live.spec.clone());
                 // The turn after follows the history and this turn's items.
                 let base = self.open.as_ref().filter(|_| shown).map(|open| open.items.len() + self.runs[ix].items.len());
                 if follow.is_none() && !queued.is_empty() {
-                    let text = queued.join("\n\n");
+                    let (text, attached) = join_queued(std::mem::take(&mut queued));
                     if shown {
                         let typed = self.composer.text.trim();
                         let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
                         self.composer = TextField::from_text(&text);
+                        self.attachments.splice(0..0, attached);
                     } else {
                         let slot = draft_slot(&key, Some(&self.runs[ix].spec.cwd));
                         let draft = self.drafts.entry(slot).or_insert_with(|| (TextField::from_text(""), Vec::new()));
                         let typed = draft.0.text.trim();
                         let text = if typed.is_empty() { text } else { format!("{text}\n\n{typed}") };
                         draft.0 = TextField::from_text(&text);
+                        draft.1.splice(0..0, attached);
                     }
                 }
                 let live = &mut self.runs[ix];

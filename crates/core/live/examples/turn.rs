@@ -58,7 +58,7 @@ fn main() {
                 first_update.get_or_insert(started.elapsed().as_millis());
                 last = Some(t);
             }
-            Some(LiveEvent::Stderr(_)) => {}
+            Some(LiveEvent::Stderr(_) | LiveEvent::Resting(_) | LiveEvent::Background(_)) => {}
             Some(LiveEvent::Permission(ask)) => {
                 let wanted = std::env::var("BOWYER_ANSWER").unwrap_or_else(|_| "allow_once".into());
                 let choice = ask.options.iter().find(|(_, kind, _)| *kind == wanted).map(|(id, _, _)| id.clone());

@@ -9,6 +9,5 @@ mod process_tree;
 
 pub(crate) use job::Job;
 pub(crate) use process::allow_ctrl_c_in_children;
-#[cfg(test)]
 pub(crate) use process_stats::process_table;
 pub(crate) use process_tree::ProcessTree;

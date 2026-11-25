@@ -41,6 +41,8 @@ pub(super) struct TermView {
     /// The session whose panel shows this terminal: the one open when it started (`None`
     /// with no session open).
     pub(super) owner: Option<SessionKey>,
+    /// A harness resumed in its own interface runs here (an npm one as `node`).
+    pub(super) harness: bool,
     session: Arc<TerminalSession>,
     spec: TermSpec,
     focus: FocusHandle,
@@ -78,6 +80,7 @@ impl TermView {
         term_grid::every_frame(cx, Self::refresh);
         Self {
             owner: None,
+            harness: false,
             session: Arc::new(session),
             spec,
             focus: cx.focus_handle(),
@@ -99,6 +102,18 @@ impl TermView {
 
     pub(super) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether something goes on in the terminal: see [`super::quit_view::terminal_busy`].
+    /// It reads the process table: not for every frame.
+    pub(super) fn busy(&self) -> bool {
+        !self.closed && super::quit_view::terminal_busy(self.session.programs().as_deref(), self.session.quiet_for(), self.harness)
+    }
+
+    /// The session and whether a harness was resumed in it, for a look off the window's
+    /// thread at what goes on there.
+    pub(super) fn watch(&self) -> Option<(Arc<TerminalSession>, bool)> {
+        (!self.closed).then(|| (self.session.clone(), self.harness))
     }
 
     /// Ends the program and everything it started in the console.

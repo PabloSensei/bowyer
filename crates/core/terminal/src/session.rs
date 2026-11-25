@@ -112,6 +112,9 @@ pub(crate) struct Shared {
     pub(crate) search: Snapshot<SearchResults>,
     pub(crate) modes: AtomicU32,
     pub(crate) bytes: AtomicU64,
+    /// When output last came, in milliseconds after `started`.
+    pub(crate) last_output: AtomicU64,
+    pub(crate) started: Instant,
     pub(crate) exit: OnceLock<u32>,
     size: AtomicU32,
     pub(crate) pty: Arc<Pty>,
@@ -125,6 +128,11 @@ impl Shared {
 
     pub(crate) fn exit_code(&self) -> Option<u32> {
         self.exit.get().copied()
+    }
+
+    /// Notes that output came now.
+    pub(crate) fn output_came(&self) {
+        self.last_output.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 }
 
@@ -169,6 +177,8 @@ impl TerminalSession {
             search: Snapshot::new(SearchResults::default()),
             modes: AtomicU32::new(0),
             bytes: AtomicU64::new(0),
+            last_output: AtomicU64::new(0),
+            started: Instant::now(),
             exit: OnceLock::new(),
             size: AtomicU32::new(pack_size(spec.cols, spec.rows)),
             pty: pty.clone(),
@@ -244,6 +254,20 @@ impl TerminalSession {
 
     pub fn exit_code(&self) -> Option<u32> {
         self.shared.exit_code()
+    }
+
+    /// How long the program has written nothing (since it started, if it never wrote).
+    pub fn quiet_for(&self) -> Duration {
+        let last = Duration::from_millis(self.shared.last_output.load(Ordering::Relaxed));
+        self.shared.started.elapsed().saturating_sub(last)
+    }
+
+    /// The programs the shell of the terminal runs now, by plain name (`claude`, `cargo`):
+    /// none at its prompt. A chain of shells counts as the shell. `None` when the process
+    /// table cannot be read. It reads the whole table: not for every frame.
+    pub fn programs(&self) -> Option<Vec<String>> {
+        let table = crate::programs::process_table()?;
+        Some(crate::programs::programs_below(&table, self.pid()))
     }
 
     /// True once the stream ended and the last picture is out. The flag lives in the
@@ -735,6 +759,58 @@ mod tests {
         .expect("spawn");
         assert!(session.wait_for(Duration::from_secs(15), |screen| screen.contains("ready")));
         session
+    }
+
+    /// A shell at its prompt runs nothing; while a command runs, the terminal names it; the
+    /// quiet time counts from the last output.
+    #[cfg(windows)]
+    #[test]
+    fn a_terminal_names_what_its_shell_runs() {
+        let session = TerminalSession::spawn(&SpawnSpec {
+            command_line: crate::command_line(std::path::Path::new("cmd.exe"), &["/q".to_string(), "/k".to_string(), "echo ready".to_string()]),
+            cwd: None,
+            env: crate::allowlisted(),
+            cols: 80,
+            rows: 12,
+            shift_enter: ShiftEnter::default(),
+        })
+        .expect("spawn");
+        assert!(session.wait_for(Duration::from_secs(15), |screen| screen.contains("ready")));
+        assert_eq!(session.programs(), Some(Vec::new()), "the shell at its prompt");
+        session.send(b"ping -n 30 127.0.0.1 >NUL\r".to_vec()).unwrap();
+        let started = Instant::now();
+        while session.programs() != Some(vec!["ping".to_owned()]) {
+            assert!(started.elapsed() < Duration::from_secs(15), "the command is not seen: {:?}", session.programs());
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(Duration::from_millis(600));
+        assert!(session.quiet_for() >= Duration::from_millis(500), "nothing was written meanwhile: {:?}", session.quiet_for());
+        session.terminate();
+    }
+
+    /// The same on Unix, where `ps` tells what the shell runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_names_what_its_shell_runs() {
+        let session = TerminalSession::spawn(&SpawnSpec {
+            command_line: crate::command_line(std::path::Path::new("sh"), &["-c".to_string(), "echo ready; exec sh -i".to_string()]),
+            cwd: None,
+            env: crate::allowlisted(),
+            cols: 80,
+            rows: 12,
+            shift_enter: ShiftEnter::default(),
+        })
+        .expect("spawn");
+        assert!(session.wait_for(Duration::from_secs(15), |screen| screen.contains("ready")));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(session.programs(), Some(Vec::new()), "the shell at its prompt");
+        session.send(b"sleep 30\n".to_vec()).unwrap();
+        let started = Instant::now();
+        while session.programs() != Some(vec!["sleep".to_owned()]) {
+            assert!(started.elapsed() < Duration::from_secs(15), "the command is not seen: {:?}", session.programs());
+            thread::sleep(Duration::from_millis(50));
+        }
+        session.terminate();
     }
 
     #[cfg(windows)]

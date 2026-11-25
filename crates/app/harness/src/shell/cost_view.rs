@@ -51,6 +51,10 @@ impl Shell {
             context = turn.last_usage.map_or(context, |u| u.context());
         }
         let (computed, complete) = pricing::session_cost(&buckets);
+        // On a subscription the sums are what the tokens would cost at API prices, and the
+        // harness's own sum is its estimate: neither is billed.
+        let account = (open.summary.key.env.clone(), open.summary.key.harness.clone());
+        let plan = matches!(self.plans.get(&account).and_then(|state| state.plan.as_ref()), Some(live::usage::Plan::Limits { .. }));
         let model = open.model.clone().or_else(|| open.summary.model.clone()).unwrap_or_default();
         let priced = pricing::price_of(&model).is_some();
 
@@ -63,8 +67,8 @@ impl Shell {
             } else {
                 "—".into()
             }))
-            .child(div().pb(px(3.)).text_size(px(12.)).text_color(theme.text_muted).child(if priced || computed > 0.0 {
-                format!("{}{}", t("cost.computed"), if complete { "" } else { " *" })
+            .child(div().flex_1().min_w_0().pb(px(3.)).text_size(px(12.)).text_color(theme.text_muted).child(if priced || computed > 0.0 {
+                format!("{}{}", t(if plan { "cost.computed_plan" } else { "cost.computed" }), if complete { "" } else { " *" })
             } else {
                 t("price.unknown").to_owned()
             }));
@@ -89,7 +93,7 @@ impl Shell {
         let mut rows: Vec<AnyElement> = Vec::new();
         if let Some(reported) = reported {
             let note = if reported == 0.0 { t("cost.subscription").to_owned() } else { money(reported) };
-            rows.push(row(t("cost.reported"), note, None).into_any_element());
+            rows.push(row(t(if plan { "cost.reported_plan" } else { "cost.reported" }), note, None).into_any_element());
         }
         let total_usage = {
             let mut sum = model::Usage::default();
