@@ -535,6 +535,10 @@ pub struct Shell {
     /// The readers of the Claude Code sessions opened lately, the latest last.
     readers: Vec<(SessionKey, u64, Reader)>,
     load_error: Option<String>,
+    /// The whole message of the load error is shown under its reason.
+    error_details: bool,
+    /// The environment whose failed scan is open under the tree, with its whole message.
+    failure_open: Option<String>,
     /// The session that failed to load and when to load it again.
     load_retry: Option<(SessionKey, Retry)>,
     open_runs: HashSet<(usize, usize)>,
@@ -781,6 +785,8 @@ impl Shell {
             load_generation: 0,
             readers: Vec::new(),
             load_error: None,
+            error_details: false,
+            failure_open: None,
             load_retry: None,
             open_runs: HashSet::new(),
             open_calls: HashSet::new(),
@@ -1848,6 +1854,7 @@ impl Shell {
         let generation = self.load_generation;
         self.loading = true;
         self.load_error = None;
+        self.error_details = false;
         let asked_at = std::time::Instant::now();
         let cache = self.cache_dir.join("remote");
         let library = self.library.clone();
@@ -2819,13 +2826,71 @@ impl Shell {
 
         let status_line = if self.scanning > 0 {
             Some(format!("{}  {count} {}", t("scanning"), t("sessions_count")))
-        } else if !self.scan_failures.is_empty() {
-            let mut errors: Vec<&str> = self.scan_failures.values().map(|(error, _)| error.as_str()).collect();
-            errors.sort_unstable();
-            Some(format!("{}\n{}", errors.join("\n"), t("retry.soon")))
-        } else {
+        } else if self.scan_failures.is_empty() {
             self.status.clone()
+        } else {
+            None
         };
+        // A host that cannot be read takes one short line, whatever ssh printed: the tree
+        // keeps its room. The whole message is in the line's tooltip.
+        let failures = if self.scanning > 0 { Vec::new() } else { self.scan_failure_lines() };
+        let failure_box = (!failures.is_empty()).then(|| {
+            let more = failures.len().saturating_sub(SHOWN_FAILURES);
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .border_t_1()
+                .border_color(theme.border)
+                .children(failures.into_iter().take(SHOWN_FAILURES).enumerate().map(|(i, (id, short, full))| {
+                    let open = self.failure_open.as_deref() == Some(id.as_str());
+                    let copied = full.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .id(("scan-failure", i))
+                                .w_full()
+                                .min_w_0()
+                                .cursor_pointer()
+                                .when(!open, |this| this.truncate())
+                                .text_color(theme.warning_mark)
+                                .hover(|style| style.underline())
+                                .child(short)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.failure_open = if this.failure_open.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                                    cx.notify();
+                                })),
+                        )
+                        .when(open, |this| {
+                            this.child(
+                                div()
+                                    .id(("scan-failure-text", i))
+                                    .max_h(px(220.))
+                                    .overflow_y_scroll()
+                                    .p(px(8.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .font_family(MONO)
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_secondary)
+                                    .child(full),
+                            )
+                            .child(div().flex().child(chip("scan-failure-copy", t("code.copy"), &theme).on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                            })))
+                        })
+                }))
+                .when(more > 0, |this| this.child(t("scan.more").replace("{n}", &more.to_string())))
+                .child(t("retry.soon"))
+        });
 
         island(&theme)
             .w(px(self.left_width))
@@ -2854,8 +2919,25 @@ impl Shell {
                     .border_color(theme.border)
                     .child(line)
             }))
+            .children(failure_box)
             .child(footer)
             .children(footer_menu)
+    }
+
+    /// One line for each environment whose scan failed: its id, its name and, in a few words,
+    /// why, and what the program said.
+    fn scan_failure_lines(&self) -> Vec<(String, String, String)> {
+        let mut by_env: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+        for ((env, _), (error, _)) in &self.scan_failures {
+            by_env.entry(env.0.clone()).or_insert(error.as_str());
+        }
+        by_env
+            .into_iter()
+            .map(|(id, error)| {
+                let label = self.envs.iter().find(|env| env.id().0 == id).map(|env| env.label()).unwrap_or_else(|| id.clone());
+                (id, format!("{label}: {}", scan_problem(error)), clean_error(error))
+            })
+            .collect()
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3124,17 +3206,69 @@ impl Shell {
             .into_any_element()
     }
 
+    /// A session that could not be read: why, in a few words, and what the program said
+    /// when the user asks for it.
+    fn render_load_error(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.global::<Theme>();
+        let details = clean_error(error);
+        let copied = details.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.))
+            .px(px(40.))
+            .child(logo(48.))
+            .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(t("load.failed")))
+            .child(div().max_w(px(620.)).text_center().text_color(theme.warning_mark).child(scan_problem(error)))
+            .child(div().text_size(px(12.)).text_color(theme.text_muted).child(t("retry.soon")))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(chip("error-details", if self.error_details { t("details.hide") } else { t("details.show") }, &theme).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.error_details = !this.error_details;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(chip("error-copy", t("code.copy"), &theme).on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                    })),
+            )
+            .when(self.error_details, |this| {
+                this.child(
+                    div()
+                        .id("load-error-details")
+                        .w_full()
+                        .max_w(px(820.))
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .text_color(theme.text_secondary)
+                        .child(details),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_conversation_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = *cx.global::<Theme>();
         let pane = island(&theme).flex_1().min_w_0().h_full().bg(theme.editor_bg);
         let Some(open) = &self.open else {
-            let message = if self.loading {
-                t("loading").to_owned()
-            } else if let Some(error) = &self.load_error {
-                format!("{}: {error}\n{}", t("error"), t("retry.soon"))
-            } else {
-                t("no_session").to_owned()
-            };
+            if !self.loading
+                && let Some(error) = self.load_error.clone()
+            {
+                return pane.child(self.render_load_error(&error, cx));
+            }
+            let message = if self.loading { t("loading").to_owned() } else { t("no_session").to_owned() };
             return pane.child(
                 div()
                     .size_full()
@@ -4117,6 +4251,51 @@ fn matched_snippet(snippet: &str, theme: &Theme) -> StyledText {
     StyledText::new(text).with_highlights(highlights)
 }
 
+/// What a program said, without empty lines and without ssh's banner of `@` signs.
+fn clean_error(error: &str) -> String {
+    error.lines().map(str::trim).filter(|line| !line.is_empty() && !line.chars().all(|c| c == '@')).map(|line| line.trim_matches('@').trim()).collect::<Vec<_>>().join("\n")
+}
+
+/// The scan failures shown under the tree; the others are counted.
+const SHOWN_FAILURES: usize = 3;
+
+/// Why a scan failed, in a few words: a changed or unknown host key, a refused sign-in, or
+/// the last line the program wrote.
+fn scan_problem(error: &str) -> String {
+    // Before the changed key: a stranger's machine shows a changed key too, and the key is
+    // not what to forget.
+    if let Some(text) = misdirected_text(error) {
+        return text;
+    }
+    if error.contains("HAS CHANGED") {
+        let host = error.split("Host key for ").nth(1).and_then(|rest| rest.split_whitespace().next()).unwrap_or("<host>");
+        return t("scan.key_changed").replace("{host}", host);
+    }
+    if envs::is_unknown_host_key(error) {
+        return t("scan.key_unknown").to_string();
+    }
+    if envs::refused_sign_in(error).is_some() {
+        return t("scan.refused").to_string();
+    }
+    // The scan's own prefix (`host · Harness: `) goes; ssh's last line tells the most.
+    let said = error.split_once(": ").map_or(error, |(_, rest)| rest);
+    let last = said.lines().map(str::trim).filter(|line| !line.is_empty()).next_back().unwrap_or(said);
+    last.chars().take(200).collect()
+}
+
+/// What to tell when `error` says the host's local name leads to the internet (see
+/// [`SshEnvironment::misdirected`]), with where Windows keeps the names of the Hyper-V
+/// Default Switch.
+pub(crate) fn misdirected_text(error: &str) -> Option<String> {
+    let (name, addresses) = envs::misdirected_name(error)?;
+    let mut text = t("scan.misdirected").replace("{host}", &name).replace("{addresses}", &addresses);
+    if cfg!(windows) && name.trim_end_matches('.').to_ascii_lowercase().ends_with(".mshome.net") {
+        text.push(' ');
+        text.push_str(t("scan.hosts_ics"));
+    }
+    Some(text)
+}
+
 /// Text coloured by the highlighter, with the code colours of the theme.
 pub(crate) fn code_text(text: SharedString, spans: &[(std::ops::Range<usize>, highlight::Kind)], theme: &Theme) -> StyledText {
     let highlights = code_highlights(&text, spans, theme);
@@ -4588,6 +4767,33 @@ mod tail_tests {
 
 #[cfg(test)]
 mod pinned_tests {
+    /// A host whose key changed takes one short line under the tree, not ssh's whole banner,
+    /// and any other failure its last line.
+    #[test]
+    fn a_failed_scan_is_one_short_line() {
+        let error = "dev-vm · Claude Code: dev-vm: @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                     @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+                     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                     IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n\
+                     Host key for dev-vm.mshome.net has changed and you have requested strict checking.\n\
+                     Host key verification failed.";
+        let line = super::scan_problem(error);
+        assert!(line.contains("ssh-keygen -R dev-vm.mshome.net"), "{line}");
+        assert!(!line.contains('@') && !line.contains('\n'), "{line}");
+        assert_eq!(
+            super::scan_problem("box · Codex: ssh: connect to host box port 22: Connection timed out\r\n"),
+            "ssh: connect to host box port 22: Connection timed out"
+        );
+        // A local name that leads to the internet is told before the changed key it shows.
+        let stray = format!(
+            "dev-vm · Claude Code: dev-vm: dev-vm.mshome.net is a name of the local network, yet it resolves on the internet to 203.0.113.7; Bowyer does not connect there.\n{error}"
+        );
+        let line = super::scan_problem(&stray);
+        assert!(line.contains("dev-vm.mshome.net") && line.contains("203.0.113.7"), "{line}");
+        assert!(!line.contains("ssh-keygen"), "{line}");
+        assert_eq!(cfg!(windows), line.contains("hosts.ics"), "{line}");
+    }
+
     /// The order a model ranked a query in outlives the search done again for it.
     #[test]
     fn a_ranked_order_is_kept_when_the_query_is_searched_again() {

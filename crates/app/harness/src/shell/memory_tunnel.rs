@@ -125,7 +125,10 @@ impl Shell {
     /// from now on as that host's.
     pub(super) fn memory_token(&self, host: &str) -> String {
         let key = format!("memory.token.{host}");
-        let token = match self.lib().setting(&key).filter(|token| token.len() >= 32) {
+        // Read on a line of its own: a guard in the `match` would live through the arms, and
+        // the one that keeps a new token would wait for it for ever.
+        let kept = self.lib().setting(&key).filter(|token| token.len() >= 32);
+        let token = match kept {
             Some(token) => token,
             None => {
                 let token = mcp::http::new_token();

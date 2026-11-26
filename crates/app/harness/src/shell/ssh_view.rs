@@ -341,7 +341,11 @@ impl Shell {
                                 None => {
                                     // A changed key in the user's own file: ssh's long warning
                                     // would be cut before the file it names.
+                                    let misdirected = super::misdirected_text(&error);
                                     let text = match envs::changed_host_key_files(&error).first() {
+                                        // The name leads to a stranger's machine: nothing
+                                        // about its key or password would help.
+                                        _ if misdirected.is_some() => misdirected.unwrap_or_default(),
                                         Some(file) => t("ssh.changed_key_elsewhere").replace("{file}", file),
                                         // A locked key the host turned away: a wrong
                                         // passphrase, or a key the host does not know.

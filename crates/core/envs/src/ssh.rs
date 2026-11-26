@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -139,15 +140,87 @@ pub fn askpass_answer(host: &str, prompt: &str) -> Option<String> {
     if !asks_secret || host_key_question {
         return None;
     }
-    // Through a jump host (`ProxyJump`) the jump host asks for its own password first: the
-    // kept password is the target's, and goes to the target only.
-    if let Some(asker) = prompt_machine(&prompt)
-        && let Some((target, jump)) = resolved(host)
-        && !answers_to(asker, &target, jump)
-    {
-        return None;
+    if let Some((target, jump)) = resolved(host) {
+        // Through a jump host (`ProxyJump`) the jump host asks for its own password first:
+        // the kept password is the target's, and goes to the target only.
+        if let Some(asker) = prompt_machine(&prompt)
+            && !answers_to(asker, &target, jump)
+        {
+            return None;
+        }
+        // A name of the local network that also leads to the internet may have reached a
+        // stranger's machine: the secret does not go there.
+        if !jump && !stray_addresses(&target, 22).is_empty() {
+            return None;
+        }
     }
     crate::secret::load(host)
+}
+
+/// Endings of names that only a local network gives out: the Hyper-V Default Switch
+/// (`mshome.net`), mDNS (`local`), RFC 8375 (`home.arpa`) and home routers.
+const LOCAL_SUFFIXES: [&str; 7] = ["mshome.net", "local", "lan", "home", "internal", "home.arpa", "localdomain"];
+
+/// Words of the error [`SshEnvironment::misdirected`] gives, which
+/// [`misdirected_name`] finds it by.
+const MISDIRECTED: &str = " is a name of the local network, yet it resolves on the internet to ";
+
+/// Whether `name` is one that only a local network gives out.
+fn is_local_name(name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    LOCAL_SUFFIXES.iter().any(|suffix| name.strip_suffix(suffix).is_some_and(|rest| rest.ends_with('.') && rest.len() > 1))
+}
+
+/// Whether `address` is on the internet: not a private, shared (CGNAT, Tailscale),
+/// loopback or link-local one.
+fn is_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let shared = a == 100 && (64..128).contains(&b);
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || shared)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            let unique_local = first & 0xfe00 == 0xfc00;
+            let link_local = first & 0xffc0 == 0xfe80;
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
+    }
+}
+
+/// The addresses on the internet that `name`, a name of the local network, resolves to: a
+/// stray entry of the local DNS (Windows half-rewrites `hosts.ics` of the Hyper-V Default
+/// Switch, leaving the tail of an old line) sends ssh to a stranger's machine. None for any
+/// other name, or for an address.
+fn stray_addresses(name: &str, port: u16) -> Vec<IpAddr> {
+    if !is_local_name(name) {
+        return Vec::new();
+    }
+    let Ok(found) = (name, port).to_socket_addrs() else { return Vec::new() };
+    let mut addresses: Vec<IpAddr> = found.map(|address| address.ip()).filter(|ip| is_public(*ip)).collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn misdirected_message(name: &str, addresses: &[IpAddr]) -> String {
+    let addresses = addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    format!("{name}{MISDIRECTED}{addresses}; Bowyer does not connect there.")
+}
+
+/// The name and the addresses on the internet when `error` is the one of
+/// [`SshEnvironment::misdirected`].
+pub fn misdirected_name(error: &str) -> Option<(String, String)> {
+    error.lines().find_map(|line| {
+        let (before, after) = line.split_once(MISDIRECTED)?;
+        let name = before.rsplit(' ').next()?.to_owned();
+        let (addresses, _) = after.split_once(';')?;
+        Some((name, addresses.to_owned()))
+    })
 }
 
 /// The machine a password prompt names: `user@machine's password:` or `(user@machine)
@@ -163,14 +236,7 @@ fn prompt_machine(prompt: &str) -> Option<&str> {
 
 /// The machine `ssh` reaches for `host`, and whether it goes through a jump host there.
 fn resolved(host: &str) -> Option<(String, bool)> {
-    let ssh = SshEnvironment::new(host);
-    let mut command = Command::new(&ssh.ssh);
-    command.arg("-G").args(ssh.options()).arg(host).stdin(Stdio::null());
-    hide_console(&mut command);
-    let config = String::from_utf8_lossy(&command.output().ok()?.stdout).into_owned();
-    let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()));
-    let jump = value("proxyjump ").is_some_and(|jump| !jump.eq_ignore_ascii_case("none"));
-    Some((value("hostname ")?, jump))
+    SshEnvironment::new(host).destination().map(|(name, _, jump)| (name, jump))
 }
 
 /// Whether a prompt from `asker` gets the password of `target`: always without a jump host,
@@ -257,6 +323,11 @@ fn changed_key_is_in(error: &str, own: &Path) -> bool {
     !files.is_empty() && files.iter().all(|file| normal(file) == own)
 }
 
+/// The key lines of `known_hosts` text, without comments and empty lines.
+fn known_host_lines(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|line| !line.starts_with('#') && !line.is_empty()).map(str::to_owned).collect()
+}
+
 /// `known_hosts` text with `new` lines in place of the lines kept for the same host names.
 /// Comments and marker lines (`@cert-authority`, `@revoked`) stay.
 fn merged_known_hosts(text: &str, new: &str) -> String {
@@ -286,11 +357,14 @@ pub const RUN_STARTED: &str = "bowyer-run-started";
 /// without it, the connection dropped while the run went on.
 pub const RUN_END: &str = "bowyer-run-end";
 
-/// The `awk` program that watches the output of an answered run and ends (and with it the
+/// The shell loop that watches the output of an answered run and ends (and with it the
 /// run's input) at a result while nothing runs in the background, or when the last
 /// background command ends after a result. Lines of tools hold their JSON escaped, so a
 /// `"subtype"` there never matches; a result line is the one with `"total_cost_usd"`.
-const RESULT_WATCH: &str = r#"/"type": *"result"/ && /"total_cost_usd"/ { done = 1; if (!busy) exit } /"subtype": *"background_tasks_changed"/ { busy = ($0 !~ /"tasks": *\[ *\]/); if (done && !busy) exit }"#;
+/// Not `awk`: `mawk` (Debian's and Ubuntu's) fills its buffer before it reads a line, and
+/// run interactive it cuts lines longer than its buffer, so a result after a long line
+/// (Claude's partial messages reach 12 kB) went unseen and the turn never ended.
+const RESULT_WATCH: &str = r#"while IFS= read -r l; do case $l in *'"subtype":"background_tasks_changed"'*|*'"subtype": "background_tasks_changed"'*) case $l in *'"tasks":[]'*|*'"tasks": []'*) busy= ;; *) busy=1 ;; esac ;; *'"total_cost_usd"'*) case $l in *'"type":"result"'*|*'"type": "result"'*) done=1 ;; esac ;; esac; [ -n "$done" ] && [ -z "$busy" ] && break; done"#;
 
 /// The system's own files of host keys, which an option naming Bowyer's file must keep.
 #[cfg(windows)]
@@ -421,13 +495,43 @@ impl SshEnvironment {
         command
     }
 
+    /// The configuration `ssh -G` resolves for this host.
+    fn config(&self) -> io::Result<String> {
+        let mut resolve = Command::new(&self.ssh);
+        resolve.arg("-G").args(self.options()).arg(&self.host).stdin(Stdio::null());
+        hide_console(&mut resolve);
+        Ok(String::from_utf8_lossy(&resolve.output()?.stdout).into_owned())
+    }
+
+    /// The machine `ssh` reaches for this host, its port, and whether it goes there through
+    /// a jump host or a proxy command, which resolve the name themselves.
+    fn destination(&self) -> Option<(String, u16, bool)> {
+        let config = self.config().ok()?;
+        let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()));
+        let set = |key: &str| value(key).is_some_and(|value| !value.eq_ignore_ascii_case("none"));
+        let port = value("port ").and_then(|port| port.parse().ok()).unwrap_or(22);
+        Some((value("hostname ")?, port, set("proxyjump ") || set("proxycommand ")))
+    }
+
+    /// An error when the machine `ssh` reaches for this host has a name of the local
+    /// network (`dev-vm.mshome.net`) that resolves to an address on the internet: a stray
+    /// entry of the local DNS, which leads to a stranger's machine. Nothing is sent there.
+    pub fn misdirected(&self) -> Option<io::Error> {
+        let (name, port, through) = self.destination()?;
+        if through {
+            return None;
+        }
+        let stray = stray_addresses(&name, port);
+        (!stray.is_empty()).then(|| io::Error::other(misdirected_message(&name, &stray)))
+    }
+
     /// Reads the keys of the host without signing in (`ssh-keyscan` at the address and
     /// port `ssh -G` resolves), for the user to compare and trust.
     pub fn scan_host_keys(&self) -> io::Result<HostKeys> {
-        let mut resolve = Command::new(&self.ssh);
-        resolve.arg("-G").args(self.options()).arg(&self.host);
-        hide_console(&mut resolve);
-        let config = String::from_utf8_lossy(&resolve.output()?.stdout).into_owned();
+        if let Some(error) = self.misdirected() {
+            return Err(error);
+        }
+        let config = self.config()?;
         let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()));
         let hostname = value("hostname ").ok_or_else(|| io::Error::other("ssh -G named no host"))?;
         let port = value("port ").unwrap_or_else(|| "22".into());
@@ -435,10 +539,19 @@ impl SshEnvironment {
         scan.args(["-T", "8", "-p", &port, &hostname]);
         hide_console(&mut scan);
         let scanned = scan.output()?;
-        let mut lines = String::from_utf8_lossy(&scanned.stdout).lines().filter(|line| !line.starts_with('#') && !line.trim().is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        let mut lines = known_host_lines(&String::from_utf8_lossy(&scanned.stdout));
         if lines.is_empty() {
-            let message = String::from_utf8_lossy(&scanned.stderr).trim().to_owned();
-            return Err(io::Error::other(if message.is_empty() { format!("{hostname}:{port}: no keys") } else { message }));
+            // ssh-keyscan offers every key exchange it knows by name, built in or not: the one
+            // of Windows (OpenSSH 9.5) offers sntrup761 without having it and fails on a server
+            // that picks it (OpenSSH 10). ssh itself offers only what it has.
+            match self.host_key_lines_by_ssh() {
+                Ok(found) => lines = found,
+                Err(by_ssh) => {
+                    let message = String::from_utf8_lossy(&scanned.stderr).trim().to_owned();
+                    let message = if message.is_empty() { format!("{hostname}:{port}: no keys") } else { message };
+                    return Err(io::Error::other(format!("{message}\n{by_ssh}")));
+                }
+            }
         }
         // A `HostKeyAlias` is the name ssh looks the key up by.
         if let Some(alias) = value("hostkeyalias ").filter(|alias| alias != "none") {
@@ -466,6 +579,44 @@ impl SshEnvironment {
         Ok(HostKeys { lines, fingerprints })
     }
 
+    /// The key the host shows to `ssh` itself, read without signing in: ssh connects with
+    /// an empty `known_hosts` of its own, keeps the key it is shown there, and stops before
+    /// any way of signing in. The user's files are not touched.
+    fn host_key_lines_by_ssh(&self) -> io::Result<Vec<String>> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+        let file = std::env::temp_dir().join(format!("bowyer-host-key-{}-{stamp}", std::process::id()));
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut ssh = Command::new(&self.ssh);
+        // The first value of an option wins: these come before the host's own.
+        for option in [
+            "BatchMode=yes".to_owned(),
+            "StrictHostKeyChecking=accept-new".to_owned(),
+            format!("UserKnownHostsFile=\"{path}\""),
+            "GlobalKnownHostsFile=none".to_owned(),
+            "HashKnownHosts=no".to_owned(),
+            "UpdateHostKeys=no".to_owned(),
+            "PubkeyAuthentication=no".to_owned(),
+            "PasswordAuthentication=no".to_owned(),
+            "KbdInteractiveAuthentication=no".to_owned(),
+            "GSSAPIAuthentication=no".to_owned(),
+            "HostbasedAuthentication=no".to_owned(),
+            "LogLevel=ERROR".to_owned(),
+        ] {
+            ssh.arg("-o").arg(option);
+        }
+        ssh.args(self.options()).arg(&self.host).arg("exit").stdin(Stdio::null());
+        hide_console(&mut ssh);
+        let output = ssh.output()?;
+        let text = fs::read_to_string(&file).unwrap_or_default();
+        let _ = fs::remove_file(&file);
+        let lines = known_host_lines(&text);
+        if lines.is_empty() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(io::Error::other(if message.is_empty() { "ssh read no host key".to_owned() } else { message }));
+        }
+        Ok(lines)
+    }
+
     /// Puts keys the user trusted in Bowyer's own file of host keys, in place of the keys
     /// kept there for the same host before (a host whose key changed).
     pub fn trust_host_keys(keys: &HostKeys) -> io::Result<()> {
@@ -490,6 +641,12 @@ impl SshEnvironment {
         let message = String::from_utf8_lossy(stderr).trim().to_owned();
         if message.contains("No such file") {
             return Err(io::Error::new(io::ErrorKind::NotFound, message));
+        }
+        // A changed key or a refused sign-in may come from a stranger's machine that a stray
+        // entry of the local DNS leads to: that is what to tell, not how to forget the key.
+        let stranger = message.contains("HAS CHANGED") || message.contains("Host key verification failed") || message.contains("Permission denied (");
+        if stranger && let Some(misdirected) = self.misdirected() {
+            return Err(io::Error::other(format!("{}: {misdirected}\n{message}", self.host)));
         }
         Err(io::Error::other(format!("{}: {message}", self.host)))
     }
@@ -583,16 +740,13 @@ impl SshEnvironment {
             // does after a result. Both end with the job (`--pid`). The key order of a line
             // changes between Claude versions, so `"type":"result"` is looked for anywhere
             // in it, with `"total_cost_usd"`, a key only the result line has: a tool's input
-            // or output is JSON too and may hold the first one. One `awk` only: the pipeline
+            // or output is JSON too and may hold the first one. One reader only: the pipeline
             // ends when `tail` sees its reader gone, and a second reader between them would
-            // keep reading. `mawk` (Debian's and Ubuntu's `awk`) fills its buffer before it
-            // reads a line unless it runs interactive: measured, it saw a line only at the
-            // end of its input.
+            // keep reading.
             format!(
                 "rm -f \"$1.fifo\"; mkfifo \"$1.fifo\" || exit 1; \
                  tail -n +1 -f --pid=$$ \"$1.in\" > \"$1.fifo\" & feed=$!; \
-                 a=awk; awk -W version </dev/null 2>&1 | grep -q mawk && a='awk -W interactive'; \
-                 (tail -n +1 -F --pid=$$ \"$1.out\" 2>/dev/null | $a '{RESULT_WATCH}' && kill $feed 2>/dev/null) & \
+                 (tail -n +1 -F --pid=$$ \"$1.out\" 2>/dev/null | {{ {RESULT_WATCH}; }} && kill $feed 2>/dev/null) & \
                  {login} < \"$1.fifo\" > \"$1.out\" 2> \"$1.err\"; code=$?; kill $feed 2>/dev/null; rm -f \"$1.fifo\"; echo $code > \"$1.code\""
             )
         } else {
@@ -637,7 +791,12 @@ impl SshEnvironment {
     }
 
     /// Checks that the host answers without a password prompt.
+    /// A host whose local name leads to the internet is not tried at all (see
+    /// [`Self::misdirected`]).
     pub fn probe(&self) -> io::Result<String> {
+        if let Some(error) = self.misdirected() {
+            return Err(error);
+        }
         let text = self.script_text("printf '%s|%s' \"$(uname -sr)\" \"$HOME\"")?;
         Ok(text.trim().to_owned())
     }
@@ -1113,6 +1272,58 @@ mod tests {
     }
 
     #[test]
+    fn names_of_the_local_network_are_told_apart() {
+        for name in ["dev-vm.mshome.net", "vm.local", "nas.lan", "files.home", "box.home.arpa", "pi.localdomain.", "db.internal", "VM.MSHOME.NET"] {
+            assert!(is_local_name(name), "{name}");
+        }
+        for name in ["example.com", "mshome.net", "local", "home", "edge", "notmshome.net", "192.168.1.10", "x.homelab.dev"] {
+            assert!(!is_local_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn addresses_on_the_internet_are_told_from_local_ones() {
+        let public = |text: &str| is_public(text.parse().unwrap());
+        for address in ["203.0.113.7", "8.8.8.8", "100.128.0.1", "2001:4860:4860::8888", "::ffff:203.0.113.7"] {
+            assert!(public(address), "{address}");
+        }
+        for address in ["172.20.1.5", "172.31.2.9", "10.0.0.1", "192.168.1.20", "127.0.0.1", "169.254.1.1", "100.100.1.1", "fd7a:115c:a1e0::1", "fe80::1", "::1", "::ffff:10.0.0.1"] {
+            assert!(!public(address), "{address}");
+        }
+    }
+
+    #[test]
+    fn a_misdirected_name_is_found_in_the_error_it_makes() {
+        let addresses: Vec<IpAddr> = vec!["203.0.113.7".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        let error = format!("dev-vm: {}\nHost key verification failed.", misdirected_message("dev-vm.mshome.net", &addresses));
+        assert_eq!(misdirected_name(&error), Some(("dev-vm.mshome.net".to_owned(), "203.0.113.7, 2001:db8::1".to_owned())));
+        assert_eq!(misdirected_name("dev-vm: Permission denied (publickey)."), None);
+    }
+
+    #[test]
+    fn an_address_or_a_name_on_the_internet_is_never_called_stray() {
+        assert!(stray_addresses("203.0.113.7", 22).is_empty());
+        assert!(stray_addresses("localhost", 22).is_empty());
+    }
+
+    /// ssh itself reads the key of a host it does not know, without signing in and without
+    /// writing to the user's files. Run by hand against a host of one's own:
+    /// `BOWYER_TEST_HOST=<host> cargo test -p envs host_key_by_ssh -- --ignored`.
+    #[test]
+    #[ignore]
+    fn host_key_by_ssh_reads_an_unknown_host() {
+        let Ok(host) = std::env::var("BOWYER_TEST_HOST") else { return };
+        let mut env = SshEnvironment::new(&host);
+        if let Ok(ssh) = std::env::var("BOWYER_TEST_SSH") {
+            env.ssh = PathBuf::from(ssh);
+        }
+        let lines = env.host_key_lines_by_ssh().unwrap();
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| line.split_whitespace().count() >= 3), "{lines:?}");
+        eprintln!("{lines:?}");
+    }
+
+    #[test]
     fn a_changed_key_is_replaced_only_in_bowyers_own_file() {
         let own = Path::new(r"C:\data dir\Bowyer\known_hosts");
         let changed = |file: &str| {
@@ -1340,8 +1551,8 @@ mod tests {
         let command = SshEnvironment::new("vm").detached_answered("claude", &["-p"], None, "17-43");
         let script = command.get_args().last().unwrap().to_string_lossy().into_owned();
         assert!(script.contains("mkfifo"), "{script}");
-        assert!(script.contains(r#"$a '\''/"type": *"result"/ && /"total_cost_usd"/"#), "{script}");
-        assert!(script.contains("a='\\''awk -W interactive'\\''"), "mawk reads line by line: {script}");
+        assert!(script.contains("| { while IFS= read -r l; do"), "a shell loop reads line by line, however long: {script}");
+        assert!(!script.contains("awk"), "mawk cuts long lines: {script}");
         assert!(script.contains(r#"cat > "$f.in""#), "{script}");
     }
 
@@ -1399,6 +1610,7 @@ mod tests {
         let run = format!("background-{}", std::process::id());
         let stub = "import json, sys\n\
             prompt = sys.stdin.readline().strip()\n\
+            print(json.dumps({'type': 'stream_event', 'text': 'x' * 20000}), flush=True)\n\
             print(json.dumps({'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': [{'task_id': 'b1'}]}), flush=True)\n\
             print(json.dumps({'type': 'result', 'total_cost_usd': 0, 'prompt': prompt}), flush=True)\n\
             later = sys.stdin.readline().strip()\n\
@@ -1412,7 +1624,7 @@ mod tests {
         stdin.write_all(b"the prompt\n").unwrap();
         drop(stdin);
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        assert!(lines.nth(1).unwrap().unwrap().contains("the prompt"));
+        assert!(lines.nth(2).unwrap().unwrap().contains("the prompt"));
         // Time for the watcher to see the result, were it to close the input there.
         std::thread::sleep(std::time::Duration::from_millis(1500));
         ssh.append_input(&run, b"sent later\n").unwrap();
