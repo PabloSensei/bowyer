@@ -29,7 +29,9 @@ mod claude_ask;
 mod follow;
 mod ide;
 mod kill;
+mod pi_rpc;
 mod resolve;
+pub mod models;
 pub mod usage;
 
 pub use acp::{Answer, AskQuestion, PermissionAsk};
@@ -354,6 +356,25 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
             args.push("-".into());
             "codex"
         }
+        HarnessKind::Pi => {
+            // The prompt goes over the protocol; Pi asks no permissions.
+            args.extend(["--mode", "rpc"].map(String::from));
+            if let Some(session) = &spec.session {
+                args.extend(["--session".into(), session.clone()]);
+            }
+            if let Some(model) = &spec.model {
+                args.extend(["--model".into(), model.clone()]);
+            }
+            if let Some(effort) = &spec.effort {
+                args.extend(["--thinking".into(), effort.clone()]);
+            }
+            "pi"
+        }
+        HarnessKind::Antigravity => {
+            // Session, prompt and files go over the protocol, as with OpenCode.
+            args.push("acp".into());
+            "agy"
+        }
         HarnessKind::DeepSeek => {
             // `-` takes the task from standard input.
             args.extend(["headless", "--json"].map(String::from));
@@ -376,6 +397,12 @@ pub fn command_line(spec: &TurnSpec) -> io::Result<(String, Vec<String>)> {
     Ok((program.to_owned(), args))
 }
 
+/// Whether a harness talks with the window both ways for the whole turn: an ACP agent
+/// (OpenCode, Antigravity) or Pi in RPC mode.
+fn talks_both_ways(harness: &HarnessKind) -> bool {
+    matches!(harness, HarnessKind::OpenCode | HarnessKind::Antigravity | HarnessKind::Pi)
+}
+
 /// Whether a Claude turn keeps its input open while it runs: for the questions it asks
 /// before an action (and `AskUserQuestion`, which comes even when everything is allowed),
 /// and for prompts sent while a command of it runs in the background.
@@ -390,8 +417,8 @@ fn prompt_text(spec: &TurnSpec) -> String {
         .attachments
         .iter()
         .filter(|a| match spec.harness {
-            HarnessKind::Claude | HarnessKind::Codex => a.image.is_none(),
-            HarnessKind::OpenCode => false,
+            HarnessKind::Claude | HarnessKind::Codex | HarnessKind::Pi => a.image.is_none(),
+            HarnessKind::OpenCode | HarnessKind::Antigravity => false,
             _ => true,
         })
         .map(|a| a.path.as_str())
@@ -481,8 +508,9 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
     let (program, mut args) = command_line(&spec)?;
     // A turn on an SSH host runs detached from the connection, so a dropped link does not
     // end it; the remote login shell finds the harness, the prompt still goes on stdin.
-    // An ACP agent talks both ways for the whole turn, so it cannot run detached.
-    let acp = spec.harness == HarnessKind::OpenCode;
+    // An ACP agent, and Pi in RPC mode, talk both ways for the whole turn, so they cannot
+    // run detached.
+    let acp = talks_both_ways(&spec.harness);
     // Either way the run has a name on the host, under which its process id is kept.
     let run = spec.ssh.as_ref().map(|_| format!("{}-{}", now_ms(), std::process::id()));
     if spec.harness == HarnessKind::Claude
@@ -637,8 +665,12 @@ pub fn start(spec: TurnSpec) -> io::Result<Turn> {
     let (reader_answers, reader_tasks) = (answers.clone(), tasks.clone());
     let reader = thread::spawn(move || {
         match (harness, acp_stdin) {
-            (_, Some(stdin)) => {
-                let error = acp::run_turn(stdin, lines, &reader_spec, &prompt, &reader_sender);
+            (harness, Some(stdin)) => {
+                let error = if harness == HarnessKind::Pi {
+                    pi_rpc::run_turn(stdin, lines, &reader_spec, &prompt, &reader_sender)
+                } else {
+                    acp::run_turn(stdin, lines, &reader_spec, &prompt, &reader_sender)
+                };
                 // The agent would wait for the next prompt: its input is closed now; give it a
                 // moment to finish its writes (the title, the last parts), then end it.
                 thread::sleep(std::time::Duration::from_millis(700));
@@ -866,12 +898,31 @@ fn read_claude(
             // The whole block is here: what was being written is in it.
             partial.text.clear();
         }
-        parser.feed(&value);
+        parser.feed(&without_subagent_words(value));
         let mut turn = parser.snapshot();
         turn.entries.insert(0, prompt_entry(prompt, started));
         let _ = sender.unbounded_send(LiveEvent::Update(turn));
     }
     error
+}
+
+/// A line of the turn with only what the main conversation says. A subagent's lines come
+/// in the same stream: its calls stay, to show that it works, but the task it was given and
+/// its own words and thinking go, or they would read as a prompt of the user and the answer.
+/// What it found comes back as the result of its call. The history drops these lines too.
+fn without_subagent_words(mut value: Value) -> Value {
+    let subagent = value.get("parent_tool_use_id").is_some_and(|id| !id.is_null()) || value.get("isSidechain").and_then(Value::as_bool) == Some(true);
+    if !subagent {
+        return value;
+    }
+    if let Some(content) = value.pointer_mut("/message/content") {
+        let calls = match content.take() {
+            Value::Array(blocks) => blocks.into_iter().filter(|block| matches!(block.get("type").and_then(Value::as_str), Some("tool_use" | "tool_result"))).collect(),
+            _ => Vec::new(),
+        };
+        *content = Value::Array(calls);
+    }
+    value
 }
 
 /// The text of a prompt Claude took, when a `user` line of its output is one
@@ -1303,6 +1354,55 @@ mod tests {
         let last = updates.last().unwrap();
         assert_eq!(text_of(last).matches("Rivers flow.").count(), 1, "the whole block replaces the partial text");
         assert_eq!(last.entries.len(), 2, "the prompt and one answer");
+    }
+
+    /// A subagent's task and words are not shown as a prompt and an answer of the turn; its
+    /// calls are, and what it found comes in the result of the call that started it.
+    #[test]
+    fn a_subagent_shows_by_its_calls_not_its_words() {
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"description":"Find prices","prompt":"Find the price of the kettle."}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Find the price of the kettle."}]},"parent_tool_use_id":"t1"}"#,
+            r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"thinking","thinking":"Where to look."},{"type":"text","text":"Let me look it up."},{"type":"tool_use","id":"w1","name":"WebFetch","input":{"url":"https://example.com/kettle"}}]},"parent_tool_use_id":"t1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"w1","content":"Kettle: 99"}]},"parent_tool_use_id":"t1"}"#,
+            r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"The kettle costs 99."}]},"parent_tool_use_id":"t1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"The kettle costs 99."}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"m4","content":[{"type":"text","text":"It costs 99."}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"It costs 99."}"#,
+        ]
+        .map(String::from);
+        let (sender, mut events) = unbounded();
+        read_claude(lines.into_iter(), &[Block::Text { text: "How much is the kettle?".into() }], &sender, &claude_ask::Input::closed(), &claude_ask::Tasks::default());
+        let mut last = None;
+        while let Ok(Some(event)) = events.try_next() {
+            if let LiveEvent::Update(turn) = event {
+                last = Some(turn);
+            }
+        }
+        let turn = last.unwrap();
+        let prompts: Vec<&Entry> = turn.entries.iter().filter(|entry| entry.role == Role::User && entry.blocks.iter().any(|block| matches!(block, Block::Text { .. }))).collect();
+        assert_eq!(prompts.len(), 1, "only the user's prompt: {prompts:?}");
+        let words: Vec<&str> = turn
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } | Block::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, ["How much is the kettle?", "It costs 99."]);
+        let calls: Vec<(&str, bool)> = turn
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.blocks)
+            .filter_map(|block| match block {
+                Block::ToolCall { name, result, .. } => Some((name.as_str(), result.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, [("Agent", true), ("WebFetch", true)]);
     }
 
     /// Claude answers, waits for a command it left in the background, and takes up the

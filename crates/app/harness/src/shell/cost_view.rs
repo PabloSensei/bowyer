@@ -17,6 +17,15 @@ fn money(usd: f64) -> String {
     }
 }
 
+/// How many times `cold` is `hot`: "×12" or "×1.4".
+fn times(cold: f64, hot: f64) -> String {
+    match cold / hot {
+        r if !r.is_finite() => "—".into(),
+        r if r >= 10.0 => format!("×{r:.0}"),
+        r => format!("×{r:.1}"),
+    }
+}
+
 fn duration(ms: i64) -> String {
     let minutes = ms / 60_000;
     match minutes {
@@ -133,6 +142,23 @@ impl Shell {
             }
             if let Some(text) = both(&|w| pricing::compact_cost(&model, context, w, long_cache)) {
                 rows.push(row(t("cost.compact"), format!("≈ {text}"), None).into_any_element());
+            }
+            // While the cache holds, the same turn and compaction once it is gone: what the
+            // warm cache saves.
+            if warm == Some(true) {
+                let cold = |label: &str, f: &dyn Fn(bool) -> Option<f64>, approx: &str| {
+                    let (hot, cold) = (f(true)?, f(false)?);
+                    Some(row(label, format!("{approx}{} · {}", money(cold), times(cold, hot)), Some(theme.text_muted)).into_any_element())
+                };
+                let turn = cold(t("cost.cold_turn"), &|w| pricing::context_cost(&model, context, w, long_cache), "");
+                let compact = cold(t("cost.cold_compact"), &|w| pricing::compact_cost(&model, context, w, long_cache), "≈ ");
+                if turn.is_some() || compact.is_some() {
+                    rows.push(
+                        div().pt(px(2.)).text_size(px(11.)).text_color(theme.text_muted).child(t("cost.cold_title").to_owned()).into_any_element(),
+                    );
+                    rows.extend(turn);
+                    rows.extend(compact);
+                }
             }
         }
         if state.is_some_and(|s| matches!(s, CacheState::Warm { .. })) {

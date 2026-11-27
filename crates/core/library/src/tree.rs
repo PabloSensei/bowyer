@@ -541,6 +541,69 @@ pub fn build_tree(
     tree
 }
 
+/// A node above a session in the tree, and whether its list is cut ("Show more") before
+/// the branch that holds the session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Above {
+    pub kind: TreeNodeKind,
+    pub id: String,
+    pub cut: bool,
+}
+
+/// The nodes above `key` in the tree, outermost first: what to open, and which lists to
+/// show whole, for the session to be seen. None when the tree does not have it (hidden).
+pub fn above_session(
+    summaries: &[SessionSummary],
+    folders: &[Folder],
+    placements: &HashMap<SessionKey, Placement>,
+    order: SortOrder,
+    grouping: Grouping,
+    collapsed: &HashSet<String>,
+    key: &SessionKey,
+) -> Option<Vec<Above>> {
+    // Every list whole: the session may be past a "Show more".
+    let mut all = HashSet::new();
+    let whole = build_tree(summaries, folders, placements, order, grouping, collapsed, &all);
+    fn ids(nodes: &[TreeNode], out: &mut HashSet<String>) {
+        for node in nodes {
+            out.insert(node.collapse_id());
+            ids(&node.children, out);
+        }
+    }
+    ids(&whole, &mut all);
+    let tree = build_tree(summaries, folders, placements, order, grouping, collapsed, &all);
+    fn find(nodes: &[TreeNode], key: &SessionKey, path: &mut Vec<Above>) -> bool {
+        for node in nodes {
+            if node.kind == TreeNodeKind::Session(key.clone()) {
+                return true;
+            }
+            path.push(Above { kind: node.kind.clone(), id: node.collapse_id(), cut: false });
+            if find(&node.children, key, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    if !find(&tree, key, &mut path) {
+        return None;
+    }
+    // Where each list is cut: the index of the branch in its parent's children.
+    let mut nodes: &[TreeNode] = &tree;
+    for step in &mut path {
+        let Some(at) = nodes.iter().position(|node| node.collapse_id() == step.id) else { break };
+        let node = &nodes[at];
+        let next = node.children.iter().position(|child| child.kind == TreeNodeKind::Session(key.clone()) || contains(child, key));
+        step.cut = node.children.len() > SHOWN_ROWS + 2 && next.is_some_and(|ix| ix >= SHOWN_ROWS);
+        nodes = &node.children;
+    }
+    fn contains(node: &TreeNode, key: &SessionKey) -> bool {
+        node.children.iter().any(|child| child.kind == TreeNodeKind::Session(key.clone()) || contains(child, key))
+    }
+    Some(path)
+}
+
 /// The rows a list draws: each node with its depth, children of collapsed nodes left out.
 pub fn flatten_visible(nodes: &[TreeNode]) -> Vec<(usize, &TreeNode)> {
     fn walk<'a>(nodes: &'a [TreeNode], depth: usize, out: &mut Vec<(usize, &'a TreeNode)>) {
@@ -742,6 +805,24 @@ mod tests {
         // Twelve rows are shown whole: a "Show 2 more" row would save nothing.
         let tree = build_tree(&summaries[..12], &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new());
         assert_eq!(tree[0].children.len(), 12);
+    }
+
+    /// A session found by the search is shown in the tree: its closed group opens and the
+    /// list it is cut from shows whole; a session near the top needs no "Show more".
+    #[test]
+    fn a_session_knows_what_hides_it_in_the_tree() {
+        let summaries: Vec<SessionSummary> = (0..25).map(|i| summary(&format!("s{i}"), &format!("S{i}"), "/w", i)).collect();
+        let group_id = build_tree(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &HashSet::new(), &HashSet::new())[0].collapse_id();
+        let closed: HashSet<String> = [group_id.clone()].into();
+        let above = |key: &SessionKey| above_session(&summaries, &[], &HashMap::new(), SortOrder::Updated, Grouping::Project, &closed, key).unwrap();
+        let oldest = above(&summaries[0].key);
+        assert_eq!(oldest.len(), 1);
+        assert_eq!(oldest[0].id, group_id);
+        assert!(oldest[0].cut, "the oldest of 25 is past the cut");
+        assert!(!above(&summaries[24].key)[0].cut, "the newest is on top");
+        let mut gone = HashMap::new();
+        gone.insert(summaries[3].key.clone(), Placement { hidden: true, ..Default::default() });
+        assert!(above_session(&summaries, &[], &gone, SortOrder::Updated, Grouping::Project, &closed, &summaries[3].key).is_none());
     }
 
     #[test]

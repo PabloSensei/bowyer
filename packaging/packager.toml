@@ -10,7 +10,7 @@
 
 name = "bowyer"
 product-name = "Bowyer"
-version = "0.1.11"
+version = "0.1.12"
 # The same string is the AppUserModelID of the Windows shortcuts and of the process
 # (crates/app/harness/src/main.rs), so the taskbar groups the window under the shortcut.
 identifier = "dev.bowyer.app"

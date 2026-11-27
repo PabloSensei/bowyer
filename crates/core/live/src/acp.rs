@@ -345,9 +345,14 @@ pub(crate) fn run_turn(
     };
     let _ = sender.unbounded_send(LiveEvent::Session(session.clone()));
     if let Some(model) = &spec.model {
+        // The model as a config option (OpenCode), or by the older `session/set_model`
+        // (Antigravity's `agy` has both).
         let params = json!({"sessionId": session, "configId": "model", "value": model});
         if let Err(error) = call("session/set_config_option", params, &mut builder, false, Some(&session)) {
-            return Some(format!("the model {model}: {error}"));
+            let params = json!({"sessionId": session, "modelId": model});
+            if call("session/set_model", params, &mut builder, false, Some(&session)).is_err() {
+                return Some(format!("the model {model}: {error}"));
+            }
         }
     }
     let _ = sender.unbounded_send(LiveEvent::Update(builder.turn.clone()));
@@ -478,8 +483,12 @@ mod tests {
         }
     }
 
+    /// The messages written so far: whole lines only, as another thread may be halfway
+    /// through one.
     fn sent(sink: &Sink) -> Vec<Value> {
-        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        let text = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        let whole = &text[..text.rfind('\n').map_or(0, |end| end + 1)];
+        whole.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
     }
 
     #[test]

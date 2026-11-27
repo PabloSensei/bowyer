@@ -37,6 +37,8 @@ pub enum Piece {
 pub struct Item {
     pub role: Role,
     pub timestamp_ms: i64,
+    /// When its last part came: an answer joins the turns after it.
+    pub end_ms: i64,
     pub model: Option<String>,
     pub compact_summary: bool,
     pub pieces: Vec<Piece>,
@@ -45,6 +47,8 @@ pub struct Item {
     pub branch: Option<(String, String)>,
     /// A prompt: its uuid, for the files its turn changed, and its text.
     pub prompt: Option<(String, String)>,
+    /// Its text as written, Markdown and all, to copy whole.
+    pub text: String,
 }
 
 fn field<'a>(input: &'a Value, names: &[&str]) -> Option<&'a str> {
@@ -86,12 +90,14 @@ fn tool_view(name: &str, kind: ToolKind, input: &Value, result: &Option<ToolResu
 
 fn item_of(entry: &Entry) -> Item {
     let mut pieces: Vec<Piece> = Vec::new();
+    let mut texts: Vec<&str> = Vec::new();
     for block in &entry.blocks {
         match block {
             Block::Text { text } => {
                 if text.trim().is_empty() {
                     continue;
                 }
+                texts.push(text.trim());
                 pieces.push(Piece::Markdown(markdown::parse(text)));
             }
             Block::Thinking { text } => pieces.push(Piece::Thinking(text.clone())),
@@ -112,11 +118,13 @@ fn item_of(entry: &Entry) -> Item {
     Item {
         role: entry.role,
         timestamp_ms: entry.timestamp_ms,
+        end_ms: entry.timestamp_ms,
         model: entry.model.clone(),
         compact_summary: entry.compact_summary,
         pieces,
         branch: None,
         prompt: None,
+        text: texts.join("\n\n"),
     }
 }
 
@@ -145,6 +153,13 @@ pub fn items(transcript: &Transcript) -> Vec<Item> {
             && last.role == Role::Assistant
             && item.role == Role::Assistant
         {
+            last.end_ms = last.end_ms.max(item.end_ms);
+            if !item.text.is_empty() {
+                if !last.text.is_empty() {
+                    last.text.push_str("\n\n");
+                }
+                last.text.push_str(&item.text);
+            }
             for piece in item.pieces {
                 match (last.pieces.last_mut(), piece) {
                     (Some(Piece::Tools(run)), Piece::Tools(more)) => run.extend(more),
@@ -220,5 +235,28 @@ mod tests {
         assert_eq!(run.len(), 3);
         assert_eq!(run_summary(run), "Read ×2 · Bash");
         assert!(matches!(items[1].pieces[2], Piece::Markdown(_)));
+    }
+
+    /// An answer joined from several turns keeps all their words as written, and ends when
+    /// the last of them came.
+    #[test]
+    fn an_answer_keeps_its_markdown_and_when_it_ended() {
+        let at = |mut entry: Entry, ms| {
+            entry.timestamp_ms = ms;
+            entry
+        };
+        let transcript = Transcript {
+            entries: vec![
+                at(entry(Role::User, vec![Block::Text { text: "list it".into() }]), 1_000),
+                at(entry(Role::Assistant, vec![Block::Text { text: "Looking **now**.".into() }, call("Read")]), 2_000),
+                at(entry(Role::Assistant, vec![call("Bash")]), 3_000),
+                at(entry(Role::Assistant, vec![Block::Thinking { text: "hm".into() }, Block::Text { text: "| a | b |\n|---|---|\n| 1 | 2 |\n".into() }]), 4_000),
+            ],
+            ..Default::default()
+        };
+        let items = items(&transcript);
+        assert_eq!((items[0].timestamp_ms, items[0].text.as_str()), (1_000, "list it"));
+        assert_eq!((items[1].timestamp_ms, items[1].end_ms), (2_000, 4_000));
+        assert_eq!(items[1].text, "Looking **now**.\n\n| a | b |\n|---|---|\n| 1 | 2 |");
     }
 }

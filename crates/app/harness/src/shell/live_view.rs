@@ -10,7 +10,7 @@ use model::{EnvId, HarnessKind, SessionKey, SessionSummary, SourceStamp, TaskRun
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use super::{LiveRun, OpenSession, Shell, can_run_live, chip, composer, critter, effort_presets, harness_color, model_presets, now_ms};
+use super::{LiveRun, OpenSession, Shell, can_continue, chip, composer, critter, effort_presets, harness_color, ide_only, model_presets, now_ms};
 use crate::display;
 use crate::i18n::t;
 
@@ -32,7 +32,8 @@ fn choice_setting(kind: &str, key: &SessionKey) -> String {
 /// with: a preset of the list does (the harness default among them), a session's own full
 /// id does not, since the settings could not show it.
 fn sets_default(harness: &HarnessKind, model: Option<&str>) -> bool {
-    model_presets(harness).contains(&model)
+    // A harness that lists its own models takes any of them for its new sessions.
+    model_presets(harness).contains(&model) || Shell::lists_models(harness)
 }
 
 /// The model a session's history names, as its next turn asks for it: the preset it is
@@ -203,13 +204,16 @@ impl Shell {
                 return Some(model);
             }
         }
-        self.default_model(harness).map(str::to_owned)
+        self.default_model(harness)
     }
 
     /// The model new sessions of `harness` start with, as the settings keep it.
-    pub(super) fn default_model(&self, harness: &HarnessKind) -> Option<&'static str> {
+    pub(super) fn default_model(&self, harness: &HarnessKind) -> Option<String> {
         let value = self.lib().setting(&format!("model.{}", harness.id()))?;
-        model_presets(harness).iter().flatten().find(|preset| **preset == value).copied()
+        if Shell::lists_models(harness) {
+            return (!value.is_empty()).then_some(value);
+        }
+        model_presets(harness).iter().flatten().find(|preset| **preset == value).map(|preset| (*preset).to_owned())
     }
 
     /// The key of the open session when the harness named it; a new session has none.
@@ -235,7 +239,7 @@ impl Shell {
     /// A model picked in the composer: for the open session, and for new sessions of
     /// `harness` too when it is one of the list's presets. The session's own full id (from
     /// its history) stays its own: new sessions keep the model they had.
-    fn set_composer_model(&self, harness: &HarnessKind, model: Option<&str>) {
+    pub(super) fn set_composer_model(&self, harness: &HarnessKind, model: Option<&str>) {
         let library = self.lib();
         if let Some(key) = self.open_session_key() {
             let _ = library.set_setting(&choice_setting("model", &key), model.unwrap_or(""));
@@ -330,6 +334,9 @@ impl Shell {
         let theme = *cx.global::<Theme>();
         let menu = self.composer_menu?;
         let bounds = self.composer_anchors[menu as usize].bounds()?;
+        if menu == ComposerMenu::Model && Shell::lists_models(harness) {
+            return Some(self.render_model_picker(harness, bounds, cx));
+        }
         let rows = self.menu_rows(menu, harness);
         let list = div()
             .id("composer-menu")
@@ -380,8 +387,16 @@ impl Shell {
             .relative()
             .when(open, |this| this.bg(theme.hover))
             .child(self.composer_anchors[menu as usize].canvas())
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.composer_menu = if this.composer_menu == Some(menu) { None } else { Some(menu) };
+                if this.composer_menu == Some(ComposerMenu::Model)
+                    && let Some(key) = this.open.as_ref().map(|open| open.summary.key.clone())
+                    && Shell::lists_models(&key.harness)
+                {
+                    this.open_model_picker(key.env, key.harness, window, cx);
+                }
+                // The composer around would take the focus back from the list's search.
+                cx.stop_propagation();
                 cx.notify();
             }))
     }
@@ -592,8 +607,9 @@ impl Shell {
         }
         let Some(open) = &self.open else { return };
         let summary = open.summary.clone();
-        if !can_run_live(&summary.key.harness) {
-            self.status = Some(format!("{}: {}", summary.key.harness, t("live.unsupported")));
+        if !can_continue(&summary) {
+            let why = if ide_only(&summary) { t("live.ide_only") } else { t("live.unsupported") };
+            self.status = Some(format!("{}: {why}", summary.key.harness));
             cx.notify();
             return;
         }
@@ -1604,10 +1620,14 @@ impl Shell {
         let harness = open.summary.key.harness.clone();
         let focused = self.composer_focus.is_focused(window);
         let running = self.live_running();
-        let supported = can_run_live(&harness);
-        let model_label = self.model_choice(&harness).unwrap_or_else(|| t("model.default").to_owned());
+        let supported = can_continue(&open.summary);
+        let model_label = self.model_choice(&harness).map_or_else(|| t("model.default").to_owned(), |id| self.model_label(&harness, &id));
         let permission_label = t(&format!("permission.{}", self.permission.id()));
-        let placeholder = if supported { t("composer.placeholder") } else { t("live.unsupported") };
+        let placeholder = match supported {
+            true => t("composer.placeholder"),
+            false if ide_only(&open.summary) => t("live.ide_only"),
+            false => t("live.unsupported"),
+        };
         // Lines wrap to the width of the field, and a text taller than it scrolls.
         let field = div()
             .id("composer-text")
@@ -1635,29 +1655,44 @@ impl Shell {
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                 let at = text_index_at(&layout, event.position);
-                                match event.click_count {
-                                    2 => this.composer.select_word_at(at),
-                                    count if count >= 3 => this.composer.select_line_at(at),
-                                    _ if event.modifiers.shift => this.composer.select_to(at),
-                                    _ => this.composer.set_caret(at),
+                                let letter = text_letter_at(&layout, event.position);
+                                let unit = match event.click_count {
+                                    2 => SelectUnit::Word,
+                                    count if count >= 3 => SelectUnit::Line,
+                                    _ => SelectUnit::Letter,
+                                };
+                                let taken = unit_around(&this.composer.text, letter, unit);
+                                match unit {
+                                    SelectUnit::Letter if event.modifiers.shift => this.composer.select_to(at),
+                                    SelectUnit::Letter => this.composer.set_caret(at),
+                                    _ => this.composer.select_range(taken.start, taken.end),
                                 }
-                                this.composer_selecting = event.click_count < 2;
+                                this.composer_selecting = Some((unit, taken));
                                 this.composer_focus.focus(window, cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
                         )
                         .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                            if this.composer_selecting && event.pressed_button == Some(MouseButton::Left) {
+                            if let Some((unit, taken)) = this.composer_selecting.clone()
+                                && event.pressed_button == Some(MouseButton::Left)
+                            {
                                 let at = text_index_at(&move_layout, event.position);
-                                if at != this.composer.caret() {
+                                let before = (this.composer.selection(), this.composer.caret());
+                                if unit == SelectUnit::Letter {
                                     this.composer.select_to(at);
+                                } else {
+                                    let here = unit_around(&this.composer.text, text_letter_at(&move_layout, event.position), unit);
+                                    let (anchor, caret) = grow_selection((taken.start, taken.end), (here.start, here.end));
+                                    this.composer.select_range(anchor, caret);
+                                }
+                                if (this.composer.selection(), this.composer.caret()) != before {
                                     cx.notify();
                                 }
                             }
                         }))
-                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = false))
-                        .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = false)),
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = None))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.composer_selecting = None)),
                 )
             });
         let elapsed = self
@@ -1723,7 +1758,8 @@ impl Shell {
         // Only a harness whose effort Bowyer can set shows the list.
         let effort_button = (!effort_presets(&harness).is_empty())
             .then(|| self.menu_button(ComposerMenu::Effort, effort_label(self.effort_choice(&harness).as_deref()), cx));
-        let permission_button = self.menu_button(ComposerMenu::Permission, permission_label.to_owned(), cx);
+        // Pi asks no permissions: every action goes through, so there is nothing to choose.
+        let permission_button = (harness != HarnessKind::Pi).then(|| self.menu_button(ComposerMenu::Permission, permission_label.to_owned(), cx));
         // The IDE Claude Code works with, when one has the session's folder open.
         let ide = open.summary.cwd.as_deref().and_then(|cwd| self.ide_of(cwd)).map(|ide| {
             let tip = t("ide.connected").replace("{ide}", &ide.name);
@@ -1819,7 +1855,7 @@ impl Shell {
                                     )
                                     .child(model_button)
                                     .children(effort_button)
-                                    .child(permission_button)
+                                    .children(permission_button)
                                     .children(ide)
                                     .children(menu),
                             )

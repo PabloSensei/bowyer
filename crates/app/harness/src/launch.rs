@@ -17,6 +17,8 @@ pub fn harness_command(harness: &HarnessKind, resume: Option<&str>) -> (String, 
         HarnessKind::Codex => "codex",
         HarnessKind::OpenCode => "opencode",
         HarnessKind::DeepSeek => "dsh",
+        HarnessKind::Pi => "pi",
+        HarnessKind::Antigravity => "agy",
         HarnessKind::Other(id) => id.as_str(),
     }
     .to_owned();
@@ -24,6 +26,8 @@ pub fn harness_command(harness: &HarnessKind, resume: Option<&str>) -> (String, 
         (HarnessKind::Claude, Some(id)) => vec!["--resume".into(), id.into()],
         (HarnessKind::Codex, Some(id)) => vec!["resume".into(), id.into()],
         (HarnessKind::OpenCode, Some(id)) => vec!["--session".into(), id.into()],
+        (HarnessKind::Pi, Some(id)) => vec!["--session".into(), id.into()],
+        (HarnessKind::Antigravity, Some(id)) => vec!["--conversation".into(), id.into()],
         // DeepSeek Harness has no terminal interface: its web interface opens the session.
         (HarnessKind::DeepSeek, _) => vec!["web".into()],
         _ => Vec::new(),

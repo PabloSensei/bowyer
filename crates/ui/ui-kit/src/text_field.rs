@@ -111,33 +111,20 @@ impl TextField {
 
     /// Selects the word around `at`, or the one character there when it is no word.
     pub fn select_word_at(&mut self, at: usize) {
-        let at = self.boundary(at);
-        let char_at = |at: usize| self.text[at..].chars().next();
-        let char_before = |at: usize| self.text[..at].chars().next_back();
-        let in_word = char_at(at).is_some_and(Self::word_char) || char_before(at).is_some_and(Self::word_char);
-        if !in_word {
-            self.anchor = at;
-            self.caret = self.next_boundary(at);
-            return;
-        }
-        let mut start = at;
-        while let Some(character) = char_before(start).filter(|c| Self::word_char(*c)) {
-            start -= character.len_utf8();
-        }
-        let mut end = at;
-        while let Some(character) = char_at(end).filter(|c| Self::word_char(*c)) {
-            end += character.len_utf8();
-        }
-        self.anchor = start;
-        self.caret = end;
-        self.last_edit = None;
+        let word = word_around(&self.text, at);
+        self.select_range(word.start, word.end);
     }
 
     /// Selects the line around `at`.
     pub fn select_line_at(&mut self, at: usize) {
-        let at = self.boundary(at);
-        self.anchor = self.line_start(at);
-        self.caret = self.line_end(at);
+        let line = line_around(&self.text, at);
+        self.select_range(line.start, line.end);
+    }
+
+    /// Selects from `anchor` to `caret`, the caret where it is drawn.
+    pub fn select_range(&mut self, anchor: usize, caret: usize) {
+        self.anchor = self.boundary(anchor);
+        self.caret = self.boundary(caret);
         self.last_edit = None;
     }
 
@@ -261,7 +248,7 @@ impl TextField {
     }
 
     fn word_char(character: char) -> bool {
-        character.is_alphanumeric() || character == '_'
+        word_char(character)
     }
 
     /// The start of the word before `at`, skipping the spaces between words.
@@ -693,10 +680,109 @@ pub fn text_field_wrapped(
     (element, returned)
 }
 
-/// The byte of a drawn [`text_field_wrapped`] nearest to `position`: the caret a click
-/// there leaves.
-pub fn index_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
+/// What a drag of the mouse selects by: letters after one click, whole words after a
+/// double click, whole lines (or the whole text) after a triple one, as in an editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectUnit {
+    #[default]
+    Letter,
+    Word,
+    Line,
+    All,
+}
+
+fn word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The word of `text` the letter at the byte `at` belongs to, or that one letter when it is
+/// no word (a space, a mark); the last word at the end of the text.
+pub fn word_around(text: &str, at: usize) -> Range<usize> {
+    let at = floor_boundary(text, at);
+    let after = |at: usize| text[at..].chars().next();
+    let before = |at: usize| text[..at].chars().next_back();
+    let in_word = match after(at) {
+        Some(letter) => word_char(letter),
+        None => before(at).is_some_and(word_char),
+    };
+    if !in_word {
+        return at..at + after(at).map_or(0, char::len_utf8);
+    }
+    let mut start = at;
+    while let Some(character) = before(start).filter(|c| word_char(*c)) {
+        start -= character.len_utf8();
+    }
+    let mut end = at;
+    while let Some(character) = after(end).filter(|c| word_char(*c)) {
+        end += character.len_utf8();
+    }
+    start..end
+}
+
+/// The line of `text` around the byte `at`, without its line break.
+pub fn line_around(text: &str, at: usize) -> Range<usize> {
+    let at = floor_boundary(text, at);
+    let start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |index| at + index);
+    start..end
+}
+
+/// The `unit` of `text` around the byte `at`.
+pub fn unit_around(text: &str, at: usize, unit: SelectUnit) -> Range<usize> {
+    match unit {
+        SelectUnit::Letter => {
+            let at = floor_boundary(text, at);
+            at..at
+        }
+        SelectUnit::Word => word_around(text, at),
+        SelectUnit::Line => line_around(text, at),
+        SelectUnit::All => 0..text.len(),
+    }
+}
+
+/// The anchor and the head of a selection that began on `origin` (the word or line clicked
+/// first) and is dragged over `here` (the one under the mouse now): it takes both whole,
+/// and the anchor goes to the far end of the origin when the drag goes back before it.
+/// Places are anything ordered: bytes of one text, or places in many.
+pub fn grow_selection<P: Ord + Copy>(origin: (P, P), here: (P, P)) -> (P, P) {
+    if here.0 < origin.0 { (origin.1, here.0) } else { (origin.0, here.1.max(origin.1)) }
+}
+
+/// The letter of a drawn text under `position`, the nearest one when it is beside the text:
+/// what a click hits, the word a double click takes.
+pub fn letter_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
     layout.index_for_position(position).unwrap_or_else(|index| index)
+}
+
+/// The boundary between letters of a drawn text nearest to `position`: the caret a click
+/// there leaves, or the end of a selection dragged there. GPUI gives the letter under the
+/// point, so a point on the right half of a letter goes past it here, as in any editor.
+pub fn index_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
+    let index = match layout.index_for_position(position) {
+        Ok(index) => index,
+        Err(index) => return index,
+    };
+    let text = layout.text();
+    let Some(letter) = text.get(index..).and_then(|rest| rest.chars().next()) else { return index };
+    let next = index + letter.len_utf8();
+    match (layout.position_for_index(index), layout.position_for_index(next)) {
+        // The letter's both edges on one line: not one a line wraps after.
+        (Some(start), Some(end)) if start.y == end.y => nearer_edge(index, next, start.x, end.x, position.x),
+        _ => index,
+    }
+}
+
+/// `before` or `after` a letter drawn from `left` to `right`, whichever `x` is nearer.
+fn nearer_edge(before: usize, after: usize, left: Pixels, right: Pixels, x: Pixels) -> usize {
+    if right > left && x - left > right - x { after } else { before }
 }
 
 /// The parts of the field that lie on one line. The caret is placed only when it belongs
@@ -799,9 +885,50 @@ fn caret(color: Hsla, height: f32, name: Option<&'static str>) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{KeyDownEvent, Keystroke, Modifiers};
+    use gpui_kit::{KeyDownEvent, Keystroke, Modifiers, px};
 
     use super::TextField;
+
+    /// A double click takes the word, Cyrillic too, or the one mark that is no word; a
+    /// triple one the line.
+    #[test]
+    fn a_click_finds_its_word_and_its_line() {
+        let text = "Мы прошли мимо, snake_case!\nВторая строка";
+        let word = |at: usize| &text[super::word_around(text, at)];
+        let at = |part: &str| text.find(part).unwrap();
+        assert_eq!(word(at("шли")), "прошли");
+        assert_eq!(word(at("ли мимо") + 1), "прошли", "inside a two-byte letter");
+        assert_eq!(word(at(" мимо") + 1), "мимо", "at the start of a word");
+        assert_eq!(word(at("case")), "snake_case");
+        assert_eq!(word(at("!")), "!");
+        assert_eq!(word(at(", ") + 1), " ");
+        assert_eq!(word(text.len()), "строка", "past the end: the last word");
+        assert_eq!(&text[super::line_around(text, at("рая"))], "Вторая строка");
+        assert_eq!(&text[super::line_around(text, 0)], "Мы прошли мимо, snake_case!");
+        assert_eq!(super::unit_around(text, 5, super::SelectUnit::All), 0..text.len());
+    }
+
+    /// A drag after a double click grows by whole words both ways and keeps the first one.
+    #[test]
+    fn a_drag_by_words_keeps_the_first_word_whole() {
+        let first = (10, 16);
+        assert_eq!(super::grow_selection(first, (10, 16)), (10, 16));
+        assert_eq!(super::grow_selection(first, (17, 22)), (10, 22), "forward to the end of a later word");
+        assert_eq!(super::grow_selection(first, (3, 9)), (16, 3), "back: the anchor goes to the far end");
+        assert_eq!(super::grow_selection(first, (12, 16)), (10, 16), "inside the first word");
+    }
+
+    /// A point on the right half of a letter is past it; on the left half, before it.
+    #[test]
+    fn a_point_goes_to_the_nearer_edge_of_its_letter() {
+        let edge = |x: f32| super::nearer_edge(8, 10, px(40.), px(48.), px(x));
+        assert_eq!(edge(41.), 8);
+        assert_eq!(edge(43.9), 8);
+        assert_eq!(edge(44.), 8, "the middle stays before");
+        assert_eq!(edge(44.5), 10);
+        assert_eq!(edge(47.9), 10);
+        assert_eq!(super::nearer_edge(8, 10, px(40.), px(40.), px(40.)), 8, "a letter of no width");
+    }
 
     fn press(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
         KeyDownEvent {

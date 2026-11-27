@@ -4,10 +4,23 @@
 
 use std::path::{Path, PathBuf};
 
-/// The program and the arguments before the harness's own, found on the PATH.
+/// The program and the arguments before the harness's own, found on the PATH, then in the
+/// folder its own installer uses: one installed after the window started is not on the
+/// PATH the window got.
 pub fn resolve_program(name: &str) -> Option<(PathBuf, Vec<String>)> {
-    let path = std::env::var_os("PATH")?;
-    resolve_in(name, std::env::split_paths(&path))
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    resolve_in(name, std::env::split_paths(&path).chain(install_dirs(name)))
+}
+
+/// Where the installers of Pi and Antigravity's `agy` put them.
+fn install_dirs(name: &str) -> Vec<PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    match name {
+        "pi" => home.map(|home| home.join(".pi").join("agent").join("bin")).into_iter().collect(),
+        "agy" if cfg!(windows) => std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("agy").join("bin")).into_iter().collect(),
+        "agy" => home.map(|home| home.join(".local").join("bin")).into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn resolve_in(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<(PathBuf, Vec<String>)> {
@@ -46,13 +59,15 @@ fn from_shim(dir: &Path, text: &str) -> Option<(PathBuf, Vec<String>)> {
     shim_exe(text).map(|relative| (dir.join(relative), Vec::new())).filter(|(exe, _)| exe.is_file())
 }
 
-/// The quoted paths after `%dp0%` in a shim, relative to its folder.
+/// The quoted paths after `%dp0%` in a shim, relative to its folder. `%~dp0` ends with a
+/// separator, so Pi's shim writes `"%~dp0pi-launcher.js"`.
 fn shim_paths(text: &str) -> impl Iterator<Item = String> + '_ {
-    ["\"%dp0%\\", "\"%~dp0\\"].into_iter().flat_map(move |marker| {
+    ["\"%dp0%", "\"%~dp0"].into_iter().flat_map(move |marker| {
         text.match_indices(marker).filter_map(move |(index, _)| {
             let rest = &text[index + marker.len()..];
             let end = rest.find('"')?;
-            Some(rest[..end].replace('\\', std::path::MAIN_SEPARATOR_STR))
+            let path = rest[..end].trim_start_matches(['\\', '/']);
+            (!path.is_empty()).then(|| path.replace('\\', std::path::MAIN_SEPARATOR_STR))
         })
     })
 }
@@ -90,6 +105,13 @@ mod tests {
         assert_eq!(shim_exe(NODE_SHIM), None, "node.exe is not the program");
         let short = "\"%_prog%\"  \"%dp0%\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js\" %*";
         assert!(shim_script(short).unwrap().ends_with("bin.js"));
+    }
+
+    /// Pi's installer writes a shim of its own, with the script right after `%~dp0`.
+    #[test]
+    fn the_shim_of_pi_names_its_launcher() {
+        let shim = "@ECHO off\r\nSETLOCAL\r\nSET \"node=node\"\r\n\"%node%\" \"%~dp0pi-launcher.js\" %*\r\n";
+        assert_eq!(shim_script(shim).as_deref(), Some("pi-launcher.js"));
     }
 
     #[test]

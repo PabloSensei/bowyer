@@ -1,0 +1,4 @@
+<!-- Bowyer's own pixel critter for Pi: one colour, drawn where it is shown. -->
+<svg width="12" height="12" viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges">
+  <path fill="#000" d="M0 1h12v1h-12zM0 2h12v1h-12zM0 3h2v1h-2zM3 3h1v1h-1zM5 3h2v1h-2zM8 3h1v1h-1zM10 3h2v1h-2zM0 4h12v1h-12zM2 5h2v1h-2zM8 5h2v1h-2zM2 6h2v1h-2zM8 6h2v1h-2zM2 7h2v1h-2zM8 7h2v1h-2zM2 8h2v1h-2zM8 8h2v1h-2zM2 9h2v1h-2zM8 9h3v1h-3zM1 10h3v1h-3zM9 10h2v1h-2z"/>
+</svg>

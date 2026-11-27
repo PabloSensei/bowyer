@@ -79,9 +79,11 @@ fn find_program(name: &str) -> Option<std::path::PathBuf> {
     } else {
         vec![String::new()]
     };
-    std::env::split_paths(&path).find_map(|dir| {
-        extensions.iter().map(|ext| dir.join(format!("{name}{ext}"))).find(|candidate| candidate.is_file())
-    })
+    std::env::split_paths(&path)
+        .find_map(|dir| extensions.iter().map(|ext| dir.join(format!("{name}{ext}"))).find(|candidate| candidate.is_file()))
+        // One its installer put where the window's PATH does not reach: the script a Node
+        // shim runs, or the program.
+        .or_else(|| live::resolve_program(name).map(|(program, prefix)| prefix.first().map_or(program, std::path::PathBuf::from)))
 }
 
 /// The program a harness runs as.
@@ -90,6 +92,8 @@ fn harness_program(harness: &HarnessKind) -> &'static str {
         HarnessKind::Claude => "claude",
         HarnessKind::Codex => "codex",
         HarnessKind::OpenCode => "opencode",
+        HarnessKind::Pi => "pi",
+        HarnessKind::Antigravity => "agy",
         _ => "dsh",
     }
 }
@@ -119,6 +123,11 @@ impl Shell {
 
     pub(super) fn notifications_enabled(&self) -> bool {
         self.lib().setting("notify.enabled").is_none_or(|value| value != "false")
+    }
+
+    /// Whether selecting text in a conversation shows the bubble with Ask about this and Copy.
+    pub(super) fn selection_bubble_enabled(&self) -> bool {
+        self.lib().setting("selection.bubble").is_none_or(|value| value != "false")
     }
 
     fn set_flag(&mut self, key: &str, on: bool, cx: &mut Context<Self>) {
@@ -275,6 +284,7 @@ impl Shell {
         let notify = self.notifications_enabled();
         let tray_close = tray::close_to_tray();
         let keep_awake = self.keep_awake_enabled();
+        let selection_bubble = self.selection_bubble_enabled();
         let data = self.settings_dir.clone();
         let data_text = data.to_string_lossy().into_owned();
         vec![
@@ -301,6 +311,17 @@ impl Shell {
                     toggle("keep-awake", keep_awake, theme, cx, |this, on, cx| {
                         this.set_flag("power.keep_awake", on, cx);
                         this.keep_awake(cx);
+                    }),
+                    theme,
+                ))
+                .child(row(
+                    t("settings.selection_bubble"),
+                    Some(t("settings.selection_bubble_hint")),
+                    toggle("selection-bubble", selection_bubble, theme, cx, |this, on, cx| {
+                        this.set_flag("selection.bubble", on, cx);
+                        if !on && let Some(selection) = &mut this.selection {
+                            selection.bubble = None;
+                        }
                     }),
                     theme,
                 ))
@@ -380,7 +401,7 @@ impl Shell {
     }
 
     fn settings_harnesses(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let harnesses = [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek];
+        let harnesses = super::new_session::HARNESSES;
         harnesses
             .into_iter()
             .map(|harness| {
@@ -392,12 +413,14 @@ impl Shell {
                 let current = self.default_model(&harness);
                 let models: Vec<(String, bool, Option<&'static str>)> = model_presets(&harness)
                     .iter()
-                    .map(|preset| (preset.unwrap_or(t("model.default")).to_owned(), *preset == current, *preset))
+                    .map(|preset| (preset.unwrap_or(t("model.default")).to_owned(), preset.map(str::to_owned) == current, *preset))
                     .collect();
                 let id: &'static str = match harness {
                     HarnessKind::Claude => "model-claude",
                     HarnessKind::Codex => "model-codex",
                     HarnessKind::OpenCode => "model-opencode",
+                    HarnessKind::Pi => "model-pi",
+                    HarnessKind::Antigravity => "model-antigravity",
                     _ => "model-deepseek",
                 };
                 let chooser = harness.clone();

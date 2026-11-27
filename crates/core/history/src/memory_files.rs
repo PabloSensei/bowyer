@@ -36,6 +36,8 @@ pub fn memory_file_paths(harness: &HarnessKind, cwd: &str, home: &str, session_p
         HarnessKind::Claude => (&["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"], vec![format!("{home}/.claude/CLAUDE.md")]),
         HarnessKind::Codex => (&["AGENTS.md"], vec![format!("{home}/.codex/AGENTS.md")]),
         HarnessKind::OpenCode => (&["AGENTS.md"], vec![format!("{home}/.config/opencode/AGENTS.md")]),
+        // Pi also takes `CLAUDE.md` where a folder has no `AGENTS.md`; most have one of them.
+        HarnessKind::Pi => (&["AGENTS.md"], vec![format!("{home}/.pi/agent/AGENTS.md")]),
         _ => return Vec::new(),
     };
     let mut paths = global;

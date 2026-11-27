@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 mod tree;
 
-pub use tree::{Grouping, PINNED_GROUP, SessionStart, SortOrder, TreeNode, TreeNodeKind, build_tree, flatten_visible, link_started, project_root};
+pub use tree::{Above, Grouping, PINNED_GROUP, SessionStart, SortOrder, TreeNode, TreeNodeKind, above_session, build_tree, flatten_visible, link_started, project_root};
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
 

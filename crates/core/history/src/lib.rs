@@ -11,6 +11,7 @@ use std::path::Path;
 use envs::Environment;
 use model::{HarnessKind, SessionSummary, Transcript};
 
+mod antigravity;
 mod claude;
 mod commands;
 mod codex;
@@ -18,12 +19,14 @@ mod dsh;
 mod export;
 mod memory_files;
 mod opencode;
+mod pi;
 #[cfg(test)]
 mod test_env;
 mod time;
 mod trash;
 mod turns;
 
+pub use antigravity::AntigravitySource;
 pub use claude::{ClaudeFollower, ClaudeParser, ClaudeSource, claude_tail, hook_feedback, turn_of_tail};
 pub use commands::{CommandSource, HarnessCommand, claude_commands};
 pub use codex::{CodexSource, codex_tail, codex_turn_of_tail};
@@ -31,6 +34,7 @@ pub use dsh::DshSource;
 pub use export::{ExportLabels, export_file_name, export_markdown};
 pub use memory_files::{memory_file_paths, memory_tokens};
 pub use opencode::OpenCodeSource;
+pub use pi::{PiSource, transcript_of_messages as pi_transcript_of_messages};
 pub use time::parse_rfc3339_ms;
 pub use trash::{TRASH_DIR, move_to_trash, session_files};
 pub use turns::{TurnFileState, file_history_dir, read_turn, undo_turn};
@@ -75,7 +79,7 @@ pub trait HistorySource: Send + Sync {
 
 /// The sources of the built-in harnesses.
 pub fn builtin_sources() -> Vec<Box<dyn HistorySource>> {
-    vec![Box::new(ClaudeSource), Box::new(CodexSource), Box::new(OpenCodeSource), Box::new(DshSource)]
+    vec![Box::new(ClaudeSource), Box::new(CodexSource), Box::new(OpenCodeSource), Box::new(DshSource), Box::new(PiSource), Box::new(AntigravitySource)]
 }
 
 /// The source of a harness, when one is built in.

@@ -59,6 +59,7 @@ mod turn_view;
 mod spend_view;
 mod mission_view;
 mod memory_tunnel;
+mod model_picker;
 
 pub const APP_NAME: &str = "Bowyer";
 
@@ -134,6 +135,8 @@ fn harness_color(harness: &HarnessKind) -> Hsla {
         HarnessKind::Codex => hex(0x10A37F),
         HarnessKind::OpenCode => hex(0x6E8BFF),
         HarnessKind::DeepSeek => hex(0x4D6BFE),
+        HarnessKind::Pi => hex(0x2BB3C0),
+        HarnessKind::Antigravity => hex(0x9B72CB),
         HarnessKind::Other(_) => hex(0x9AA0A6),
     }
 }
@@ -146,6 +149,8 @@ fn critter(harness: &HarnessKind, color: Hsla, size: f32) -> Svg {
         HarnessKind::Codex => "codex",
         HarnessKind::OpenCode => "opencode",
         HarnessKind::DeepSeek => "deepseek",
+        HarnessKind::Pi => "pi",
+        HarnessKind::Antigravity => "antigravity",
         HarnessKind::Other(_) => "other",
     };
     svg().path(format!("icons/critters/{name}.svg")).size(px(size)).flex_none().text_color(color)
@@ -224,6 +229,22 @@ fn ago(ms: i64) -> String {
         m if m < 60 * 24 * 60 => format!("{}w", m / (60 * 24 * 7)),
         m => format!("{}mo", m / (60 * 24 * 30)),
     }
+}
+
+/// When a message came, in local time: the hour for today, the date with it before, and
+/// the moment to the second for a tooltip. None when the history has no time for it.
+fn clock(ms: i64) -> Option<(String, String)> {
+    use chrono::TimeZone as _;
+    if ms <= 0 {
+        return None;
+    }
+    let at = chrono::Local.timestamp_millis_opt(ms).single()?.naive_local();
+    Some(clock_text(at, chrono::Local::now().date_naive()))
+}
+
+fn clock_text(at: chrono::NaiveDateTime, today: chrono::NaiveDate) -> (String, String) {
+    let short = if at.date() == today { at.format("%H:%M") } else { at.format("%Y-%m-%d %H:%M") };
+    (short.to_string(), at.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 fn tokens_text(tokens: u64) -> String {
@@ -414,6 +435,8 @@ fn effort_presets(harness: &HarnessKind) -> &'static [Option<&'static str>] {
     match harness {
         HarnessKind::Claude => &[None, Some("low"), Some("medium"), Some("high"), Some("xhigh"), Some("max")],
         HarnessKind::Codex => &[None, Some("minimal"), Some("low"), Some("medium"), Some("high")],
+        // Pi's thinking levels (`--thinking`), clamped by Pi to what the model can.
+        HarnessKind::Pi => &[None, Some("off"), Some("minimal"), Some("low"), Some("medium"), Some("high"), Some("xhigh"), Some("max")],
         _ => &[],
     }
 }
@@ -453,8 +476,22 @@ fn changed_tail(old: usize, new: usize) -> (std::ops::Range<usize>, usize) {
     (start..old, new - start)
 }
 
+/// Whether the window can go on with this very session: its harness runs turns here, and
+/// the harness can reach it. `agy` does not see the conversations of the Antigravity IDE.
+fn can_continue(summary: &SessionSummary) -> bool {
+    can_run_live(&summary.key.harness) && !ide_only(summary)
+}
+
+/// A conversation of the Antigravity IDE, which only the IDE goes on with.
+fn ide_only(summary: &SessionSummary) -> bool {
+    summary.key.harness == HarnessKind::Antigravity && summary.source.path.replace('\\', "/").contains("/antigravity-ide/")
+}
+
 fn can_run_live(harness: &HarnessKind) -> bool {
-    matches!(harness, HarnessKind::Claude | HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::DeepSeek)
+    matches!(
+        harness,
+        HarnessKind::Claude | HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::DeepSeek | HarnessKind::Pi | HarnessKind::Antigravity
+    )
 }
 
 struct Loaded {
@@ -553,8 +590,9 @@ pub struct Shell {
     composer_focus: FocusHandle,
     /// The scroll of the composer's text, taller than the field when long.
     composer_scroll: ScrollHandle,
-    /// A drag of the mouse selects in the composer.
-    composer_selecting: bool,
+    /// A drag of the mouse selects in the composer: by letters, or by whole words or lines
+    /// after a double or triple click, keeping the one it took first.
+    composer_selecting: Option<(SelectUnit, std::ops::Range<usize>)>,
     ssh_hosts: Vec<SshEnvironment>,
     ssh_form: Option<ssh_view::SshForm>,
     ssh_focus: FocusHandle,
@@ -592,6 +630,8 @@ pub struct Shell {
     context_menu: Option<context_menu::ContextMenu>,
     /// Text selected in an answer, with its bubble.
     selection: Option<selection::TextSelection>,
+    /// A file an answer names, right-clicked: its path on this computer and where the menu opens.
+    path_menu: Option<(std::path::PathBuf, Point<Pixels>)>,
     /// The blocks of text drawn in the last frame, for a selection whose end is over none.
     drawn_text: selection::DrawnText,
     /// Where the pointer is while a selection is dragged at the edge of the conversation.
@@ -686,6 +726,13 @@ pub struct Shell {
     /// buttons the lists open under (in that order).
     composer_menu: Option<live_view::ComposerMenu>,
     composer_anchors: [MenuAnchor; 3],
+    /// The models each harness of each environment listed, asked when its list first opens.
+    model_lists: HashMap<(model::EnvId, HarnessKind), model_picker::ModelList>,
+    /// What is typed in the search of the model list, the provider it is narrowed to, and
+    /// the search's focus.
+    model_search: TextField,
+    model_provider: Option<String>,
+    model_search_focus: FocusHandle,
     /// The open list of the sessions pane's footer, and where its buttons are.
     footer_menu: Option<FooterMenu>,
     footer_anchors: [MenuAnchor; 2],
@@ -797,7 +844,7 @@ impl Shell {
             composer: TextField::from_text(""),
             composer_focus: cx.focus_handle(),
             composer_scroll: ScrollHandle::new(),
-            composer_selecting: false,
+            composer_selecting: None,
             ssh_hosts,
             ssh_form: None,
             ssh_focus: cx.focus_handle(),
@@ -825,6 +872,7 @@ impl Shell {
             indexing: false,
             context_menu: None,
             selection: None,
+            path_menu: None,
             drawn_text: Default::default(),
             autoscroll: None,
             autoscrolling: false,
@@ -873,6 +921,10 @@ impl Shell {
             permission: Permission::Bypass,
             composer_menu: None,
             composer_anchors: Default::default(),
+            model_lists: HashMap::new(),
+            model_search: TextField::from_text(""),
+            model_provider: None,
+            model_search_focus: cx.focus_handle(),
             footer_menu: None,
             footer_anchors: Default::default(),
             pending_open: None,
@@ -1143,6 +1195,47 @@ impl Shell {
         }
         self.save_collapsed();
         self.reload(cx);
+    }
+
+    /// Opens what hides a session in the tree: the groups and folders above it, the session
+    /// it hangs under, and a list cut before it.
+    fn reveal_in_tree(&mut self, key: &SessionKey) {
+        let summaries = library::link_started(&self.summaries, &self.started);
+        let Some(above) = library::above_session(&summaries, &self.folders, &self.placements, self.sort, self.grouping, &self.collapsed, key) else {
+            return;
+        };
+        let mut changed = false;
+        for step in above {
+            match &step.kind {
+                TreeNodeKind::Folder(id) => {
+                    if let Some(folder) = self.folders.iter_mut().find(|folder| folder.id == *id && folder.collapsed) {
+                        folder.collapsed = false;
+                        let _ = self.lib().set_folder_collapsed(*id, false);
+                    }
+                }
+                // A session with sessions under it is named in the set when it is open.
+                TreeNodeKind::Session(_) => changed |= self.collapsed.insert(step.id.clone()),
+                _ => changed |= self.collapsed.remove(&step.id),
+            }
+            if step.cut {
+                self.show_all.insert(step.id);
+            }
+        }
+        if changed {
+            self.save_collapsed();
+        }
+        if self.hits.is_none() {
+            self.rebuild_rows();
+        }
+    }
+
+    /// The open session in the tree: opened up to it, selected and scrolled into view.
+    fn show_selected_in_tree(&mut self) {
+        let Some(key) = self.selected.clone() else { return };
+        self.reveal_in_tree(&key);
+        if let Some(ix) = self.rows.iter().position(|row| row.kind == TreeNodeKind::Session(key.clone())) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
     }
 
     fn save_collapsed(&self) {
@@ -2231,8 +2324,12 @@ impl Shell {
         let seq = self.search_seq;
         let query = self.search.text.trim().to_owned();
         if query.is_empty() {
-            self.hits = None;
+            let searched = self.hits.take().is_some();
             self.rebuild_rows();
+            // Back from the search, the tree shows the session opened from it.
+            if searched {
+                self.show_selected_in_tree();
+            }
             return;
         }
         let library = self.library.clone();
@@ -2696,10 +2793,34 @@ impl Shell {
             } else {
                 div()
                     .flex()
+                    .flex_1()
                     .items_center()
                     .min_w_0()
                     .children(text_field_children(&self.search, theme.text, theme.over_accent, theme.selection, theme.caret, 16., focused))
                     .into_any_element()
+            })
+            .when(!self.search.text.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("search-clear")
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(20.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover))
+                        .child(icon("general/close", &theme))
+                        .tooltip(|_, cx| tooltip(t("search.clear"), Some("Esc".into()), cx))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.search = TextField::from_text("");
+                            this.search_focus.focus(window, cx);
+                            this.start_search(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
             });
 
         let rank_bar = self.hits.as_ref().filter(|hits| hits.len() > 1).map(|hits| {
@@ -3298,6 +3419,7 @@ impl Shell {
                     .items_center()
                     .gap(px(10.))
                     .min_w_0()
+                    .child(env_badge(&summary.key.env, &theme))
                     .child(badge(&summary.key.harness, harness_color(&summary.key.harness)))
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.)).truncate().child(title))
                     .when(self.loading, |this| this.child(div().text_color(theme.text_muted).child(t("loading")))),
@@ -3449,17 +3571,25 @@ impl Shell {
         let action = |id: &'static str, label: String| {
             div().id((id, ix)).px(px(6.)).rounded(px(5.)).hover(|style| style.bg(theme.hover).text_color(theme.text)).child(label)
         };
-        let branch = (can_branch || turn_files.is_some()).then(|| {
+        let when = |ms: i64| {
+            clock(ms).map(|(short, full)| {
+                div().id(("message-time", ix)).px(px(4.)).child(short).tooltip(move |_, cx| tooltip(full.clone(), None, cx))
+            })
+        };
+        let prompt_text = item.prompt.as_ref().map_or_else(|| item.text.clone(), |(_, text)| text.clone());
+        let branch = user.then(|| {
             div()
                 .id(("branch", ix))
                 .flex()
                 .justify_end()
+                .items_center()
                 .gap(px(4.))
                 .mt(px(4.))
                 .text_size(px(11.5))
                 .text_color(theme.text_muted)
                 .opacity(0.)
                 .group_hover("user-message", |style| style.opacity(1.))
+                .children(when(item.timestamp_ms))
                 .when_some(turn_files, |this, n| {
                     this.child(
                         action("turn-action", t("turn.action").replace("{n}", &n.to_string()))
@@ -3474,7 +3604,22 @@ impl Shell {
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_branch(ix, window, cx))),
                     )
                 })
+                .when(!prompt_text.trim().is_empty(), |this| this.child(self.copy_message(ix, prompt_text, t("copy.prompt"), cx)))
         });
+        // Under an answer: when it ended, and its text to copy. Not while it is still coming.
+        let total = base.len() + live_items.as_ref().map_or(0, |items| items.len());
+        let answer_foot = (item.role == Role::Assistant && !item.compact_summary && !(ix + 1 == total && self.live_running()))
+            .then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .mt(px(6.))
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .children(when(item.end_ms))
+                    .when(!item.text.is_empty(), |this| this.child(self.copy_message(ix, item.text.clone(), t("copy.answer"), cx)))
+            });
         // A compaction summary is long and repeats what came before: folded until asked.
         let summary_open = item.compact_summary && self.open_summaries.contains(&ix);
         let mut column = div().flex().flex_col().gap(px(8.)).min_w_0();
@@ -3548,7 +3693,8 @@ impl Shell {
                                     })),
                             )
                         })
-                        .child(column),
+                        .child(column)
+                        .children(answer_foot),
                 )
                 .into_any_element()
         };
@@ -4064,6 +4210,31 @@ fn badge(harness: &HarnessKind, color: Hsla) -> impl IntoElement {
         .child(harness.label().to_owned())
 }
 
+/// Where the session runs, before its harness: this computer in quiet colours, a host in
+/// the colour of information, so a prompt is not sent to the wrong machine by mistake.
+fn env_badge(env: &model::EnvId, theme: &Theme) -> impl IntoElement + use<> {
+    let (icon_name, label, color, tip) = match env.ssh_host() {
+        Some(host) => ("toolwindows/services", host.to_owned(), theme.info, format!("{} {host}", t("env.runs_on_host"))),
+        None => ("own/computer", t("group.local").to_owned(), theme.text_secondary, t("env.runs_here").to_owned()),
+    };
+    div()
+        .id("session-env")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(7.))
+        .py(px(2.))
+        .rounded(px(5.))
+        .bg(color.opacity(0.14))
+        .text_color(color)
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(icon_sized(icon_name, 12., theme))
+        .child(label)
+        .tooltip(move |_, cx| tooltip(tip.clone(), None, cx))
+}
+
 /// The space at the end of a tree row: the counts and times stay clear of the scrollbar.
 const TREE_ROW_END: f32 = 18.;
 
@@ -4338,12 +4509,33 @@ fn code_block_text(language: &str, text: &str, theme: &Theme, selected: Option<s
     StyledText::new(text.to_owned()).with_highlights(highlights)
 }
 
-/// The text of a block of an answer as it is drawn and selected; none for a rule.
-fn block_text(block: &MdBlock) -> Option<&str> {
+/// The selectable texts one block of an answer may hold: a table has one per cell.
+const BLOCK_PIECES: usize = 100_000;
+
+/// The texts of the block `bi` of an answer as they are drawn and selected, each with its
+/// key in the selection and what joins it to the text before when copied: one text for
+/// most blocks, one per cell for a table (a tab between cells, a line between rows), none
+/// for a rule.
+fn block_pieces(block: &MdBlock, bi: usize) -> Vec<(usize, &str, &'static str)> {
+    let key = bi * BLOCK_PIECES;
     match block {
-        MdBlock::Paragraph(rich) | MdBlock::Heading(_, rich) | MdBlock::Quote(rich) | MdBlock::Item { text: rich, .. } => Some(&rich.text),
-        MdBlock::Code { text, .. } => Some(text),
-        MdBlock::Rule => None,
+        MdBlock::Paragraph(rich) | MdBlock::Heading(_, rich) | MdBlock::Quote(rich) | MdBlock::Item { text: rich, .. } => vec![(key, rich.text.as_str(), "\n\n")],
+        MdBlock::Code { text, .. } => vec![(key, text.as_str(), "\n\n")],
+        MdBlock::Rule => Vec::new(),
+        MdBlock::Table { rows, .. } => rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| row.iter().enumerate().map(move |(c, cell)| (r, c, cell)))
+            .enumerate()
+            .map(|(i, (r, c, cell))| {
+                let joint = match (r, c) {
+                    (0, 0) => "\n\n",
+                    (_, 0) => "\n",
+                    _ => "\t",
+                };
+                (key + i.min(BLOCK_PIECES - 1), cell.text.as_str(), joint)
+            })
+            .collect(),
     }
 }
 
@@ -4385,6 +4577,25 @@ fn rich_text(rich: &Rich, theme: &Theme, selected: Option<std::ops::Range<usize>
 }
 
 impl Shell {
+    /// A button that copies a whole prompt or answer as written, a tick for a moment after.
+    fn copy_message(&self, ix: usize, text: String, tip: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = *cx.global::<Theme>();
+        // Clear of the ids of code blocks, which count up from zero.
+        let id = usize::MAX - ix;
+        let copied = self.copied.is_some_and(|(at, when)| at == id && when.elapsed().as_millis() < 1500);
+        div()
+            .id(("copy-message", ix))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(22.))
+            .rounded(px(5.))
+            .hover(|style| style.bg(theme.hover))
+            .child(icon_sized(if copied { "general/check" } else { "general/copy" }, 14., &theme))
+            .tooltip(move |_, cx| tooltip(if copied { t("code.copied") } else { tip }, None, cx))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.copy_block(id, &text, cx)))
+    }
+
     /// Copies a code block, and marks its button for a moment.
     fn copy_block(&mut self, id: usize, text: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
@@ -4476,35 +4687,51 @@ impl Shell {
                 )
             })
             .collect();
-        let texts: Vec<Option<AnyElement>> = blocks
+        let selectable_rich = |this: &Self, key: usize, rich: &Rich, cx: &mut Context<Self>| {
+            let range = this.selection.as_ref().and_then(|selection| selection.range_in((base, key), rich.text.len()));
+            let links = rich.links.iter().filter(|(_, url)| crate::markdown::opens_in_browser(url)).cloned().collect();
+            this.selectable((base, key), rich_text(rich, &theme, range), links, rich.paths(), cx)
+        };
+        // Each block's texts, drawn so they can be selected: one per cell for a table.
+        let texts: Vec<Vec<AnyElement>> = blocks
             .iter()
             .enumerate()
             .map(|(bi, block)| {
-                let len = block_text(block)?.len();
-                let range = self.selection.as_ref().and_then(|selection| selection.range_in((base, bi), len));
-                let (styled, links) = match block {
+                let key = bi * BLOCK_PIECES;
+                match block {
                     MdBlock::Paragraph(rich) | MdBlock::Heading(_, rich) | MdBlock::Quote(rich) | MdBlock::Item { text: rich, .. } => {
-                        let links = rich.links.iter().filter(|(_, url)| crate::markdown::opens_in_browser(url)).cloned().collect();
-                        (rich_text(rich, &theme, range), links)
+                        vec![selectable_rich(self, key, rich, cx)]
                     }
-                    MdBlock::Code { language, text } => (code_block_text(language, text, &theme, range), Vec::new()),
-                    MdBlock::Rule => return None,
-                };
-                Some(self.selectable((base, bi), styled, links, cx))
+                    MdBlock::Code { language, text } => {
+                        let range = self.selection.as_ref().and_then(|selection| selection.range_in((base, key), text.len()));
+                        vec![self.selectable((base, key), code_block_text(language, text, &theme, range), Vec::new(), Vec::new(), cx)]
+                    }
+                    MdBlock::Rule => Vec::new(),
+                    MdBlock::Table { rows, .. } => rows
+                        .iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(i, cell)| selectable_rich(self, key + i.min(BLOCK_PIECES - 1), cell, cx))
+                        .collect(),
+                }
             })
             .collect();
         markdown_blocks(blocks, &theme, buttons, texts)
     }
 }
 
-fn markdown_blocks(blocks: &[MdBlock], theme: &Theme, buttons: Vec<Option<AnyElement>>, texts: Vec<Option<AnyElement>>) -> impl IntoElement + use<> {
+fn markdown_blocks(blocks: &[MdBlock], theme: &Theme, buttons: Vec<Option<AnyElement>>, texts: Vec<Vec<AnyElement>>) -> impl IntoElement + use<> {
     let theme = *theme;
     let theme = &theme;
     let mut buttons = buttons.into_iter();
     let mut texts = texts.into_iter();
     let elements: Vec<AnyElement> = blocks.iter().map(|block| {
         let button = buttons.next().flatten();
-        let custom = texts.next().flatten();
+        let mut pieces = texts.next().unwrap_or_default();
+        if let MdBlock::Table { aligns, rows } = block {
+            return markdown_table(aligns, rows, pieces, theme);
+        }
+        let custom = (!pieces.is_empty()).then(|| pieces.remove(0));
         let rich_of = |custom: Option<AnyElement>, rich: &Rich| custom.unwrap_or_else(|| rich_text(rich, theme, None).into_any_element());
         match block {
             MdBlock::Paragraph(rich) => div().child(rich_of(custom, rich)).into_any_element(),
@@ -4567,9 +4794,88 @@ fn markdown_blocks(blocks: &[MdBlock], theme: &Theme, buttons: Vec<Option<AnyEle
                 )
                 .into_any_element(),
             MdBlock::Rule => div().h(px(1.)).bg(theme.border).my(px(4.)).into_any_element(),
+            MdBlock::Table { .. } => unreachable!("drawn above"),
         }
     }).collect();
     div().flex().flex_col().gap(px(8.)).text_size(px(13.5)).line_height(px(21.)).children(elements)
+}
+
+/// Cells this short keep their column wide enough to stay on one line.
+const TABLE_SHORT_CELL: usize = 16;
+
+/// How each column of a table takes the width: its share of the room, by its longest cell
+/// within bounds, so long text gets the room; and the least width it keeps, so a column of
+/// short labels never wraps them.
+fn table_columns(rows: &[Vec<Rich>]) -> Vec<(f32, f32)> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    (0..columns)
+        .map(|c| {
+            let longest = rows.iter().filter_map(|row| row.get(c)).map(|cell| cell.text.chars().count()).max().unwrap_or(0);
+            let least = if longest <= TABLE_SHORT_CELL { longest as f32 * 7.8 + 26. } else { 0. };
+            ((longest as f32).clamp(12., 48.), least)
+        })
+        .collect()
+}
+
+/// A table of an answer: a head row on a tinted band, lines between rows, columns that
+/// line up across rows and wrap their text. `cells` are the drawn texts of its cells in
+/// reading order; a cell without one is drawn plain.
+fn markdown_table(aligns: &[crate::markdown::Align], rows: &[Vec<Rich>], cells: Vec<AnyElement>, theme: &Theme) -> AnyElement {
+    use crate::markdown::Align;
+    let columns = table_columns(rows);
+    let mut cells = cells.into_iter();
+    let last = rows.len().saturating_sub(1);
+    let row_elements: Vec<AnyElement> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let head = r == 0;
+            let row_cells: Vec<AnyElement> = columns
+                .iter()
+                .enumerate()
+                .map(|(c, (weight, least))| {
+                    let text = match row.get(c) {
+                        Some(cell) => cells.next().unwrap_or_else(|| rich_text(cell, theme, None).into_any_element()),
+                        None => div().into_any_element(),
+                    };
+                    let cell = div()
+                        .flex_grow(*weight)
+                        .flex_basis(px(0.))
+                        .min_w(px(*least))
+                        .px(px(12.))
+                        .py(px(7.))
+                        .when(c > 0, |this| this.border_l_1().border_color(theme.border.opacity(0.6)))
+                        .when(head, |this| this.font_weight(FontWeight::SEMIBOLD).text_color(theme.text));
+                    match aligns.get(c) {
+                        Some(Align::Center) => cell.text_center(),
+                        Some(Align::Right) => cell.text_right(),
+                        _ => cell,
+                    }
+                    .child(text)
+                    .into_any_element()
+                })
+                .collect();
+            div()
+                .flex()
+                .w_full()
+                .when(head, |this| this.bg(theme.hover))
+                .when(r < last, |this| this.border_b_1().border_color(theme.border))
+                .children(row_cells)
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .rounded(px(8.))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(13.))
+        .line_height(px(19.))
+        .children(row_elements)
+        .into_any_element()
 }
 
 impl Render for Shell {
@@ -4590,6 +4896,7 @@ impl Render for Shell {
         let viewer = self.render_viewer(window, cx);
         let context_menu = self.render_context_menu(cx);
         let selection_bubble = self.render_selection_bubble(cx);
+        let path_menu = self.render_path_menu(cx);
         let left_handle = self.render_handle(Side::Left, cx);
         let right_handle = self.render_handle(Side::Right, cx);
         let titlebar = self.render_titlebar(window, cx);
@@ -4638,6 +4945,7 @@ impl Render for Shell {
             .children(viewer)
             .children(context_menu)
             .children(selection_bubble)
+            .children(path_menu)
             .children(new_session)
             .children(quit_ask)
     }
@@ -4712,7 +5020,7 @@ fn remote_stats(env: &dyn Environment, root: Option<&str>, paths: &[&str]) -> st
     Ok(parse_stats(&out))
 }
 
-/// When Codex, dsh and OpenCode last wrote their history on a host, for the harnesses
+/// When Codex, dsh, OpenCode, Pi and Antigravity last wrote their history on a host, for the harnesses
 /// that wrote in the last [`RECENT_MINUTES`], in one command.
 fn other_stamps(env: &dyn Environment) -> std::io::Result<Vec<(HarnessKind, i64)>> {
     let script = format!(
@@ -4720,6 +5028,8 @@ fn other_stamps(env: &dyn Environment) -> std::io::Result<Vec<(HarnessKind, i64)
 m codex "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions" -name '*.jsonl'
 m deepseek "$HOME/.dsh/sessions" -name 'session.v*'
 m opencode "$HOME/.local/share/opencode" -maxdepth 1 -name 'opencode.db*'
+m pi "$HOME/.pi/agent/sessions" -name '*.jsonl'
+m antigravity "$HOME/.gemini" -path '*/brain/*' -name 'transcript*.jsonl'
 true"#
     );
     Ok(parse_stamps(&env.run("sh", &["-c", &script], None)?))
@@ -4734,6 +5044,8 @@ fn parse_stamps(out: &str) -> Vec<(HarnessKind, i64)> {
                 "codex" => HarnessKind::Codex,
                 "deepseek" => HarnessKind::DeepSeek,
                 "opencode" => HarnessKind::OpenCode,
+                "pi" => HarnessKind::Pi,
+                "antigravity" => HarnessKind::Antigravity,
                 _ => return None,
             };
             Some((harness, (seconds.trim().parse::<f64>().ok()? * 1000.0) as i64))
@@ -4762,6 +5074,17 @@ mod tail_tests {
         assert_eq!(super::changed_tail(10, 8), (7..10, 1), "rows folded into the one before");
         assert_eq!(super::changed_tail(0, 5), (0..0, 5));
         assert_eq!(super::changed_tail(4, 0), (0..4, 0));
+    }
+
+    /// A message of today shows its hour; an older one its date too.
+    #[test]
+    fn a_message_time_names_the_day_only_when_it_is_not_today() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+        let at = |d: u32, h: u32, m: u32| today.with_day(d).unwrap().and_hms_opt(h, m, 5).unwrap();
+        use chrono::Datelike as _;
+        assert_eq!(super::clock_text(at(27, 9, 4), today), ("09:04".to_owned(), "2026-11-27 09:04:05".to_owned()));
+        assert_eq!(super::clock_text(at(26, 23, 59), today).0, "2026-11-26 23:59");
+        assert_eq!(super::clock(0), None, "a history without times shows none");
     }
 }
 

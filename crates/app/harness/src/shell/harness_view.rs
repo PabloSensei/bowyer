@@ -34,7 +34,7 @@ fn program(harness: &HarnessKind) -> String {
 /// Whether the window asks the harness for its version. DeepSeek Harness has no known
 /// `--version`, and an unknown word could start it.
 fn asks_version(harness: &HarnessKind) -> bool {
-    matches!(harness, HarnessKind::Claude | HarnessKind::Codex | HarnessKind::OpenCode)
+    matches!(harness, HarnessKind::Claude | HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::Pi | HarnessKind::Antigravity)
 }
 
 /// The npm package whose newest release is the harness's. OpenCode 2 is a package of its
@@ -51,7 +51,7 @@ pub(super) fn npm_package(harness: &HarnessKind, installed: &str) -> Option<&'st
 /// The harness's own update command; each finds out by itself how it was installed.
 pub(super) fn update_args(harness: &HarnessKind) -> Option<&'static [&'static str]> {
     match harness {
-        HarnessKind::Claude | HarnessKind::Codex => Some(&["update"]),
+        HarnessKind::Claude | HarnessKind::Codex | HarnessKind::Pi | HarnessKind::Antigravity => Some(&["update"]),
         HarnessKind::OpenCode => Some(&["upgrade"]),
         _ => None,
     }

@@ -14,7 +14,8 @@ use crate::i18n::t;
 use crate::launch;
 
 /// The harnesses a new session can run in, in this order.
-pub(super) const HARNESSES: [HarnessKind; 4] = [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek];
+pub(super) const HARNESSES: [HarnessKind; 6] =
+    [HarnessKind::Claude, HarnessKind::Codex, HarnessKind::OpenCode, HarnessKind::DeepSeek, HarnessKind::Pi, HarnessKind::Antigravity];
 
 /// How many projects of the environment the dialog lists.
 const PROJECTS_SHOWN: usize = 30;
@@ -73,7 +74,8 @@ static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// ways: the native installers of Claude Code and OpenCode, npm for Codex and for OpenCode
 /// on Windows (its docs support no Windows package manager). OpenCode is OpenCode 2: its
 /// own package and installer, since `opencode-ai` and `opencode.ai/install` stay on 1.
-/// DeepSeek Harness has none known.
+/// Pi has an installer of its own (pi.dev). DeepSeek Harness and Antigravity's `agy` have
+/// none known: their docs say how.
 fn install_command(harness: &HarnessKind, windows: bool) -> Option<&'static str> {
     Some(match (harness, windows) {
         (HarnessKind::Claude, true) => "irm https://claude.ai/install.ps1 | iex",
@@ -81,6 +83,8 @@ fn install_command(harness: &HarnessKind, windows: bool) -> Option<&'static str>
         (HarnessKind::OpenCode, true) => "npm install -g @opencode/cli",
         (HarnessKind::OpenCode, false) => "curl -fsSL https://opencode.ai/v2/install | bash",
         (HarnessKind::Codex, _) => "npm install -g @openai/codex",
+        (HarnessKind::Pi, true) => "irm https://pi.dev/install.ps1 | iex",
+        (HarnessKind::Pi, false) => "curl -fsSL https://pi.dev/install.sh | sh",
         _ => return None,
     })
 }

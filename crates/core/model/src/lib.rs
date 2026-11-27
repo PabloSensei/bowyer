@@ -22,6 +22,10 @@ pub enum HarnessKind {
     Codex,
     OpenCode,
     DeepSeek,
+    /// Pi (pi.dev): sessions in `~/.pi/agent/sessions`.
+    Pi,
+    /// Google Antigravity: the `agy` CLI, the app and the IDE, in `~/.gemini/antigravity*`.
+    Antigravity,
     /// A harness from a plugin, by its id.
     Other(String),
 }
@@ -33,6 +37,8 @@ impl HarnessKind {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::DeepSeek => "deepseek",
+            Self::Pi => "pi",
+            Self::Antigravity => "antigravity",
             Self::Other(id) => id,
         }
     }
@@ -43,6 +49,8 @@ impl HarnessKind {
             "codex" => Self::Codex,
             "opencode" => Self::OpenCode,
             "deepseek" => Self::DeepSeek,
+            "pi" => Self::Pi,
+            "antigravity" => Self::Antigravity,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -53,6 +61,8 @@ impl HarnessKind {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::DeepSeek => "DeepSeek",
+            Self::Pi => "Pi",
+            Self::Antigravity => "Antigravity",
             Self::Other(id) => id,
         }
     }
